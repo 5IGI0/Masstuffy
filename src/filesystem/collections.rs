@@ -22,7 +22,7 @@ use anyhow::Result;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
-use crate::warc::WarcRecord;
+use crate::warc::{cdx::CDXRecord, WarcRecord};
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -44,42 +44,38 @@ impl Collection {
 
     // TODO: mutex
     // TODO: keep the files open
-    // TODO: "massaged url" in cdx
-    // TODO: create a new warc part when the file is too big
     // TODO: extract http response status code (when available)
     // TODO: flush .cdx to .cdx.gz when enough big \
     //       don't forget to patch list_records()  \
     //       and add the CDX header if it is the first flush
     pub fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<()>{
         info!("writing new record to `{}` ({})", self.get_slug(), record.get_record_id()?);
-        let cdx_line = format!(
-            "{} {} {} {} {}\n",
-            record.get_target_uri().unwrap_or("-".to_string()),
-            record.get_type()?,
-            record.get_record_id()?,
-            record.get_date()?.format("%Y%m%d"),
-            std::fs::metadata(format!("{}/{}.1.warc", self.path, self.get_slug()))?.len()
-        );
-
-        debug!("{} cdx: {}", record.get_record_id()?, cdx_line);
 
         let serialized_record = record.serialize();
+
+        // TODO: create a new warc part when the file is too big
+        let warc_target = format!("{}/{}.1.warc", self.path, self.get_slug());
+        let warc_target_size = std::fs::metadata(&warc_target)?.len();
+
+        let mut cdx = CDXRecord::from_warc(&record)?;
+        cdx.set_file(warc_target.clone(), Some(warc_target_size));
+
+        debug!("{} cdx: {}", record.get_record_id()?, cdx);
 
         OpenOptions::new()
             .write(true)
             .append(true)
             .create(true)
-            .open(format!("{}/{}.1.cdx", self.path, self.get_slug()))?
-            .write_all(cdx_line.as_bytes()).expect("unable to write cdx file");
+            .open(format!("{}/{}.cdx", self.path, self.get_slug()))?
+            .write_all(format!("{}\n", cdx).as_bytes())
+            .expect("unable to write cdx file");
 
         OpenOptions::new()
             .write(true)
             .append(true)
-            .open(format!("{}/{}.1.warc", self.path, self.get_slug()))?
-            .write_all(&serialized_record[..]).expect("unable to write warc file");
-        
-
-        // std::fs::File::open()?;
+            .open(warc_target)?
+            .write_all(&serialized_record[..])
+            .expect("unable to write warc file");
 
         Ok(())
     }

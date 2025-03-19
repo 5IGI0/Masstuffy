@@ -23,6 +23,8 @@ use chrono::Utc;
 use log::warn;
 use uuid::Uuid;
 
+pub mod cdx;
+
 #[derive(Debug)]
 pub struct WarcRecord {
     headers: HashMap<String, Vec<String>>,

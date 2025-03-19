@@ -36,6 +36,9 @@ For more details, please refer to the LICENSE file.
 
 ## TODO
 
+- [ ] database
+  - [ ] read and load cdx files to db
+  - [ ] search
 - collections
   - [X] create
   - [X] load
@@ -48,9 +51,6 @@ For more details, please refer to the LICENSE file.
     - [ ] dictionnary
     - [ ] regenerate cdx files
     - [ ] dictionnary generation
-  - [ ] database
-    - [ ] read and load cdx files to db
-    - [ ] search
 - cli
   - [x] setup file layout
   - [ ] create collection

@@ -21,8 +21,8 @@ _Please note this is subject to change._
     │       └── [slug](.[id]).json
     └── repository
         ├── [slug].[part](.[dict_id]).warc(.[compression_method])
-        ├── [slug].[part].cdx.gz # when .cdx is enough large, flush inside
-        ├── [slug].[part].cdx
+        ├── [slug].cdx.gz # when .cdx is enough large, flush inside
+        ├── [slug].cdx
         └── [slug].json
 ```
 
