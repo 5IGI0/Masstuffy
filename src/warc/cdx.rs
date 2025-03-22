@@ -16,7 +16,10 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::fmt;
+use std::{fmt, io::{BufRead, BufReader}};
+use anyhow::bail;
+use log::{debug, error};
+
 use super::WarcRecord;
 
 
@@ -30,15 +33,40 @@ pub struct CDXRecord {
     file_offset: Option<String>
 }
 
+fn part2option(part: &str) -> Option<String> {
+    if part == "-" {
+        None
+    } else {
+        Some(part.to_string())
+    }
+}
+
 impl CDXRecord {
     pub fn from_warc(warc: &WarcRecord) -> anyhow::Result<Self> {
         Ok(CDXRecord{
             url: warc.get_target_uri(),
             record_type: warc.get_type()?,
             record_id: warc.get_record_id()?,
-            date: warc.get_date()?.format("%Y%m%d").to_string(),
+            date: warc.get_date()?.format("%Y%m%d%H%M%S").to_string(),
             file_name: None,
             file_offset: None
+        })
+    }
+
+    pub fn from_line(line: &str) -> anyhow::Result<Self> {
+        let parts: Vec<&str> = line.split(' ').collect();
+
+        if parts.len() != 6 && (parts.len() != 7 || parts[6] != "\n"){
+            bail!("expected 6 parts but found {}", parts.len());
+        }
+
+        Ok(CDXRecord{
+            url: part2option(parts[0]),
+            record_type: parts[1].to_string(),
+            record_id: parts[2].to_string(),
+            date: parts[3].to_string(),
+            file_name: part2option(parts[4]),
+            file_offset: part2option(parts[5].trim())
         })
     }
 
@@ -48,6 +76,21 @@ impl CDXRecord {
             self.file_offset = Some(format!("{}", x));
         } else {
             self.file_offset = None
+        }
+    }
+
+    pub fn get_date(&self) -> String {self.date.clone()}
+    pub fn get_url(&self) -> Option<String> {self.url.clone()}
+    pub fn get_file_name(&self) -> Option<String> {self.file_name.clone()}
+    pub fn get_file_offset(&self) -> Option<u64> {
+        if let Some(x) = &self.file_offset {
+            if let Ok(b) = x.parse::<u64>() {
+                Some(b)
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 }
@@ -62,5 +105,44 @@ impl fmt::Display for CDXRecord {
             self.file_offset.clone().unwrap_or("-".to_string())
         )?;
         Ok(())
+    }
+}
+
+pub struct CDXFileReader {
+    br: BufReader<std::fs::File>,
+    buff: String
+}
+
+impl CDXFileReader {
+    pub fn open(path: &str) -> anyhow::Result<Self> {
+        Ok(CDXFileReader{
+            br: BufReader::new(std::fs::File::open(path)?),
+            buff: String::new()
+        })
+    }
+}
+
+impl Iterator for CDXFileReader {
+    type Item = CDXRecord;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.buff.clear();
+        if let Err(x) = self.br.read_line(&mut self.buff) {
+            error!("failed to read cdx line: {}", x);
+            return None
+        }
+
+        if self.buff.is_empty() {
+            debug!("cdx file ended");
+            return None
+        }
+
+        let ret = CDXRecord::from_line(&self.buff);
+        if let Ok(x) = ret{
+            Some(x)
+        } else {
+            error!("failed to read cdx entry: {}", ret.err().unwrap());
+            None
+        }
     }
 }

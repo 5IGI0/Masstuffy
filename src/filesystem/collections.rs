@@ -22,8 +22,7 @@ use anyhow::Result;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
-use crate::warc::{cdx::CDXRecord, WarcRecord};
-
+use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcRecord};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CollectionManifest {
@@ -58,7 +57,7 @@ impl Collection {
         let warc_target_size = std::fs::metadata(&warc_target)?.len();
 
         let mut cdx = CDXRecord::from_warc(&record)?;
-        cdx.set_file(warc_target.clone(), Some(warc_target_size));
+        cdx.set_file(format!("{}.1.warc", self.get_slug()), Some(warc_target_size));
 
         debug!("{} cdx: {}", record.get_record_id()?, cdx);
 
@@ -78,6 +77,11 @@ impl Collection {
             .expect("unable to write warc file");
 
         Ok(())
+    }
+
+    pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
+        // TODO: cdx.gz
+        Ok(CDXFileReader::open(&format!("{}/{}.cdx", self.path, self.get_slug()))?)
     }
 }
 

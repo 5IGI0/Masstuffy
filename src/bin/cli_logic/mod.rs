@@ -21,6 +21,7 @@ use std::{env::args, error::Error};
 mod init_fs;
 mod push_records;
 mod create_collection;
+mod init_db;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -30,6 +31,7 @@ sub commands:
 init_fs           - setup the current directory
 create_collection - create a collection
 push_records      - push new records to repository
+init_db           - init database
 "#,
     argv[0]);
     Ok(0)
@@ -48,6 +50,7 @@ pub fn main() {
         "init_fs" => init_fs::main(argv),
         "create_collection" => create_collection::main(argv),
         "push_records" => push_records::main(argv),
+        "init_db" => init_db::main(argv),
         _ => print_help(argv),
     };
 
