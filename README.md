@@ -24,7 +24,7 @@ After exploring WebArchive, I realized that the WARC file format perfectly suits
 
 Before storing records, you need to create a collection. Depending on what you plan to store, you can enable compression (and use a dictionary if necessary) and then insert all the objects you want.
 
-Additionally, there is an option to generate the dictionary after the collection has been created. In this case, objects will be stored without compression in a temporary folder. Once a certain threshold is reached, the dictionary will be generated.
+Additionally, there will be an option to generate the dictionary after the collection has been created. In this case, objects will be stored without compression in a temporary folder. Once a certain threshold is reached, the dictionary will be generated.
 
 ### License
 
@@ -46,6 +46,7 @@ For more details, please refer to the LICENSE file.
   - [ ] regenerate cdx files
   - [ ] read
   - [x] append
+  - [ ] fs atomicity
   - [ ] compression
     - [ ] compress
     - [ ] dictionnary
