@@ -1,4 +1,3 @@
-use log::info;
 /**
  *  This file is part of Masstuffy. Masstuffy is free software:
  *  you can redistribute it and/or modify it under the terms of 
@@ -15,11 +14,15 @@ use log::info;
  *  along with Masstuffy. If not, see <https://www.gnu.org/licenses/>. 
  * 
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
-**/
-
-use sqlx::{postgres::PgPool, Executor};
-
+ **/
+ 
+use sqlx::postgres::PgPool;
+use structs::DBWarcRecord;
+use log::info;
+ 
 use crate::warc::cdx::CDXRecord;
+
+pub mod structs;
 
 pub struct DBManager {
     is_setup: bool,
@@ -43,24 +46,9 @@ impl DBManager {
 
         // TODO: [improvement] use numeric value for collections (or maybe enum?) and filename
         // TODO: massaged url
-        self.db.execute( r#"
-        CREATE TABLE IF NOT EXISTS masstuffy_records (
-            id         bigserial,
-            flags      int4,
-            date       timestamp,
-            identifier text,
-            collection text,
-            filename   text,
-            "offset"   bigint,
-            "type"     text
-        );"#).await.expect("unable to create record table");
-
-        self.db.execute( r#"
-        CREATE INDEX IF NOT EXISTS masstuffy_record_id_idx
-        ON masstuffy_records USING hash (identifier);"#).await.expect("unable to create record index (masstuffy_record_id_idx)");
-        self.db.execute( r#"
-        CREATE UNIQUE INDEX IF NOT EXISTS masstuffy_record_id_unq
-        ON masstuffy_records(identifier);"#).await.expect("unable to create record index (masstuffy_record_id_unq)");
+        sqlx::migrate!()
+            .run(&self.db)
+            .await.expect("unable to init db");
 
         self.is_setup = true;
     }
@@ -82,5 +70,11 @@ impl DBManager {
             .bind(record.get_record_type())
             .execute(&self.db).await?;
         Ok(())
+    }
+
+    pub async fn get_record_from_id(&mut self, id: String) -> anyhow::Result<DBWarcRecord> {
+        let record: DBWarcRecord = sqlx::query_as!(DBWarcRecord,
+            "SELECT * FROM masstuffy_records WHERE \"type\" != 'request' AND identifier=$1", id).fetch_one(&self.db).await?.into();
+        Ok(record)
     }
 }

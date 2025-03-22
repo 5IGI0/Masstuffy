@@ -17,12 +17,14 @@
 **/
 
 use std::{env::args, error::Error};
+use log::error;
 use tokio;
 
 mod init_fs;
 mod push_records;
 mod create_collection;
 mod init_db;
+mod get_record;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -33,6 +35,7 @@ init_fs           - setup the current directory
 create_collection - create a collection
 push_records      - push new records to repository
 init_db           - init database
+get_record        - get record from its id
 "#,
     argv[0]);
     Ok(0)
@@ -47,19 +50,19 @@ pub fn main() {
         return;
     }
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
     let ret = match argv[1].as_str() {
         "init_fs" => init_fs::main(argv),
         "create_collection" => create_collection::main(argv),
         "push_records" => push_records::main(argv),
-        "init_db" => {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(init_db::main(argv))
-        },
+        "get_record" => rt.block_on(get_record::main(argv)),
+        "init_db" => rt.block_on(init_db::main(argv)),
         _ => print_help(argv),
     };
 
     if let Err(x) = ret {
-        panic!("{}", x);
+        error!("{}", x);
     } else {
         std::process::exit(ret.ok().unwrap());
     }

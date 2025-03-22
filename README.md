@@ -40,6 +40,8 @@ For more details, please refer to the LICENSE file.
   - [X] read and load cdx files to db
   - [ ] mark for deletion
   - [ ] search
+    - [X] by id
+    - [ ] by url
 - collections
   - [X] create
   - [X] load

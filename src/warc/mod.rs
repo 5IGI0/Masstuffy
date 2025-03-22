@@ -140,10 +140,14 @@ pub struct WarcReader {
 } 
 
 impl WarcReader {
+    pub fn from_fp(fp: fs::File) -> WarcReader {
+        WarcReader{
+            br: BufReader::new(fp)
+        }
+    }
+
     pub fn from_file(path: &str) -> anyhow::Result<WarcReader> {
-        Ok(WarcReader{
-            br: BufReader::new(fs::File::open(path)?)
-        })
+        Ok(Self::from_fp(fs::File::open(path)?))
     }
 }
 

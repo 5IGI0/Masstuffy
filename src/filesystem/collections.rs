@@ -16,13 +16,13 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{fs::{self, OpenOptions}, io::Write};
+use std::{fs::{self, OpenOptions}, io::{Seek, Write}};
 
 use anyhow::Result;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
-use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcRecord};
+use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CollectionManifest {
@@ -82,6 +82,14 @@ impl Collection {
     pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
         // TODO: cdx.gz
         Ok(CDXFileReader::open(&format!("{}/{}.cdx", self.path, self.get_slug()))?)
+    }
+
+    pub fn get_record(&self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
+        let mut fp = std::fs::File::open(format!("{}/{}", self.path, filename))?;
+
+        fp.seek(std::io::SeekFrom::Start(offset as u64))?;
+        
+        Ok(WarcReader::from_fp(fp).next())
     }
 }
 

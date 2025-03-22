@@ -117,4 +117,13 @@ impl FileSystem {
     pub fn get_database_conn_string(&self) -> String {
         self.config.database.clone()
     }
+
+    pub fn get_record(&self, coll: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
+        // TODO: do it properly
+        if let None = self.collections.borrow().get(coll) {
+            return Ok(None);
+        } else {
+            self.collections.borrow().get(coll).unwrap().get_record(filename, offset)
+        }
+    }
 }
