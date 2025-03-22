@@ -19,6 +19,7 @@
 use std::error::Error;
 use std::io::Write;
 
+use chrono::Utc;
 use clap::Parser;
 use log::info;
 use masstuffy::{database::DBManager, filesystem};
@@ -26,7 +27,15 @@ use masstuffy::{database::DBManager, filesystem};
 /// Simple program to greet a person
 #[derive(Parser)]
 struct Args {
-    id: String
+    query: String,
+
+    /// search by id instead of uri?
+    #[arg(short, long, default_value_t = false)]
+    by_id: bool,
+
+    /// date (format: YYYYmmddHHMMSS)
+    #[arg(short, long)]
+    date: Option<String>,
 }
 
 pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
@@ -35,7 +44,17 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let fs = filesystem::init()?;
     let mut db = DBManager::new(&fs.get_database_conn_string());
 
-    let record_cdx= db.get_record_from_id(args.id).await?;
+    let record_cdx = if args.by_id {
+        db.get_record_from_id(args.query).await?
+    } else {
+        let date_str = if let Some(d) = args.date {
+            d
+        } else {
+            Utc::now().naive_utc().format("%Y%m%d%H%M%S").to_string()
+        };
+
+        db.get_record_from_uri(&date_str, &args.query).await?
+    };
 
     info!("{}", record_cdx.collection);
 

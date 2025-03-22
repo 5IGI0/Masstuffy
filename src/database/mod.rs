@@ -21,6 +21,8 @@ use structs::DBWarcRecord;
 use log::info;
  
 use crate::warc::cdx::CDXRecord;
+use chrono::NaiveDateTime;
+
 
 pub mod structs;
 
@@ -58,23 +60,38 @@ impl DBManager {
         sqlx::query(r#"
         INSERT INTO masstuffy_records(
             flags, date, identifier,
-            collection, filename, "offset", "type")
+            collection, filename, "offset", "type",
+            uri)
         VALUES(
             0, to_timestamp($1, 'YYYYMMDDHH24MISS'), $2,
-            $3, $4, $5, $6)"#)
+            $3, $4, $5, $6, $7)"#)
             .bind(record.get_date())
             .bind(record.get_record_id())
             .bind(coll)
             .bind(record.get_file_name().unwrap())
             .bind(record.get_file_offset().unwrap())
             .bind(record.get_record_type())
+            .bind(record.get_url())
             .execute(&self.db).await?;
         Ok(())
     }
 
     pub async fn get_record_from_id(&mut self, id: String) -> anyhow::Result<DBWarcRecord> {
         let record: DBWarcRecord = sqlx::query_as!(DBWarcRecord,
-            "SELECT * FROM masstuffy_records WHERE \"type\" != 'request' AND identifier=$1", id).fetch_one(&self.db).await?.into();
+            "SELECT * FROM masstuffy_records WHERE identifier=$1 LIMIT 1", id).fetch_one(&self.db).await?.into();
+        Ok(record)
+    }
+
+    pub async fn get_record_from_uri(&mut self, date: &String, uri: &String) -> anyhow::Result<DBWarcRecord> {
+        // TOOD: better way than comparing epoches?
+        let record: DBWarcRecord = sqlx::query_as!(DBWarcRecord,
+            r#"SELECT * FROM masstuffy_records
+            WHERE
+                "type" != 'request' AND
+                uri=$1
+            ORDER BY ABS(DATE_PART('epoch', date) - DATE_PART('epoch', $2::timestamp)) ASC
+            LIMIT 1
+            "#, uri, NaiveDateTime::parse_from_str(date, "%Y%m%d%H%M%S")?).fetch_one(&self.db).await?.into();
         Ok(record)
     }
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM masstuffy_records WHERE \"type\" != 'request' AND identifier=$1",
+  "query": "SELECT * FROM masstuffy_records WHERE identifier=$1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -42,6 +42,11 @@
         "ordinal": 7,
         "name": "type",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "uri",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -57,8 +62,9 @@
       false,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "7212063b018e9ddde4d8b0934aec9d696250add823dea42315b1294f6104daf8"
+  "hash": "6009aff79952737a1399fc4da70df1386c2bc29acd221a8bc2ad14776bdb39f1"
 }
