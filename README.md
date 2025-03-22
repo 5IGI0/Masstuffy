@@ -39,9 +39,9 @@ For more details, please refer to the LICENSE file.
 - [ ] database
   - [X] read and load cdx files to db
   - [ ] mark for deletion
-  - [ ] search
+  - [X] search
     - [X] by id
-    - [ ] by url
+    - [X] by url
 - collections
   - [X] create
   - [X] load
