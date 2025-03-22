@@ -113,4 +113,8 @@ impl FileSystem {
             Err(anyhow::Error::msg("no such collection"))
         }
     }
+
+    pub fn get_database_conn_string(&self) -> String {
+        self.config.database.clone()
+    }
 }

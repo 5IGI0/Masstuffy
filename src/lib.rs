@@ -19,3 +19,4 @@
 pub mod filesystem;
 pub mod config;
 pub mod warc;
+pub mod database;

@@ -80,11 +80,13 @@ impl CDXRecord {
     }
 
     pub fn get_date(&self) -> String {self.date.clone()}
+    pub fn get_record_id(&self) -> String {self.record_id.clone()}
+    pub fn get_record_type(&self) -> String {self.record_type.clone()}
     pub fn get_url(&self) -> Option<String> {self.url.clone()}
     pub fn get_file_name(&self) -> Option<String> {self.file_name.clone()}
-    pub fn get_file_offset(&self) -> Option<u64> {
+    pub fn get_file_offset(&self) -> Option<i64> {
         if let Some(x) = &self.file_offset {
-            if let Ok(b) = x.parse::<u64>() {
+            if let Ok(b) = x.parse::<i64>() {
                 Some(b)
             } else {
                 None

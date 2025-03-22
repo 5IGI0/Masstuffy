@@ -18,17 +18,26 @@
 
 use std::error::Error;
 
-use masstuffy::filesystem::init;
+use log::{error, info};
+use masstuffy::{database::DBManager, filesystem::init};
 
-pub fn main(_argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
+pub async fn main(_argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let fs = init()
         .expect("unable to initialise fs");
+
+    let mut db = DBManager::new(&fs.get_database_conn_string());
+
+    db.setup_db().await;
 
     let collections = fs.get_collection_list();
     
     for col in &collections {
+        info!("inserting collection '{}'", col);
+        // TODO: optimise
         for record in fs.get_collection_cdx_iter(col)?.into_iter() {
-            println!("{}", record)
+            if let Err(x) = db.insert_record(col, &record).await {
+                error!("error when inserting record: {}", x);
+            }
         }
     }
 

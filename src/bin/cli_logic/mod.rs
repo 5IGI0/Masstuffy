@@ -17,6 +17,7 @@
 **/
 
 use std::{env::args, error::Error};
+use tokio;
 
 mod init_fs;
 mod push_records;
@@ -50,7 +51,10 @@ pub fn main() {
         "init_fs" => init_fs::main(argv),
         "create_collection" => create_collection::main(argv),
         "push_records" => push_records::main(argv),
-        "init_db" => init_db::main(argv),
+        "init_db" => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(init_db::main(argv))
+        },
         _ => print_help(argv),
     };
 

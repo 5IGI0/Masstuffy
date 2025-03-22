@@ -37,7 +37,8 @@ For more details, please refer to the LICENSE file.
 ## TODO
 
 - [ ] database
-  - [ ] read and load cdx files to db
+  - [X] read and load cdx files to db
+  - [ ] mark for deletion
   - [ ] search
 - collections
   - [X] create

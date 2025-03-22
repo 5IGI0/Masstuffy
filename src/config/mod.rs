@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Config {
     pub listen_addr: String,
-    pub secret_key: Option<String>
+    pub secret_key: Option<String>,
+    pub database: String,
 }
 
 impl Config {
@@ -34,6 +35,7 @@ impl Default for Config {
     fn default() -> Self {
         Config{
             listen_addr: "127.0.0.1:8080".to_string(),
-            secret_key: None}
+            secret_key: None,
+            database: String::new()}
     }
 }
