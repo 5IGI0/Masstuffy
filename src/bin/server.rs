@@ -16,6 +16,5 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-fn main() {
-    
-}
+mod server_logic;
+use server_logic::*;

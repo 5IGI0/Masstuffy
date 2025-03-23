@@ -47,7 +47,7 @@ For more details, please refer to the LICENSE file.
   - [X] load
   - [x] generate cdx files
   - [ ] regenerate cdx files
-  - [ ] read
+  - [X] read
   - [x] append
   - [ ] fs atomicity
   - [ ] compression
@@ -55,16 +55,22 @@ For more details, please refer to the LICENSE file.
     - [ ] dictionnary
     - [ ] regenerate cdx files
     - [ ] dictionnary generation
+  - [ ] make async
 - cli
   - [x] setup file layout
   - [ ] create collection
     - [X] create
     - [ ] custom dictionnary
   - [X] add records
-  - [ ] get record(s)
+  - [X] get record
+  - [ ] search records
   - [ ] detect when the server runs and send commands to it
 - server
-  - [ ] link to source code (AGPL requirement)
+  - [X] link to source code (AGPL requirement)
   - [ ] create collection
   - [ ] add records
+  - [ ] search records
+  - [ ] report records
   - [ ] get record(s)
+    - [X] by id
+    - [ ] by uri

@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 /**
  *  This file is part of Masstuffy. Masstuffy is free software:
  *  you can redistribute it and/or modify it under the terms of 
@@ -16,8 +17,7 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{collections::HashMap, fs, rc};
-use std::cell::RefCell;
+use std::{collections::HashMap, fs};
 
 use anyhow::{anyhow, bail, Result};
 use collections::{load_collection, Collection};
@@ -31,14 +31,14 @@ mod collections;
 pub struct FileSystem {
     path: String,
     config: Config,
-    collections: rc::Rc<RefCell<HashMap<String, Collection>>>
+    collections: Arc<Mutex<HashMap<String, Collection>>> // TODO: RWLock
 }
 
 pub fn init() -> Result<FileSystem> {
     let mut ret: FileSystem = FileSystem{
         path: std::env::var("MASSTUFFY_WORKDIR").unwrap_or("./".to_string()),
         config: Config::default(),
-        collections: rc::Rc::new(RefCell::new(HashMap::new()))};
+        collections: Arc::new(Mutex::new(HashMap::new()))};
 
     info!("filesystem initialisation...");
     debug!("workdir: {}", ret.path);
@@ -64,8 +64,8 @@ pub fn init() -> Result<FileSystem> {
             let coll_ret = load_collection(f.path().to_str().unwrap());
 
             if let Ok(collection) = coll_ret {
-                ret.collections.borrow_mut()
-                    .insert(collection.get_slug(), collection);
+                let mut colls = ret.collections.lock().unwrap();
+                colls.insert(collection.get_slug(), collection);
             }
         }
     }
@@ -75,23 +75,23 @@ pub fn init() -> Result<FileSystem> {
 
 impl FileSystem {
     pub fn has_collection(&self, slug: &String) -> bool {
-        self.collections.borrow_mut().get(slug).is_some()
+        self.collections.lock().unwrap().get(slug).is_some()
     }
 
     pub fn create_collection(&mut self, slug: String) -> anyhow::Result<bool>{
+        // TODO: fix race condition
         if self.has_collection(&slug) {
             return Ok(false);
         }
 
         let coll = collections::create_collection(&format!("{}/data/repository", self.path), &slug)?;
-
-        self.collections.borrow_mut().insert(slug, coll);
+        self.collections.lock().unwrap().insert(slug, coll);
 
         Ok(true)
     }
 
     pub fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<()> {
-        if let Some(c) = self.collections.borrow_mut().get_mut(slug) {
+        if let Some(c) = self.collections.lock().unwrap().get_mut(slug) {
             if let Err(x) = c.add_warc(record) {
                 bail!("unable to write warc: {}", x);
             } else {
@@ -103,11 +103,11 @@ impl FileSystem {
     }
 
     pub fn get_collection_list(&self) -> Vec<String>{
-        self.collections.borrow().keys().cloned().collect()
+        self.collections.lock().unwrap().keys().cloned().collect()
     }
 
     pub fn get_collection_cdx_iter(&self, collection_name: &str) -> anyhow::Result<CDXFileReader>{
-        if let Some(col) = self.collections.borrow().get(collection_name) {
+        if let Some(col) = self.collections.lock().unwrap().get(collection_name) {
             Ok(col.iter_cdx()?)
         } else {
             Err(anyhow::Error::msg("no such collection"))
@@ -120,10 +120,15 @@ impl FileSystem {
 
     pub fn get_record(&self, coll: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
         // TODO: do it properly
-        if let None = self.collections.borrow().get(coll) {
+        let colls = self.collections.lock();
+        if let None = colls.as_ref().unwrap().get(coll) {
             return Ok(None);
         } else {
-            self.collections.borrow().get(coll).unwrap().get_record(filename, offset)
+            colls.as_ref().unwrap().get(coll).unwrap().get_record(filename, offset)
         }
+    }
+
+    pub fn get_listen_addr(&self) -> String {
+        self.config.listen_addr.clone()
     }
 }

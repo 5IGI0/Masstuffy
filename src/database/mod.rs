@@ -56,7 +56,7 @@ impl DBManager {
     }
 
     // TODO: insert from iterator
-    pub async fn insert_record(&mut self, coll: &str, record: &CDXRecord) -> anyhow::Result<()> {
+    pub async fn insert_record(&self, coll: &str, record: &CDXRecord) -> anyhow::Result<()> {
         sqlx::query(r#"
         INSERT INTO masstuffy_records(
             flags, date, identifier,
@@ -76,13 +76,13 @@ impl DBManager {
         Ok(())
     }
 
-    pub async fn get_record_from_id(&mut self, id: String) -> anyhow::Result<DBWarcRecord> {
+    pub async fn get_record_from_id(&self, id: String) -> anyhow::Result<DBWarcRecord> {
         let record: DBWarcRecord = sqlx::query_as!(DBWarcRecord,
             "SELECT * FROM masstuffy_records WHERE identifier=$1 LIMIT 1", id).fetch_one(&self.db).await?.into();
         Ok(record)
     }
 
-    pub async fn get_record_from_uri(&mut self, date: &String, uri: &String) -> anyhow::Result<DBWarcRecord> {
+    pub async fn get_record_from_uri(&self, date: &String, uri: &String) -> anyhow::Result<DBWarcRecord> {
         // TOOD: better way than comparing epoches?
         let record: DBWarcRecord = sqlx::query_as!(DBWarcRecord,
             r#"SELECT * FROM masstuffy_records

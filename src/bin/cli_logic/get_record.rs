@@ -42,7 +42,7 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let args = Args::parse_from(&argv[1..]);
 
     let fs = filesystem::init()?;
-    let mut db = DBManager::new(&fs.get_database_conn_string());
+    let db = DBManager::new(&fs.get_database_conn_string());
 
     let record_cdx = if args.by_id {
         db.get_record_from_id(args.query).await?
