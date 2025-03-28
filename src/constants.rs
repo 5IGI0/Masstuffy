@@ -16,8 +16,4 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-pub mod filesystem;
-pub mod config;
-pub mod warc;
-pub mod database;
-pub mod constants;
+pub const MASSTUFFY_DATE_FMT: &str = "%Y%m%d%H%M%S";

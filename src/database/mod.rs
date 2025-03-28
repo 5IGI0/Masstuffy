@@ -20,7 +20,7 @@ use sqlx::postgres::PgPool;
 use structs::DBWarcRecord;
 use log::info;
  
-use crate::warc::cdx::CDXRecord;
+use crate::{constants::MASSTUFFY_DATE_FMT, warc::cdx::CDXRecord};
 use chrono::NaiveDateTime;
 
 
@@ -91,7 +91,7 @@ impl DBManager {
                 uri=$1
             ORDER BY ABS(DATE_PART('epoch', date) - DATE_PART('epoch', $2::timestamp)) ASC
             LIMIT 1
-            "#, uri, NaiveDateTime::parse_from_str(date, "%Y%m%d%H%M%S")?).fetch_one(&self.db).await?.into();
+            "#, uri, NaiveDateTime::parse_from_str(date, MASSTUFFY_DATE_FMT)?).fetch_one(&self.db).await?.into();
         Ok(record)
     }
 }
