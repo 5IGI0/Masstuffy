@@ -15,7 +15,7 @@
  * 
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
-use std::{fmt::format, sync::Arc};
+use std::sync::Arc;
 
 use masstuffy::{constants::MASSTUFFY_DATE_FMT, database::DBManager, filesystem::{self, FileSystem}};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ async fn get_by_id(req: Request<AppState>) -> tide::Result {
             .get_record_from_id(req.param("id").unwrap().to_string()).await?;
     
     let rec = req.state().fs.read().await.get_record(
-        &cdx_rec.collection, &cdx_rec.filename, cdx_rec.offset)?.unwrap();
+        &cdx_rec.collection, &cdx_rec.filename, cdx_rec.offset).await?.unwrap();
 
     Ok(Response::builder(200)
     .body(rec.serialize())
@@ -48,7 +48,7 @@ async fn get_by_url(req: Request<AppState>) -> tide::Result {
                 &url).await?;
     
     let rec = req.state().fs.read().await.get_record(
-        &cdx_rec.collection, &cdx_rec.filename, cdx_rec.offset)?.unwrap();
+        &cdx_rec.collection, &cdx_rec.filename, cdx_rec.offset).await?.unwrap();
 
     let dt = rec.get_date()?.format(MASSTUFFY_DATE_FMT).to_string();
     if dt != req.param("date")? {
@@ -76,10 +76,11 @@ async fn server_status_handler(_: Request<AppState>) -> tide::Result {
     }).expect("error serializing")))
 }
 
-pub fn main() {
+#[tokio::main]
+pub async fn main() {
     env_logger::init();
 
-    let fs = filesystem::init().expect("unable to init filesystem"); //Arc<RwLock<FileSystem>> = ;
+    let fs = filesystem::init().await.expect("unable to init filesystem"); //Arc<RwLock<FileSystem>> = ;
     
     let listen_addr = fs.get_listen_addr();
     let database_conn = fs.get_database_conn_string();

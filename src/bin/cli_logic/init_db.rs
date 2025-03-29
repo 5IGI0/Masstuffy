@@ -22,19 +22,19 @@ use log::{error, info};
 use masstuffy::{database::DBManager, filesystem::init};
 
 pub async fn main(_argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
-    let fs = init()
+    let fs = init().await
         .expect("unable to initialise fs");
 
     let mut db = DBManager::new(&fs.get_database_conn_string());
 
     db.setup_db().await;
 
-    let collections = fs.get_collection_list();
+    let collections = fs.get_collection_list().await;
     
     for col in &collections {
         info!("inserting collection '{}'", col);
         // TODO: optimise
-        for record in fs.get_collection_cdx_iter(col)?.into_iter() {
+        for record in fs.get_collection_cdx_iter(col).await?.into_iter() {
             if let Err(x) = db.insert_record(col, &record).await {
                 error!("error when inserting record: {}", x);
             }

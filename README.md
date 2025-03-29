@@ -48,14 +48,17 @@ For more details, please refer to the LICENSE file.
   - [x] generate cdx files
   - [ ] regenerate cdx files
   - [X] read
-  - [x] append
+  - [ ] append
+    - [X] warc
+    - [X] cdx
+    - [ ] db
   - [ ] fs atomicity
   - [ ] compression
     - [ ] compress
     - [ ] dictionnary
     - [ ] regenerate cdx files
     - [ ] dictionnary generation
-  - [ ] make async
+  - [X] make async
 - cli
   - [x] setup file layout
   - [ ] create collection
@@ -71,6 +74,7 @@ For more details, please refer to the LICENSE file.
   - [ ] add records
   - [ ] search records
   - [ ] report records
-  - [ ] get record(s)
+  - [ ] offload decompression (client-side decompression)
+  - [X] get record(s)
     - [X] by id
-    - [ ] by uri
+    - [X] by url

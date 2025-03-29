@@ -1,4 +1,3 @@
-use std::sync::{Arc, Mutex};
 /**
  *  This file is part of Masstuffy. Masstuffy is free software:
  *  you can redistribute it and/or modify it under the terms of 
@@ -17,7 +16,10 @@ use std::sync::{Arc, Mutex};
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{collections::HashMap, fs};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::sync::Mutex;
 
 use anyhow::{anyhow, bail, Result};
 use collections::{load_collection, Collection};
@@ -34,37 +36,36 @@ pub struct FileSystem {
     collections: Arc<Mutex<HashMap<String, Collection>>> // TODO: RWLock
 }
 
-pub fn init() -> Result<FileSystem> {
+pub async fn init() -> Result<FileSystem> {
     let mut ret: FileSystem = FileSystem{
         path: std::env::var("MASSTUFFY_WORKDIR").unwrap_or("./".to_string()),
         config: Config::default(),
         collections: Arc::new(Mutex::new(HashMap::new()))};
 
     info!("filesystem initialisation...");
-    debug!("workdir: {}", ret.path);
+    info!("workdir: {}", ret.path);
 
     debug!("reading config...");
     ret.config = serde_json::from_slice(
-        &fs::read(format!("{}/config.json", &ret.path))?)?;
+        &fs::read(format!("{}/config.json", &ret.path)).await?)?;
     debug!("config: {:?}", ret.config);
-    debug!("validating config");
-    
+
+    info!("validating config");
     if let Some(err) = ret.config.validate() {
         error!("invalid config: {}", &err);
         return Err(anyhow!(err));
     }
 
-    debug!("loading collections...");
+    info!("loading collections...");
     
-    for f in fs::read_dir(format!("{}/data/repository/", ret.path))? {
-        let f = f?;
-        // debug!("{}", f.path().to_str().unwrap());
+    let mut dir_handle = fs::read_dir(format!("{}/data/repository/", ret.path)).await?;
+    while let Some(f) = dir_handle.next_entry().await? {
         if f.file_name().to_string_lossy().ends_with(".json") {
             debug!("found {}", f.file_name().to_string_lossy());
-            let coll_ret = load_collection(f.path().to_str().unwrap());
+            let coll_ret = load_collection(f.path().to_str().unwrap()).await;
 
             if let Ok(collection) = coll_ret {
-                let mut colls = ret.collections.lock().unwrap();
+                let mut colls = ret.collections.lock().await;
                 colls.insert(collection.get_slug(), collection);
             }
         }
@@ -74,25 +75,25 @@ pub fn init() -> Result<FileSystem> {
 }
 
 impl FileSystem {
-    pub fn has_collection(&self, slug: &String) -> bool {
-        self.collections.lock().unwrap().get(slug).is_some()
+    pub async fn has_collection(&self, slug: &String) -> bool {
+        self.collections.lock().await.get(slug).is_some()
     }
 
-    pub fn create_collection(&mut self, slug: String) -> anyhow::Result<bool>{
+    pub async fn create_collection(&mut self, slug: String) -> anyhow::Result<bool>{
         // TODO: fix race condition
-        if self.has_collection(&slug) {
+        if self.has_collection(&slug).await {
             return Ok(false);
         }
 
-        let coll = collections::create_collection(&format!("{}/data/repository", self.path), &slug)?;
-        self.collections.lock().unwrap().insert(slug, coll);
+        let coll = collections::create_collection(&format!("{}/data/repository", self.path), &slug).await?;
+        self.collections.lock().await.insert(slug, coll);
 
         Ok(true)
     }
 
-    pub fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<()> {
-        if let Some(c) = self.collections.lock().unwrap().get_mut(slug) {
-            if let Err(x) = c.add_warc(record) {
+    pub async fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<()> {
+        if let Some(c) = self.collections.lock().await.get_mut(slug) {
+            if let Err(x) = c.add_warc(record).await {
                 bail!("unable to write warc: {}", x);
             } else {
                 return Ok(());
@@ -102,12 +103,12 @@ impl FileSystem {
         }
     }
 
-    pub fn get_collection_list(&self) -> Vec<String>{
-        self.collections.lock().unwrap().keys().cloned().collect()
+    pub async fn get_collection_list(&self) -> Vec<String>{
+        self.collections.lock().await.keys().cloned().collect()
     }
 
-    pub fn get_collection_cdx_iter(&self, collection_name: &str) -> anyhow::Result<CDXFileReader>{
-        if let Some(col) = self.collections.lock().unwrap().get(collection_name) {
+    pub async fn get_collection_cdx_iter(&self, collection_name: &str) -> anyhow::Result<CDXFileReader>{
+        if let Some(col) = self.collections.lock().await.get(collection_name) {
             Ok(col.iter_cdx()?)
         } else {
             Err(anyhow::Error::msg("no such collection"))
@@ -118,13 +119,14 @@ impl FileSystem {
         self.config.database.clone()
     }
 
-    pub fn get_record(&self, coll: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
+    pub async fn get_record(&self, coll: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
         // TODO: do it properly
-        let colls = self.collections.lock();
-        if let None = colls.as_ref().unwrap().get(coll) {
-            return Ok(None);
+        let cloned_ref = self.collections.clone();
+        let colls = cloned_ref.lock().await;
+        if let None = colls.get(coll) {
+            Ok(None)
         } else {
-            colls.as_ref().unwrap().get(coll).unwrap().get_record(filename, offset)
+            colls.get(coll).unwrap().get_record(filename, offset).await
         }
     }
 

@@ -16,7 +16,9 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{collections::HashMap, fs, io::{BufRead, BufReader, Read}};
+use std::collections::HashMap;
+use tokio::{fs, io::{AsyncBufReadExt, AsyncReadExt}};
+use tokio::io::BufReader;
 
 use anyhow::bail;
 use chrono::Utc;
@@ -136,7 +138,7 @@ impl WarcRecord {
 }
 
 pub struct WarcReader {
-    br: BufReader<std::fs::File>
+    br: BufReader<fs::File>
 } 
 
 impl WarcReader {
@@ -146,16 +148,14 @@ impl WarcReader {
         }
     }
 
-    pub fn from_file(path: &str) -> anyhow::Result<WarcReader> {
-        Ok(Self::from_fp(fs::File::open(path)?))
+    pub async fn from_file(path: &str) -> anyhow::Result<WarcReader> {
+        Ok(Self::from_fp(fs::File::open(path).await?))
     }
 }
 
-impl Iterator for WarcReader {
-    type Item = WarcRecord;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let ret = read_record(&mut self.br);
+impl WarcReader {
+    pub async fn async_next(&mut self) -> Option<WarcRecord> {
+        let ret = read_record(&mut self.br).await;
         if let Ok(x) = ret {
             x
         } else {
@@ -172,14 +172,14 @@ enum ReadRecordState {
     _WaitingContent // this one is not used but still
 }
 
-pub fn read_record(br: &mut BufReader<std::fs::File>) -> anyhow::Result<Option<WarcRecord>>{
+pub async fn read_record(br: &mut BufReader<fs::File>) -> anyhow::Result<Option<WarcRecord>>{
     let mut contentlen: Option<usize> = None;
     let mut ret = WarcRecord::new("".to_string());
     let mut state = ReadRecordState::WaitingWarcHeader;
 
     loop {
         let mut line_buffer = String::new();
-        let num = br.read_line(&mut line_buffer)?;
+        let num = br.read_line(&mut line_buffer).await?;
 
         if num == 0 {
             if state == ReadRecordState::WaitingWarcHeader {
@@ -223,10 +223,10 @@ pub fn read_record(br: &mut BufReader<std::fs::File>) -> anyhow::Result<Option<W
     if let Some(len) = contentlen {
         let mut content: Vec<u8> = Vec::new();
         content.resize(len, 0);
-        br.read_exact(&mut content[..])?;
+        br.read_exact(&mut content[..]).await?;
         ret.set_body(content);
         let mut newlines: [u8; 4] = [0,0,0,0];
-        br.read_exact(&mut newlines)?;
+        br.read_exact(&mut newlines).await?;
         if newlines != "\r\n\r\n".as_bytes() {
             bail!("invalid body footer in warc record");
         }

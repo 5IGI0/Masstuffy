@@ -28,18 +28,18 @@ struct Args {
     collection: String
 }
 
-pub fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
+pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let args = Args::parse_from(&argv[1..]);
 
-    let mut fs = init()
+    let mut fs = init().await
         .expect("unable to initialise fs");
 
-    if fs.has_collection(&args.collection) {
+    if fs.has_collection(&args.collection).await {
         error!("collection {} already exists", args.collection);
         return Ok(1);
     }
 
-    fs.create_collection(args.collection)?;
+    fs.create_collection(args.collection).await?;
 
     Ok(0)
 }

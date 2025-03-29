@@ -16,7 +16,7 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{fs::{self, OpenOptions}, io::{Seek, Write}};
+use tokio::{fs::{self, OpenOptions}, io::{AsyncSeekExt, AsyncWriteExt}};
 
 use anyhow::Result;
 use log::{debug, info};
@@ -47,7 +47,7 @@ impl Collection {
     // TODO: flush .cdx to .cdx.gz when enough big \
     //       don't forget to patch list_records()  \
     //       and add the CDX header if it is the first flush
-    pub fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<()>{
+    pub async fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<()>{
         info!("writing new record to `{}` ({})", self.get_slug(), record.get_record_id()?);
 
         let serialized_record = record.serialize();
@@ -65,15 +65,15 @@ impl Collection {
             .write(true)
             .append(true)
             .create(true)
-            .open(format!("{}/{}.cdx", self.path, self.get_slug()))?
-            .write_all(format!("{}\n", cdx).as_bytes())
+            .open(format!("{}/{}.cdx", self.path, self.get_slug())).await?
+            .write_all(format!("{}\n", cdx).as_bytes()).await
             .expect("unable to write cdx file");
 
         OpenOptions::new()
             .write(true)
             .append(true)
-            .open(warc_target)?
-            .write_all(&serialized_record[..])
+            .open(warc_target).await?
+            .write_all(&serialized_record[..]).await
             .expect("unable to write warc file");
 
         Ok(())
@@ -81,23 +81,24 @@ impl Collection {
 
     pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
         // TODO: cdx.gz
+        // TODO: async
         Ok(CDXFileReader::open(&format!("{}/{}.cdx", self.path, self.get_slug()))?)
     }
 
-    pub fn get_record(&self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
-        let mut fp = std::fs::File::open(format!("{}/{}", self.path, filename))?;
+    pub async fn get_record(&self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
+        let mut fp = fs::File::open(format!("{}/{}", self.path, filename)).await?;
 
-        fp.seek(std::io::SeekFrom::Start(offset as u64))?;
+        fp.seek(std::io::SeekFrom::Start(offset as u64)).await?;
         
-        Ok(WarcReader::from_fp(fp).next())
+        Ok(WarcReader::from_fp(fp).async_next().await)
     }
 }
 
-pub fn load_collection(manifest_path: &str) -> Result<Collection> {
+pub async fn load_collection(manifest_path: &str) -> Result<Collection> {
     debug!("loading collection: {}", manifest_path);
     debug!("reading manifest...");
     let manifest: CollectionManifest = serde_json::from_slice(
-        &fs::read(manifest_path)?)?;
+        &fs::read(manifest_path).await?)?;
     
     // TODO: manifest.validate()
     let collection = Collection{
@@ -109,7 +110,7 @@ pub fn load_collection(manifest_path: &str) -> Result<Collection> {
     Ok(collection)
 }
 
-pub fn create_collection(
+pub async fn create_collection(
     repository_path: &str,
     slug: &str
     ) -> Result<Collection>{
@@ -132,9 +133,9 @@ pub fn create_collection(
             manifest
         ).as_bytes().to_vec());
 
-    fs::write(format!("{}/{}.1.warc", repository_path, slug), first_record.serialize())?;
-    fs::write(&manifest_path, manifest)?;
+    fs::write(format!("{}/{}.1.warc", repository_path, slug), first_record.serialize()).await?;
+    fs::write(&manifest_path, manifest).await?;
 
     debug!("collection created!");
-    load_collection(&manifest_path)
+    load_collection(&manifest_path).await
 }

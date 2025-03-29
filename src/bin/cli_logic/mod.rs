@@ -41,7 +41,8 @@ get_record        - get record from its id
     Ok(0)
 }
 
-pub fn main() {
+#[tokio::main]
+pub async fn main() {
     let argv: Vec<String> = args().collect();
     env_logger::init();
 
@@ -50,14 +51,12 @@ pub fn main() {
         return;
     }
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-
     let ret = match argv[1].as_str() {
         "init_fs" => init_fs::main(argv),
-        "create_collection" => create_collection::main(argv),
-        "push_records" => push_records::main(argv),
-        "get_record" => rt.block_on(get_record::main(argv)),
-        "init_db" => rt.block_on(init_db::main(argv)),
+        "create_collection" => create_collection::main(argv).await,
+        "push_records" => push_records::main(argv).await,
+        "get_record" => get_record::main(argv).await,
+        "init_db" => init_db::main(argv).await,
         _ => print_help(argv),
     };
 

@@ -31,19 +31,20 @@ struct Args {
     destination: String
 }
 
-pub fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
+pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let args = Args::parse_from(&argv[1..]);
 
-    let mut fs = init()
+    let mut fs = init().await
         .expect("unable to initialise fs");
 
-    if !fs.has_collection(&args.destination) {
+    if !fs.has_collection(&args.destination).await {
         error!("collection `{}` doesn't exist", args.destination);
         return Ok(1);
     }
 
-    for record in WarcReader::from_file(&args.source)? {
-        let _ = fs.add_warc(&args.destination, &record);
+    let mut reader = WarcReader::from_file(&args.source).await?;
+    while let Some(record) = reader.async_next().await {
+        let _ = fs.add_warc(&args.destination, &record).await;
     }
 
     Ok(0)

@@ -41,7 +41,7 @@ struct Args {
 pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let args = Args::parse_from(&argv[1..]);
 
-    let fs = filesystem::init()?;
+    let fs = filesystem::init().await?;
     let db = DBManager::new(&fs.get_database_conn_string());
 
     let record_cdx = if args.by_id {
@@ -58,7 +58,7 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
 
     info!("{}", record_cdx.collection);
 
-    let record = fs.get_record(&record_cdx.collection, &record_cdx.filename, record_cdx.offset)?;
+    let record = fs.get_record(&record_cdx.collection, &record_cdx.filename, record_cdx.offset).await?;
 
     let mut handle = std::io::stdout().lock();
     handle.write(&record.unwrap().serialize()).unwrap();
