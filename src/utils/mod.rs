@@ -16,9 +16,23 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-pub mod filesystem;
-pub mod config;
-pub mod warc;
-pub mod database;
-pub mod constants;
-pub mod utils;
+use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder, XzDecoder};
+use tokio::io::{AsyncRead, BufReader};
+use anyhow::Result;
+
+pub async fn open_compressed(path: &str) -> Result<BufReader<Box<dyn AsyncRead + Unpin + Send>>> {
+    let fp = tokio::fs::File::open(path).await?;
+
+    if path.ends_with(".gz") {
+        let dec = GzipDecoder::new(BufReader::new(fp));
+        return Ok(BufReader::new(Box::new(dec)));
+    } else if path.ends_with(".zst") {
+        let dec = ZstdDecoder::new(BufReader::new(fp));
+        return Ok(BufReader::new(Box::new(dec)));
+    } else if path.ends_with(".xz") {
+        let dec = XzDecoder::new(BufReader::new(fp));
+        return Ok(BufReader::new(Box::new(dec)));
+    }
+
+    Ok(BufReader::new(Box::new(fp)))
+}

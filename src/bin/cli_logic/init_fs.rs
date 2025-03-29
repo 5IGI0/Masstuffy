@@ -23,7 +23,6 @@ use log::{debug, error, info};
 use masstuffy::config::Config;
 use uuid::Uuid;
 
-/// Simple program to greet a person
 #[derive(Parser)]
 struct Args {
     path: Option<String>

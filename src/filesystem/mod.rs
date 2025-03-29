@@ -25,7 +25,7 @@ use anyhow::{anyhow, bail, Result};
 use collections::{load_collection, Collection};
 use log::{debug, error, info};
 
-use crate::warc::cdx::CDXFileReader;
+use crate::warc::cdx::{CDXFileReader, CDXRecord};
 use crate::{config::Config, warc::WarcRecord};
 
 mod collections;
@@ -91,12 +91,13 @@ impl FileSystem {
         Ok(true)
     }
 
-    pub async fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<()> {
+    pub async fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<CDXRecord> {
         if let Some(c) = self.collections.lock().await.get_mut(slug) {
-            if let Err(x) = c.add_warc(record).await {
+            let ret = c.add_warc(record).await;
+            if let Err(x) = ret {
                 bail!("unable to write warc: {}", x);
             } else {
-                return Ok(());
+                return Ok(ret.unwrap());
             }
         } else {
             bail!("no such collection");

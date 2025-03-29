@@ -24,7 +24,6 @@ use clap::Parser;
 use log::info;
 use masstuffy::{database::DBManager, filesystem};
 
-/// Simple program to greet a person
 #[derive(Parser)]
 struct Args {
     query: String,

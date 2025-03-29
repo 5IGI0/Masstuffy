@@ -20,7 +20,7 @@ use std::error::Error;
 use clap::Parser;
 
 use log::error;
-use masstuffy::{filesystem::init, warc::WarcReader};
+use masstuffy::{database::DBManager, filesystem::init, warc::WarcReader};
 
 #[derive(Parser)]
 struct Args {
@@ -42,9 +42,23 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         return Ok(1);
     }
 
+    let mut dbm: Option<DBManager> = None;
+
+    {
+        let db_conn = fs.get_database_conn_string();
+        if db_conn != "" {
+            let mut db = DBManager::new(&fs.get_database_conn_string());
+            db.setup_db().await;
+            dbm = Some(db);
+        }
+    }
+
     let mut reader = WarcReader::from_file(&args.source).await?;
     while let Some(record) = reader.async_next().await {
-        let _ = fs.add_warc(&args.destination, &record).await;
+        let cdx = fs.add_warc(&args.destination, &record).await?;
+        if let Some(db) = &dbm {
+            db.insert_record(&args.destination, &cdx).await?; // TODO: bulk insert
+        }
     }
 
     Ok(0)

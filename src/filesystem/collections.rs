@@ -47,7 +47,7 @@ impl Collection {
     // TODO: flush .cdx to .cdx.gz when enough big \
     //       don't forget to patch list_records()  \
     //       and add the CDX header if it is the first flush
-    pub async fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<()>{
+    pub async fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<CDXRecord>{
         info!("writing new record to `{}` ({})", self.get_slug(), record.get_record_id()?);
 
         let serialized_record = record.serialize();
@@ -76,7 +76,7 @@ impl Collection {
             .write_all(&serialized_record[..]).await
             .expect("unable to write warc file");
 
-        Ok(())
+        Ok(cdx)
     }
 
     pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {

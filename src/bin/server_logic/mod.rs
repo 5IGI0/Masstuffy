@@ -95,6 +95,5 @@ pub async fn main() {
     app.at("/").get(server_status_handler);
     app.at("/id/:flags/:id").get(get_by_id);
     app.at("/url/:date/:flags/*url").get(get_by_url);
-    let rt = tokio::runtime::Runtime::new().expect("unable to start tokio runtime");
-    rt.block_on(app.listen(listen_addr)).expect("failed block_on");
+    app.listen(listen_addr).await.expect("server error");
 }

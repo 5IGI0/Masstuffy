@@ -17,13 +17,15 @@
 **/
 
 use std::collections::HashMap;
-use tokio::{fs, io::{AsyncBufReadExt, AsyncReadExt}};
+use tokio::{fs, io::{AsyncBufReadExt, AsyncRead, AsyncReadExt}};
 use tokio::io::BufReader;
 
 use anyhow::bail;
 use chrono::Utc;
 use log::warn;
 use uuid::Uuid;
+
+use crate::utils::open_compressed;
 
 pub mod cdx;
 
@@ -138,18 +140,20 @@ impl WarcRecord {
 }
 
 pub struct WarcReader {
-    br: BufReader<fs::File>
+    br: BufReader<Box<dyn AsyncRead + Unpin + Send>>
 } 
 
 impl WarcReader {
     pub fn from_fp(fp: fs::File) -> WarcReader {
         WarcReader{
-            br: BufReader::new(fp)
+            br: BufReader::new(Box::new(fp))
         }
     }
 
     pub async fn from_file(path: &str) -> anyhow::Result<WarcReader> {
-        Ok(Self::from_fp(fs::File::open(path).await?))
+        Ok(WarcReader{
+            br: open_compressed(path).await?
+        })
     }
 }
 
@@ -172,7 +176,7 @@ enum ReadRecordState {
     _WaitingContent // this one is not used but still
 }
 
-pub async fn read_record(br: &mut BufReader<fs::File>) -> anyhow::Result<Option<WarcRecord>>{
+pub async fn read_record(br: &mut BufReader<Box<dyn AsyncRead + Unpin + Send>>) -> anyhow::Result<Option<WarcRecord>>{
     let mut contentlen: Option<usize> = None;
     let mut ret = WarcRecord::new("".to_string());
     let mut state = ReadRecordState::WaitingWarcHeader;

@@ -48,10 +48,7 @@ For more details, please refer to the LICENSE file.
   - [x] generate cdx files
   - [ ] regenerate cdx files
   - [X] read
-  - [ ] append
-    - [X] warc
-    - [X] cdx
-    - [ ] db
+  - [X] append
   - [ ] fs atomicity
   - [ ] compression
     - [ ] compress
