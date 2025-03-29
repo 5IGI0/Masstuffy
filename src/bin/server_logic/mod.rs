@@ -80,7 +80,7 @@ async fn server_status_handler(_: Request<AppState>) -> tide::Result {
 pub async fn main() {
     env_logger::init();
 
-    let fs = filesystem::init().await.expect("unable to init filesystem"); //Arc<RwLock<FileSystem>> = ;
+    let fs = filesystem::init().await.expect("unable to init filesystem");
     
     let listen_addr = fs.get_listen_addr();
     let database_conn = fs.get_database_conn_string();

@@ -59,6 +59,8 @@ pub fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         .expect("unable to create buffer dir");
     fs::create_dir(format!("{}/data/dict", &path))
         .expect("unable to create dict dir");
+    fs::create_dir(format!("{}/data/dict/zstd", &path))
+        .expect("unable to create zstd dict dir");
     fs::create_dir(format!("{}/data/repository", &path))
         .expect("unable to create records dir");
 

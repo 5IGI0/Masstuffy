@@ -29,49 +29,51 @@ use crate::warc::cdx::{CDXFileReader, CDXRecord};
 use crate::{config::Config, warc::WarcRecord};
 
 mod collections;
+mod dict_store;
 
 pub struct FileSystem {
     path: String,
     config: Config,
-    collections: Arc<Mutex<HashMap<String, Collection>>> // TODO: RWLock
+    collections: Arc<Mutex<HashMap<String, Collection>>>, // TODO: RWLock
+    dictionary_store: dict_store::DictStore
 }
 
 pub async fn init() -> Result<FileSystem> {
-    let mut ret: FileSystem = FileSystem{
-        path: std::env::var("MASSTUFFY_WORKDIR").unwrap_or("./".to_string()),
-        config: Config::default(),
-        collections: Arc::new(Mutex::new(HashMap::new()))};
-
+    let path = std::env::var("MASSTUFFY_WORKDIR").unwrap_or("./".to_string());
     info!("filesystem initialisation...");
-    info!("workdir: {}", ret.path);
+    info!("workdir: {}", path);
 
     debug!("reading config...");
-    ret.config = serde_json::from_slice(
-        &fs::read(format!("{}/config.json", &ret.path)).await?)?;
-    debug!("config: {:?}", ret.config);
+    let config: Config = serde_json::from_slice(
+        &fs::read(format!("{}/config.json", &path)).await?)?;
+    debug!("config: {:?}", config);
 
     info!("validating config");
-    if let Some(err) = ret.config.validate() {
+    if let Some(err) = config.validate() {
         error!("invalid config: {}", &err);
         return Err(anyhow!(err));
     }
 
+    info!("finding dictionaries");
+    let dictionary_store = dict_store::DictStore::from_dir(&format!("{}/data/dict/", path))?;
+
     info!("loading collections...");
     
-    let mut dir_handle = fs::read_dir(format!("{}/data/repository/", ret.path)).await?;
+    let collections = Arc::new(Mutex::new(HashMap::new()));
+    let mut dir_handle = fs::read_dir(format!("{}/data/repository/", path)).await?;
     while let Some(f) = dir_handle.next_entry().await? {
         if f.file_name().to_string_lossy().ends_with(".json") {
             debug!("found {}", f.file_name().to_string_lossy());
             let coll_ret = load_collection(f.path().to_str().unwrap()).await;
 
             if let Ok(collection) = coll_ret {
-                let mut colls = ret.collections.lock().await;
+                let mut colls = collections.lock().await;
                 colls.insert(collection.get_slug(), collection);
             }
         }
     }
 
-    Ok(ret)
+    Ok(FileSystem{path, config, collections, dictionary_store})
 }
 
 impl FileSystem {
@@ -133,5 +135,29 @@ impl FileSystem {
 
     pub fn get_listen_addr(&self) -> String {
         self.config.listen_addr.clone()
+    }
+
+    pub async fn get_buffer_path(&self, name: &str, create: bool) -> anyhow::Result<(String, bool)>{
+        let path = format!("{}/data/buffer/{}/", self.path, name); //TODO: validate no traversal path
+
+        let exists = fs::metadata(&path).await.is_ok();
+        if create && !exists {
+            fs::create_dir(&path).await?;
+            Ok((path, false))
+        } else {
+            Ok((path, exists))
+        }
+    }
+
+    pub async fn has_zstd_dict(&self, id: u32) -> bool {
+        self.dictionary_store.has_zstd_dict(id).await
+    }
+
+    pub async fn add_zstd_dict(&self, slug: &str, dict: Vec<u8>) {
+        // TODO: check dict_id doesn't exists
+        tokio::fs::write(
+            format!("{}/data/dict/zstd/{}.{}.zstdict",
+            self.path, slug, u32::from_le_bytes(dict[4..8].try_into().expect("invalid zstd dictionary"))),
+            dict).await.expect("unable to write zstd dictionary file");
     }
 }

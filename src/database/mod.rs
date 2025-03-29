@@ -94,4 +94,15 @@ impl DBManager {
             "#, uri, NaiveDateTime::parse_from_str(date, MASSTUFFY_DATE_FMT)?).fetch_one(&self.db).await?.into();
         Ok(record)
     }
+
+    pub async fn get_samples(&self, collection: &str, limit: i64) -> anyhow::Result<Vec<DBWarcRecord>> {
+        Ok(sqlx::query_as!(
+            DBWarcRecord,
+            r#"
+            SELECT * FROM masstuffy_records
+            WHERE collection=$1
+            ORDER BY hashint8(id)
+            LIMIT $2"#, collection, limit).
+            fetch_all(&self.db).await?) // TODO: make it random?
+    }
 }
