@@ -55,7 +55,7 @@ pub async fn init() -> Result<FileSystem> {
     }
 
     info!("finding dictionaries");
-    let dictionary_store = dict_store::DictStore::from_dir(&format!("{}/data/dict/", path))?;
+    let dictionary_store = dict_store::DictStore::from_dir(format!("{}/data/dict/", path)).await?;
 
     info!("loading collections...");
     
@@ -153,11 +153,12 @@ impl FileSystem {
         self.dictionary_store.has_zstd_dict(id).await
     }
 
-    pub async fn add_zstd_dict(&self, slug: &str, dict: Vec<u8>) {
+    pub async fn add_zstd_dict(&mut self, slug: &str, dict: Vec<u8>) {
         // TODO: check dict_id doesn't exists
         tokio::fs::write(
             format!("{}/data/dict/zstd/{}.{}.zstdict",
             self.path, slug, u32::from_le_bytes(dict[4..8].try_into().expect("invalid zstd dictionary"))),
             dict).await.expect("unable to write zstd dictionary file");
+        self.dictionary_store.reload().await;
     }
 }

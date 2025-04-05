@@ -28,14 +28,27 @@ struct ZstdDict {
 }
 
 pub struct DictStore {
+    store_location: String,
     zstd_dicts: RwLock<HashMap<u32, RwLock<ZstdDict>>>
 }
 
 impl DictStore {
-    pub fn from_dir(path: &str) -> anyhow::Result<DictStore> {
-        let mut zstd_dicts: HashMap<u32, RwLock<ZstdDict>> = HashMap::new();
-        debug!("loading zstd dictionaries...");
-        if let Ok(dir) = std::fs::read_dir(format!("{}/zstd/", path)) {
+    pub async fn from_dir(path: String) -> anyhow::Result<DictStore> {
+        let mut store = DictStore {
+            store_location: path,
+            zstd_dicts: RwLock::new(HashMap::new())
+        };
+
+        store.reload().await;
+
+        Ok(store)
+    }
+
+    pub async fn reload(&mut self) {
+        let mut zstd_dicts = self.zstd_dicts.write().await;
+        debug!("(re)loading zstd dictionaries...");
+        // TODO: use fs
+        if let Ok(dir) = std::fs::read_dir(format!("{}/zstd/", self.store_location)) {
             for f in dir {
                 if let Err(e) = f {
                     warn!("failed to fetch new files: {}", e);
@@ -66,9 +79,14 @@ impl DictStore {
                 }
                 let id = id.unwrap();
 
-                if let Some(_) = zstd_dicts.get(&id) {
-                    error!("duplicate dictionaries with same id ({})", id);
-                    panic!("duplicate dictionaries with same id ({})", id);
+                if let Some(dict) = zstd_dicts.get(&id) {
+                    let dict = dict.read().await;
+                    if dict.path != path {
+                        error!("duplicate dictionaries with same id ({})", id);
+                        panic!("duplicate dictionaries with same id ({})", id);
+                    } else {
+                        continue;
+                    }
                 }
 
                 zstd_dicts.insert(
@@ -79,8 +97,6 @@ impl DictStore {
                 info!("dictionary {} ({}) found", id, parts[0]);
             }
         }
-
-        Ok(DictStore { zstd_dicts: RwLock::new(zstd_dicts) })
     }
 
     pub async fn get_zstd_dict(&self, id: u32) -> Option<Arc<Vec<u8>>> {

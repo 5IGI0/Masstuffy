@@ -40,7 +40,7 @@ struct Args {
 pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let args = Args::parse_from(&argv[1..]);
 
-    let fs = filesystem::init().await?;
+    let mut fs = filesystem::init().await?;
     let db = DBManager::new(&fs.get_database_conn_string());
 
     info!("creating buffer...");
@@ -95,8 +95,8 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         dict[4..8].copy_from_slice(&new_id.to_le_bytes());
     }
 
+    tokio::fs::remove_dir_all(path).await?;
     fs.add_zstd_dict(&format!("{}_{}", args.collection, Utc::now().format(MASSTUFFY_DATE_FMT)), dict).await;
-    // tokio::fs::write("a.zstdict", dict).await?;
 
     Ok(0)
 }
