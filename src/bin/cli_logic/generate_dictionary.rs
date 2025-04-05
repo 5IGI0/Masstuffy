@@ -81,8 +81,9 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         args.max_dict_size)?;
 
     let mut rng = rand::rng();
+    let mut dict_id: u32;
     loop {
-        let dict_id = u32::from_le_bytes(dict[4..8].try_into()?);
+        dict_id = u32::from_le_bytes(dict[4..8].try_into()?);
 
         debug!("dictionary id: {}", dict_id);
         if !fs.has_zstd_dict(dict_id).await {
@@ -97,6 +98,10 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
 
     tokio::fs::remove_dir_all(path).await?;
     fs.add_zstd_dict(&format!("{}_{}", args.collection, Utc::now().format(MASSTUFFY_DATE_FMT)), dict).await;
+
+    // TODO: if args.rebuild_repository
+    fs.create_collection(format!("_{}", args.collection), Some(("zstd".to_string(), dict_id))).await?;
+    
 
     Ok(0)
 }

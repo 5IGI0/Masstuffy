@@ -44,7 +44,7 @@ impl DictStore {
         Ok(store)
     }
 
-    pub async fn reload(&mut self) {
+    pub async fn reload(&self) {
         let mut zstd_dicts = self.zstd_dicts.write().await;
         debug!("(re)loading zstd dictionaries...");
         // TODO: use fs

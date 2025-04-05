@@ -25,7 +25,11 @@ use masstuffy::filesystem::init;
 #[derive(Parser)]
 struct Args {
     /// warc file holding records
-    collection: String
+    collection: String,
+
+    /// dictionary's id to use
+    #[arg(short, long)]
+    dict_id: Option<u32>,
 }
 
 pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
@@ -39,7 +43,14 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         return Ok(1);
     }
 
-    fs.create_collection(args.collection).await?;
+    fs.create_collection(
+        args.collection,
+        if let Some(dict_id) = args.dict_id {
+            Some(("zstd".to_string(), dict_id))
+        } else {
+            None
+        }
+    ).await?;
 
     Ok(0)
 }

@@ -1,3 +1,4 @@
+use async_std::io::Cursor;
 /**
  *  This file is part of Masstuffy. Masstuffy is free software:
  *  you can redistribute it and/or modify it under the terms of 
@@ -16,24 +17,46 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use tokio::{fs::{self, OpenOptions}, io::{AsyncSeekExt, AsyncWriteExt}};
+use tokio::{fs::{self, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}};
 
 use anyhow::Result;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use async_compression::tokio::bufread::ZstdEncoder;
 
 use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
+
+use super::dict_store::DictStore;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CollectionManifest {
     pub slug: String,
     pub compression: Option<String>,
-    pub dict_id: Option<u16>,
+    pub dict_id: Option<u32>,
+}
+
+impl CollectionManifest {
+    pub async fn validate(&self) -> anyhow::Result<()> {
+        if let Some(comp) = &self.compression {
+            if comp != "zstd" {
+                anyhow::bail!("{}: compression '{}' is not supported", self.slug, comp);
+            }
+    
+            if let None = self.dict_id {
+                anyhow::bail!("{}: compression with no dictionary is not supported", self.slug);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub struct Collection {
     path: String,
-    manifest: CollectionManifest
+    manifest: CollectionManifest,
+    dict_store: Arc<DictStore>,
+    dict: Option<Arc<Vec<u8>>>
 }
 
 impl Collection {
@@ -54,12 +77,24 @@ impl Collection {
 
         // TODO: create a new warc part when the file is too big
         let warc_target = format!("{}/{}.1.warc", self.path, self.get_slug());
-        let warc_target_size = std::fs::metadata(&warc_target)?.len();
+        let warc_target_size = if let Ok(m) = tokio::fs::metadata(&warc_target).await {
+            m.len()
+        } else {
+            0
+        };
 
         let mut cdx = CDXRecord::from_warc(&record)?;
         cdx.set_file(format!("{}.1.warc", self.get_slug()), Some(warc_target_size));
 
         debug!("{} cdx: {}", record.get_record_id()?, cdx);
+        
+        OpenOptions::new()
+            .write(true)
+            .append(true)
+            .create(true)
+            .open(warc_target).await?
+            .write_all(&self.compress(serialized_record).await[..]).await
+            .expect("unable to write warc file");
 
         OpenOptions::new()
             .write(true)
@@ -69,14 +104,33 @@ impl Collection {
             .write_all(format!("{}\n", cdx).as_bytes()).await
             .expect("unable to write cdx file");
 
-        OpenOptions::new()
-            .write(true)
-            .append(true)
-            .open(warc_target).await?
-            .write_all(&serialized_record[..]).await
-            .expect("unable to write warc file");
-
         Ok(cdx)
+    }
+
+    async fn ensure_dict_loaded(&mut self) {
+        if let None = self.dict {
+            self.dict = self.dict_store.get_zstd_dict(self.manifest.dict_id.unwrap()).await;
+            if let None = self.dict {
+                panic!("unable to load dictionary {}", self.manifest.dict_id.unwrap())
+            }
+        }
+    }
+
+    async fn compress(&mut self, content: Vec<u8>) -> Vec<u8> {
+        if let None = self.manifest.dict_id {
+            return content
+        }
+        
+        self.ensure_dict_loaded().await;
+
+        let encoder = ZstdEncoder::with_dict(
+            BufReader::new(&content[..]),
+            async_compression::Level::Best,
+            &self.dict.clone().unwrap()[..]);
+        
+        let mut ret = Vec::new();
+        encoder.unwrap().read_to_end(&mut ret).await.expect("unable to compress record");
+        ret
     }
 
     pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
@@ -94,16 +148,25 @@ impl Collection {
     }
 }
 
-pub async fn load_collection(manifest_path: &str) -> Result<Collection> {
+pub async fn load_collection(manifest_path: &str, dict_store: Arc<DictStore>) -> Result<Collection> {
     debug!("loading collection: {}", manifest_path);
     debug!("reading manifest...");
     let manifest: CollectionManifest = serde_json::from_slice(
         &fs::read(manifest_path).await?)?;
-    
-    // TODO: manifest.validate()
+
+    manifest.validate().await?;
+
+    /* since we support zstd only, i don't check the algorithm */
+    if let Some(dict_id) = manifest.dict_id {
+        if !dict_store.has_zstd_dict(dict_id).await {
+            anyhow::bail!("{}: dictionary {} unknown", manifest.slug, dict_id);
+        }
+    }
+
     let collection = Collection{
         path: std::path::Path::new(manifest_path).parent().unwrap().to_str().unwrap().to_string(),
-        manifest};
+        manifest,
+        dict_store, dict: None};
 
     info!("collection {} loaded!", collection.get_slug());
 
@@ -112,17 +175,30 @@ pub async fn load_collection(manifest_path: &str) -> Result<Collection> {
 
 pub async fn create_collection(
     repository_path: &str,
-    slug: &str
+    slug: &str,
+    dictionary: Option<(String, u32)>,
+    dict_store: Arc<DictStore>
     ) -> Result<Collection>{
     debug!("creating collection: {}", slug);
     let manifest_path = format!("{}/{}.json", repository_path, slug);
 
     let manifest = serde_json::to_string(&CollectionManifest{
         slug: slug.to_string(),
-        compression: None,
-        dict_id: None})?;
+        dict_id: if let Some(x) = &dictionary {
+            Some(x.1)
+        } else {
+            None
+        },
+        compression: if let Some(x) = dictionary {
+            Some(x.0)
+        } else {
+            None
+        }})?;
     
     // TODO: manifest.validate()
+
+    fs::write(&manifest_path, &manifest).await?;
+    let mut coll = load_collection(&manifest_path, dict_store).await?;
 
     let mut first_record = WarcRecord::new("warcinfo".to_string());
     first_record.set_header("Content-Type".to_string(), "application/warc-fields".to_string());
@@ -133,9 +209,8 @@ pub async fn create_collection(
             manifest
         ).as_bytes().to_vec());
 
-    fs::write(format!("{}/{}.1.warc", repository_path, slug), first_record.serialize()).await?;
-    fs::write(&manifest_path, manifest).await?;
+    coll.add_warc(&first_record).await?;
 
     debug!("collection created!");
-    load_collection(&manifest_path).await
+    Ok(coll)
 }

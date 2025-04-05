@@ -35,7 +35,7 @@ pub struct FileSystem {
     path: String,
     config: Config,
     collections: Arc<Mutex<HashMap<String, Collection>>>, // TODO: RWLock
-    dictionary_store: dict_store::DictStore
+    dictionary_store: Arc<dict_store::DictStore>
 }
 
 pub async fn init() -> Result<FileSystem> {
@@ -55,7 +55,7 @@ pub async fn init() -> Result<FileSystem> {
     }
 
     info!("finding dictionaries");
-    let dictionary_store = dict_store::DictStore::from_dir(format!("{}/data/dict/", path)).await?;
+    let dictionary_store = Arc::new(dict_store::DictStore::from_dir(format!("{}/data/dict/", path)).await?);
 
     info!("loading collections...");
     
@@ -64,7 +64,7 @@ pub async fn init() -> Result<FileSystem> {
     while let Some(f) = dir_handle.next_entry().await? {
         if f.file_name().to_string_lossy().ends_with(".json") {
             debug!("found {}", f.file_name().to_string_lossy());
-            let coll_ret = load_collection(f.path().to_str().unwrap()).await;
+            let coll_ret = load_collection(f.path().to_str().unwrap(), dictionary_store.clone()).await;
 
             if let Ok(collection) = coll_ret {
                 let mut colls = collections.lock().await;
@@ -73,7 +73,7 @@ pub async fn init() -> Result<FileSystem> {
         }
     }
 
-    Ok(FileSystem{path, config, collections, dictionary_store})
+    Ok(FileSystem{path, config, collections, dictionary_store: dictionary_store})
 }
 
 impl FileSystem {
@@ -81,13 +81,17 @@ impl FileSystem {
         self.collections.lock().await.get(slug).is_some()
     }
 
-    pub async fn create_collection(&mut self, slug: String) -> anyhow::Result<bool>{
+    pub async fn create_collection(&mut self, slug: String, dictionary: Option<(String, u32)>) -> anyhow::Result<bool> {
         // TODO: fix race condition
         if self.has_collection(&slug).await {
             return Ok(false);
         }
 
-        let coll = collections::create_collection(&format!("{}/data/repository", self.path), &slug).await?;
+        let coll = collections::create_collection(
+            &format!("{}/data/repository", self.path),
+            &slug,
+            dictionary,
+            self.dictionary_store.clone()).await?;
         self.collections.lock().await.insert(slug, coll);
 
         Ok(true)
