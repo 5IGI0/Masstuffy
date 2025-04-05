@@ -1,0 +1,1 @@
+DROP INDEX masstuffy_record_id_unq;

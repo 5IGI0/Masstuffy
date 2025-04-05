@@ -164,4 +164,19 @@ impl FileSystem {
             dict).await.expect("unable to write zstd dictionary file");
         self.dictionary_store.reload().await;
     }
+
+    pub async fn delete_collection(&mut self, slug: &str) -> anyhow::Result<()> {
+        let mut colls = self.collections.lock().await;
+
+        let col = colls.get(slug);
+
+        if let Some(col) = col {
+            let mut col = col.write().await;
+            col.delete().await?;
+            drop(col);
+            colls.remove(slug); // TODO: remove from database
+        }
+
+        Ok(())
+    }
 }

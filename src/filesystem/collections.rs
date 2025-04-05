@@ -1,4 +1,3 @@
-use async_std::io::Cursor;
 /**
  *  This file is part of Masstuffy. Masstuffy is free software:
  *  you can redistribute it and/or modify it under the terms of 
@@ -17,7 +16,7 @@ use async_std::io::Cursor;
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufStream}};
+use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}};
 
 use anyhow::Result;
 use log::{debug, info};
@@ -126,7 +125,7 @@ impl Collection {
 
         let encoder = ZstdEncoder::with_dict(
             BufReader::new(&content[..]),
-            async_compression::Level::Best,
+            async_compression::Level::Default, // TODO: configure
             &self.dict.clone().unwrap()[..]);
         
         let mut ret = Vec::new();
@@ -163,6 +162,23 @@ impl Collection {
         fp.seek(std::io::SeekFrom::Start(offset as u64)).await?;
         
         Ok(WarcReader::from_bufreader(self.get_decompressor(fp).await).async_next().await)
+    }
+
+    // TODO: atomic
+    pub async fn delete(&mut self) -> anyhow::Result<()> {
+        let slug = self.get_slug();
+        for i in 1.. {
+            let target = format!("{}/{}.{}.warc", self.path, slug, i);
+            if let Err(_) = fs::metadata(&target).await {
+                break;
+            }
+            
+            fs::remove_file(target).await?;
+        }
+        let _ = fs::remove_file(format!("{}/{}.cdx", self.path, slug)).await;
+        let _ = fs::remove_file(format!("{}/{}.cdx.gz", self.path, slug)).await;
+        let _ = fs::remove_file(format!("{}/{}.json", self.path, slug)).await;
+        Ok(())
     }
 }
 
