@@ -34,7 +34,7 @@ pub struct DictStore {
 
 impl DictStore {
     pub async fn from_dir(path: String) -> anyhow::Result<DictStore> {
-        let mut store = DictStore {
+        let store = DictStore {
             store_location: path,
             zstd_dicts: RwLock::new(HashMap::new())
         };

@@ -150,6 +150,10 @@ impl WarcReader {
         }
     }
 
+    pub fn from_bufreader(br: BufReader<Box<dyn AsyncRead + Unpin + Send>>) -> WarcReader{
+        WarcReader{br}
+    }
+
     pub async fn from_file(path: &str) -> anyhow::Result<WarcReader> {
         Ok(WarcReader{
             br: open_compressed(path).await?

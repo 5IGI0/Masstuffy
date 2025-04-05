@@ -51,10 +51,11 @@ For more details, please refer to the LICENSE file.
   - [X] append
   - [ ] fs atomicity
   - [ ] compression
-    - [ ] compress
-    - [ ] dictionnary
+    - [X] compress
+    - [X] dictionnary
     - [ ] regenerate cdx files
-    - [ ] dictionnary generation
+    - [X] dictionnary generation
+    - [ ] collection rebuild
   - [X] make async
 - cli
   - [x] setup file layout

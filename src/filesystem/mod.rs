@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use anyhow::{anyhow, bail, Result};
 use collections::{load_collection, Collection};
@@ -34,7 +34,7 @@ mod dict_store;
 pub struct FileSystem {
     path: String,
     config: Config,
-    collections: Arc<Mutex<HashMap<String, Collection>>>, // TODO: RWLock
+    collections: Arc<Mutex<HashMap<String, RwLock<Collection>>>>, // TODO: RWLock for hashmap
     dictionary_store: Arc<dict_store::DictStore>
 }
 
@@ -59,7 +59,7 @@ pub async fn init() -> Result<FileSystem> {
 
     info!("loading collections...");
     
-    let collections = Arc::new(Mutex::new(HashMap::new()));
+    let mut collections = HashMap::new();
     let mut dir_handle = fs::read_dir(format!("{}/data/repository/", path)).await?;
     while let Some(f) = dir_handle.next_entry().await? {
         if f.file_name().to_string_lossy().ends_with(".json") {
@@ -67,13 +67,12 @@ pub async fn init() -> Result<FileSystem> {
             let coll_ret = load_collection(f.path().to_str().unwrap(), dictionary_store.clone()).await;
 
             if let Ok(collection) = coll_ret {
-                let mut colls = collections.lock().await;
-                colls.insert(collection.get_slug(), collection);
+                collections.insert(collection.get_slug(), RwLock::new(collection));
             }
         }
     }
 
-    Ok(FileSystem{path, config, collections, dictionary_store: dictionary_store})
+    Ok(FileSystem{path, config, collections: Arc::new(Mutex::new(collections)), dictionary_store: dictionary_store})
 }
 
 impl FileSystem {
@@ -92,14 +91,14 @@ impl FileSystem {
             &slug,
             dictionary,
             self.dictionary_store.clone()).await?;
-        self.collections.lock().await.insert(slug, coll);
+        self.collections.lock().await.insert(slug, RwLock::new(coll));
 
         Ok(true)
     }
 
     pub async fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<CDXRecord> {
         if let Some(c) = self.collections.lock().await.get_mut(slug) {
-            let ret = c.add_warc(record).await;
+            let ret = c.write().await.add_warc(record).await;
             if let Err(x) = ret {
                 bail!("unable to write warc: {}", x);
             } else {
@@ -116,7 +115,7 @@ impl FileSystem {
 
     pub async fn get_collection_cdx_iter(&self, collection_name: &str) -> anyhow::Result<CDXFileReader>{
         if let Some(col) = self.collections.lock().await.get(collection_name) {
-            Ok(col.iter_cdx()?)
+            Ok(col.read().await.iter_cdx()?)
         } else {
             Err(anyhow::Error::msg("no such collection"))
         }
@@ -127,13 +126,13 @@ impl FileSystem {
     }
 
     pub async fn get_record(&self, coll: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
-        // TODO: do it properly
-        let cloned_ref = self.collections.clone();
-        let colls = cloned_ref.lock().await;
-        if let None = colls.get(coll) {
-            Ok(None)
+        let colls = self.collections.lock().await;
+        let coll = colls.get(coll);
+
+        if let Some(coll) = coll {
+            Ok(coll.write().await.get_record(filename, offset).await?) // TODO: no need for write access
         } else {
-            colls.get(coll).unwrap().get_record(filename, offset).await
+            Ok(None)
         }
     }
 

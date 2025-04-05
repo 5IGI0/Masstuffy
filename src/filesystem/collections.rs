@@ -17,13 +17,13 @@ use async_std::io::Cursor;
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use tokio::{fs::{self, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}};
+use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufStream}};
 
 use anyhow::Result;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use async_compression::tokio::bufread::ZstdEncoder;
+use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 
 use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
 
@@ -65,6 +65,7 @@ impl Collection {
     }
 
     // TODO: mutex
+    // TODO: compression suffix
     // TODO: keep the files open
     // TODO: extract http response status code (when available)
     // TODO: flush .cdx to .cdx.gz when enough big \
@@ -133,18 +134,35 @@ impl Collection {
         ret
     }
 
+    async fn get_decompressor(&mut self, fp: fs::File) -> BufReader<Box<dyn AsyncRead + Unpin + Send>> {
+        if let None = self.manifest.dict_id {
+            return BufReader::new(Box::new(fp));
+        }
+
+        self.ensure_dict_loaded().await;
+
+        BufReader::new(
+            Box::new(
+                ZstdDecoder::with_dict(
+                    BufReader::new(fp),
+                    &self.dict.clone().unwrap()[..]
+                ).expect(&format!("unable to load dictionary {}", self.manifest.dict_id.unwrap()))
+            )
+        )
+    }
+
     pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
         // TODO: cdx.gz
         // TODO: async
         Ok(CDXFileReader::open(&format!("{}/{}.cdx", self.path, self.get_slug()))?)
     }
 
-    pub async fn get_record(&self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
+    pub async fn get_record(&mut self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
         let mut fp = fs::File::open(format!("{}/{}", self.path, filename)).await?;
 
         fp.seek(std::io::SeekFrom::Start(offset as u64)).await?;
         
-        Ok(WarcReader::from_fp(fp).async_next().await)
+        Ok(WarcReader::from_bufreader(self.get_decompressor(fp).await).async_next().await)
     }
 }
 
