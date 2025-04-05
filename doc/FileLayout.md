@@ -17,12 +17,12 @@ _Please note this is subject to change._
     │           └── ...
     ├── dict
     │   └── [compress_method]
-    │       ├── [slug](.[id]).[ext]
-    │       └── [slug](.[id]).json
+    │       └── [slug](.[id]).[ext]
     └── repository
-        ├── [slug].[part](.[dict_id]).warc(.[compression_method])
-        ├── [slug].cdx.gz # when .cdx is enough large, flush inside
-        ├── [slug].cdx
-        └── [slug].json
+        └── [collection_uuid]
+            ├── records.[part](.[dict_id]).warc(.[compression_method])
+            ├── index.cdx.gz # when .cdx is enough large, flush inside
+            ├── index.cdx
+            └── manifest.json
 ```
 

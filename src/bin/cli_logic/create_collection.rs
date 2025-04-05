@@ -38,7 +38,7 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let mut fs = init().await
         .expect("unable to initialise fs");
 
-    if fs.has_collection(&args.collection).await {
+    if fs.has_collection_slug(&args.collection).await {
         error!("collection {} already exists", args.collection);
         return Ok(1);
     }

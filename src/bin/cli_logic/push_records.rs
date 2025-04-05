@@ -37,7 +37,7 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let mut fs = init().await
         .expect("unable to initialise fs");
 
-    if !fs.has_collection(&args.destination).await {
+    if !fs.has_collection_slug(&args.destination).await {
         error!("collection `{}` doesn't exist", args.destination);
         return Ok(1);
     }
@@ -53,11 +53,13 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         }
     }
 
+    let coll_uuid = fs.get_coll_uuid(&args.destination).await?;
+
     let mut reader = WarcReader::from_file(&args.source).await?;
     while let Some(record) = reader.async_next().await {
         let cdx = fs.add_warc(&args.destination, &record).await?;
         if let Some(db) = &dbm {
-            db.insert_record(&args.destination, &cdx).await?; // TODO: bulk insert
+            db.insert_record(&coll_uuid, &cdx).await?; // TODO: bulk insert
         }
     }
 

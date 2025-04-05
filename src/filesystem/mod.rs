@@ -34,7 +34,8 @@ mod dict_store;
 pub struct FileSystem {
     path: String,
     config: Config,
-    collections: Arc<Mutex<HashMap<String, RwLock<Collection>>>>, // TODO: RWLock for hashmap
+    collection_uuids: Arc<Mutex<HashMap<String, Arc<RwLock<Collection>>>>>, // TODO: RWLock for hashmap
+    collection_slugs: Arc<Mutex<HashMap<String, Arc<RwLock<Collection>>>>>, // TODO: RWLock for hashmap
     dictionary_store: Arc<dict_store::DictStore>
 }
 
@@ -59,30 +60,43 @@ pub async fn init() -> Result<FileSystem> {
 
     info!("loading collections...");
     
-    let mut collections = HashMap::new();
+    let mut collection_slugs: HashMap<String, Arc<RwLock<Collection>>> = HashMap::new();
+    let mut collection_uuids: HashMap<String, Arc<RwLock<Collection>>> = HashMap::new();
     let mut dir_handle = fs::read_dir(format!("{}/data/repository/", path)).await?;
     while let Some(f) = dir_handle.next_entry().await? {
-        if f.file_name().to_string_lossy().ends_with(".json") {
+        if f.metadata().await?.is_dir() {
             debug!("found {}", f.file_name().to_string_lossy());
             let coll_ret = load_collection(f.path().to_str().unwrap(), dictionary_store.clone()).await;
 
             if let Ok(collection) = coll_ret {
-                collections.insert(collection.get_slug(), RwLock::new(collection));
+                let slug = collection.get_slug();
+                let uuid = collection.get_uuid();
+                let collection = Arc::new(RwLock::new(collection));
+                collection_slugs.insert(slug.clone(), Arc::clone(&collection)); // TODO: check duplicate
+                collection_uuids.insert(uuid, Arc::clone(&collection));
             }
         }
     }
 
-    Ok(FileSystem{path, config, collections: Arc::new(Mutex::new(collections)), dictionary_store: dictionary_store})
+    Ok(FileSystem{
+        path, config,
+        collection_slugs: Arc::new(Mutex::new(collection_slugs)),
+        collection_uuids: Arc::new(Mutex::new(collection_uuids)),
+        dictionary_store: dictionary_store})
 }
 
 impl FileSystem {
-    pub async fn has_collection(&self, slug: &String) -> bool {
-        self.collections.lock().await.get(slug).is_some()
+    pub async fn has_collection_slug(&self, slug: &String) -> bool {
+        self.collection_slugs.lock().await.get(slug).is_some()
+    }
+
+    pub async fn has_collection_uuid(&self, slug: &String) -> bool {
+        self.collection_uuids.lock().await.get(slug).is_some()
     }
 
     pub async fn create_collection(&mut self, slug: String, dictionary: Option<(String, u32)>) -> anyhow::Result<bool> {
         // TODO: fix race condition
-        if self.has_collection(&slug).await {
+        if self.has_collection_slug(&slug).await {
             return Ok(false);
         }
 
@@ -91,13 +105,18 @@ impl FileSystem {
             &slug,
             dictionary,
             self.dictionary_store.clone()).await?;
-        self.collections.lock().await.insert(slug, RwLock::new(coll));
+        
+        let slug = coll.get_slug();
+        let uuid = coll.get_uuid();
+        let coll = Arc::new(RwLock::new(coll));
+        self.collection_slugs.lock().await.insert(slug, Arc::clone(&coll));
+        self.collection_uuids.lock().await.insert(uuid, Arc::clone(&coll));
 
         Ok(true)
     }
 
     pub async fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<CDXRecord> {
-        if let Some(c) = self.collections.lock().await.get_mut(slug) {
+        if let Some(c) = self.collection_slugs.lock().await.get_mut(slug) {
             let ret = c.write().await.add_warc(record).await;
             if let Err(x) = ret {
                 bail!("unable to write warc: {}", x);
@@ -110,11 +129,11 @@ impl FileSystem {
     }
 
     pub async fn get_collection_list(&self) -> Vec<String>{
-        self.collections.lock().await.keys().cloned().collect()
+        self.collection_slugs.lock().await.keys().cloned().collect()
     }
 
     pub async fn get_collection_cdx_iter(&self, collection_name: &str) -> anyhow::Result<CDXFileReader>{
-        if let Some(col) = self.collections.lock().await.get(collection_name) {
+        if let Some(col) = self.collection_slugs.lock().await.get(collection_name) {
             Ok(col.read().await.iter_cdx()?)
         } else {
             Err(anyhow::Error::msg("no such collection"))
@@ -125,9 +144,9 @@ impl FileSystem {
         self.config.database.clone()
     }
 
-    pub async fn get_record(&self, coll: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
-        let colls = self.collections.lock().await;
-        let coll = colls.get(coll);
+    pub async fn get_record(&self, coll_uuid: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
+        let colls = self.collection_uuids.lock().await;
+        let coll = colls.get(coll_uuid);
 
         if let Some(coll) = coll {
             Ok(coll.write().await.get_record(filename, offset).await?) // TODO: no need for write access
@@ -166,17 +185,27 @@ impl FileSystem {
     }
 
     pub async fn delete_collection(&mut self, slug: &str) -> anyhow::Result<()> {
-        let mut colls = self.collections.lock().await;
+        let mut colls = self.collection_slugs.lock().await;
 
         let col = colls.get(slug);
 
         if let Some(col) = col {
             let mut col = col.write().await;
+            let uuid = col.get_uuid();
             col.delete().await?;
             drop(col);
             colls.remove(slug); // TODO: remove from database
+            colls.remove(&uuid);
         }
 
         Ok(())
+    }
+
+    pub async fn get_coll_uuid(&self, coll_slug: &str) -> anyhow::Result<String> {
+        if let Some(col) = self.collection_slugs.lock().await.get(coll_slug) {
+            Ok(col.read().await.get_uuid())
+        } else {
+            Err(anyhow::format_err!("no such collection"))
+        }
     }
 }

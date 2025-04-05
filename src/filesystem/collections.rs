@@ -21,18 +21,22 @@ use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt,
 use anyhow::Result;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use std::sync::Arc;
 use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 
-use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
+use crate::warc::{self, cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
 
 use super::dict_store::DictStore;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CollectionManifest {
-    pub slug: String,
-    pub compression: Option<String>,
-    pub dict_id: Option<u32>,
+    uuid: String,
+    slug: String,
+    compression: Option<String>,
+    compression_level: i32,
+    dict_id: Option<u32>,
+    split_threshold: u64
 }
 
 impl CollectionManifest {
@@ -59,32 +63,54 @@ pub struct Collection {
 }
 
 impl Collection {
+    pub fn get_uuid(&self) -> String {
+        self.manifest.uuid.clone()
+    }
+
     pub fn get_slug(&self) -> String {
         self.manifest.slug.clone()
     }
 
+    fn gen_warc_filename(&self, n: i32) -> String{
+        format!(
+            "records.{}{}.warc{}", n,
+            if let Some(id) = &self.manifest.dict_id {
+                format!(".{}", id)
+            } else {"".to_string()},
+            if let Some(alg) = &self.manifest.compression {
+                format!(".{}", alg)
+            } else {"".to_string()})
+    }
+
     // TODO: mutex
-    // TODO: compression suffix
     // TODO: keep the files open
     // TODO: extract http response status code (when available)
     // TODO: flush .cdx to .cdx.gz when enough big \
     //       don't forget to patch list_records()  \
     //       and add the CDX header if it is the first flush
     pub async fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<CDXRecord>{
-        info!("writing new record to `{}` ({})", self.get_slug(), record.get_record_id()?);
+        info!("writing new record to `{}`: {}", self.get_slug(), record.get_record_id()?);
 
-        let serialized_record = record.serialize();
+        let serialized_record = self.compress(record.serialize()).await;
 
-        // TODO: create a new warc part when the file is too big
-        let warc_target = format!("{}/{}.1.warc", self.path, self.get_slug());
-        let warc_target_size = if let Ok(m) = tokio::fs::metadata(&warc_target).await {
-            m.len()
-        } else {
-            0
-        };
+        /* get the first file that can hold the record */
+        let mut warc_target = String::new();
+        let mut warc_target_size = 0;
+        for n in 1.. {
+            warc_target = self.gen_warc_filename(n);
+            if let Ok(m) = tokio::fs::metadata(format!("{}/{}", self.path, warc_target)).await {
+                warc_target_size = m.len();
+                if (warc_target_size+(serialized_record.len() as u64)) >= self.manifest.split_threshold {
+                    continue;
+                }
+            } else {
+                warc_target_size = 0;
+            };
+            break;
+        }
 
         let mut cdx = CDXRecord::from_warc(&record)?;
-        cdx.set_file(format!("{}.1.warc", self.get_slug()), Some(warc_target_size));
+        cdx.set_file(warc_target.clone(), Some(warc_target_size));
 
         debug!("{} cdx: {}", record.get_record_id()?, cdx);
         
@@ -92,15 +118,15 @@ impl Collection {
             .write(true)
             .append(true)
             .create(true)
-            .open(warc_target).await?
-            .write_all(&self.compress(serialized_record).await[..]).await
+            .open(format!("{}/{}", self.path, warc_target)).await?
+            .write_all(&serialized_record[..]).await
             .expect("unable to write warc file");
 
         OpenOptions::new()
             .write(true)
             .append(true)
             .create(true)
-            .open(format!("{}/{}.cdx", self.path, self.get_slug())).await?
+            .open(format!("{}/index.cdx", self.path)).await?
             .write_all(format!("{}\n", cdx).as_bytes()).await
             .expect("unable to write cdx file");
 
@@ -125,7 +151,7 @@ impl Collection {
 
         let encoder = ZstdEncoder::with_dict(
             BufReader::new(&content[..]),
-            async_compression::Level::Default, // TODO: configure
+            async_compression::Level::Precise(self.manifest.compression_level),
             &self.dict.clone().unwrap()[..]);
         
         let mut ret = Vec::new();
@@ -153,7 +179,7 @@ impl Collection {
     pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
         // TODO: cdx.gz
         // TODO: async
-        Ok(CDXFileReader::open(&format!("{}/{}.cdx", self.path, self.get_slug()))?)
+        Ok(CDXFileReader::open(&format!("{}/index.cdx", self.path))?)
     }
 
     pub async fn get_record(&mut self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
@@ -166,27 +192,16 @@ impl Collection {
 
     // TODO: atomic
     pub async fn delete(&mut self) -> anyhow::Result<()> {
-        let slug = self.get_slug();
-        for i in 1.. {
-            let target = format!("{}/{}.{}.warc", self.path, slug, i);
-            if let Err(_) = fs::metadata(&target).await {
-                break;
-            }
-            
-            fs::remove_file(target).await?;
-        }
-        let _ = fs::remove_file(format!("{}/{}.cdx", self.path, slug)).await;
-        let _ = fs::remove_file(format!("{}/{}.cdx.gz", self.path, slug)).await;
-        let _ = fs::remove_file(format!("{}/{}.json", self.path, slug)).await;
+        fs::remove_dir_all(&self.path).await?;
         Ok(())
     }
 }
 
-pub async fn load_collection(manifest_path: &str, dict_store: Arc<DictStore>) -> Result<Collection> {
-    debug!("loading collection: {}", manifest_path);
+pub async fn load_collection(collection_path: &str, dict_store: Arc<DictStore>) -> Result<Collection> {
+    debug!("loading collection: {}", collection_path);
     debug!("reading manifest...");
     let manifest: CollectionManifest = serde_json::from_slice(
-        &fs::read(manifest_path).await?)?;
+        &fs::read(format!("{}/manifest.json", collection_path)).await?)?;
 
     manifest.validate().await?;
 
@@ -198,7 +213,7 @@ pub async fn load_collection(manifest_path: &str, dict_store: Arc<DictStore>) ->
     }
 
     let collection = Collection{
-        path: std::path::Path::new(manifest_path).parent().unwrap().to_str().unwrap().to_string(),
+        path: collection_path.to_string(),
         manifest,
         dict_store, dict: None};
 
@@ -214,10 +229,14 @@ pub async fn create_collection(
     dict_store: Arc<DictStore>
     ) -> Result<Collection>{
     debug!("creating collection: {}", slug);
-    let manifest_path = format!("{}/{}.json", repository_path, slug);
+    let collection_uuid = Uuid::new_v4().to_string();
+    let collection_path = format!("{}/{}/", repository_path, collection_uuid);
 
     let manifest = serde_json::to_string(&CollectionManifest{
+        uuid: collection_uuid,
         slug: slug.to_string(),
+        compression_level: zstd::DEFAULT_COMPRESSION_LEVEL,  // TODO: configure
+        split_threshold: (1 << 32) - 1, // TODO: configure
         dict_id: if let Some(x) = &dictionary {
             Some(x.1)
         } else {
@@ -231,8 +250,9 @@ pub async fn create_collection(
     
     // TODO: manifest.validate()
 
-    fs::write(&manifest_path, &manifest).await?;
-    let mut coll = load_collection(&manifest_path, dict_store).await?;
+    fs::create_dir(&collection_path).await?;
+    fs::write(format!("{}/manifest.json", collection_path), &manifest).await?;
+    let mut coll = load_collection(&collection_path, dict_store).await?;
 
     let mut first_record = WarcRecord::new("warcinfo".to_string());
     first_record.set_header("Content-Type".to_string(), "application/warc-fields".to_string());
