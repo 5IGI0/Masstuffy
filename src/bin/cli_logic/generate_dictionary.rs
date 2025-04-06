@@ -103,19 +103,19 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     tokio::fs::remove_dir_all(path).await?;
     fs.add_zstd_dict(&format!("{}_{}", args.collection, Utc::now().format(MASSTUFFY_DATE_FMT)), dict).await;
 
-    if args.rebuild {
-        info!("rebuilding {}", args.collection);
-        let dst = format!("_{}", args.collection);
-        fs.create_collection(dst.clone(), Some(("zstd".to_string(), dict_id))).await?;
-        for record in fs.get_collection_cdx_iter(&args.collection).await?.into_iter() {
-            if let Err(x) = db.insert_record(&dst, &record).await {
-                panic!("error when inserting record: {}", x);
-            }
-        }
+    // if args.rebuild {
+    //     info!("rebuilding {}", args.collection);
+    //     let dst = format!("_{}", args.collection);
+    //     fs.create_collection(dst.clone(), Some(("zstd".to_string(), dict_id))).await?;
+    //     for record in fs.get_collection_cdx_iter(&args.collection).await?.into_iter() {
+    //         if let Err(x) = db.insert_record(&dst, &record).await {
+    //             panic!("error when inserting record: {}", x);
+    //         }
+    //     }
 
-        // TODO: atomic move
-        fs.delete_collection(&args.collection).await?;
-    }
+    //     // TODO: atomic move
+    //     fs.delete_collection(&args.collection).await?;
+    // }
     
     Ok(0)
 }

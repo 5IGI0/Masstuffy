@@ -16,9 +16,13 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{fmt, io::{BufRead, BufReader}};
+use std::fmt;
+
 use anyhow::bail;
 use log::{debug, error};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+
+use crate::utils::open_compressed;
 
 use super::WarcRecord;
 
@@ -111,25 +115,21 @@ impl fmt::Display for CDXRecord {
 }
 
 pub struct CDXFileReader {
-    br: BufReader<std::fs::File>,
+    br: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     buff: String
 }
 
 impl CDXFileReader {
-    pub fn open(path: &str) -> anyhow::Result<Self> {
+    pub async fn open(path: &str) -> anyhow::Result<Self> {
         Ok(CDXFileReader{
-            br: BufReader::new(std::fs::File::open(path)?),
+            br: open_compressed(path).await?,
             buff: String::new()
         })
     }
-}
 
-impl Iterator for CDXFileReader {
-    type Item = CDXRecord;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub async fn async_next(&mut self) -> Option<CDXRecord> {
         self.buff.clear();
-        if let Err(x) = self.br.read_line(&mut self.buff) {
+        if let Err(x) = self.br.read_line(&mut self.buff).await {
             error!("failed to read cdx line: {}", x);
             return None
         }

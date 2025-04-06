@@ -16,7 +16,7 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}};
+use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}, sync::RwLock};
 
 use anyhow::Result;
 use log::{debug, info};
@@ -25,7 +25,7 @@ use uuid::Uuid;
 use std::sync::Arc;
 use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 
-use crate::warc::{self, cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
+use crate::warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord};
 
 use super::dict_store::DictStore;
 
@@ -59,7 +59,7 @@ pub struct Collection {
     path: String,
     manifest: CollectionManifest,
     dict_store: Arc<DictStore>,
-    dict: Option<Arc<Vec<u8>>>
+    dict: RwLock<Option<Arc<Vec<u8>>>>
 }
 
 impl Collection {
@@ -88,7 +88,7 @@ impl Collection {
     // TODO: flush .cdx to .cdx.gz when enough big \
     //       don't forget to patch list_records()  \
     //       and add the CDX header if it is the first flush
-    pub async fn add_warc(&mut self, record: &WarcRecord) -> anyhow::Result<CDXRecord>{
+    pub async fn add_warc(&self, record: &WarcRecord) -> anyhow::Result<CDXRecord>{
         info!("writing new record to `{}`: {}", self.get_slug(), record.get_record_id()?);
 
         let serialized_record = self.compress(record.serialize()).await;
@@ -133,56 +133,62 @@ impl Collection {
         Ok(cdx)
     }
 
-    async fn ensure_dict_loaded(&mut self) {
-        if let None = self.dict {
-            self.dict = self.dict_store.get_zstd_dict(self.manifest.dict_id.unwrap()).await;
-            if let None = self.dict {
+    async fn ensure_dict_loaded(&self) {
+        let dict = self.dict.read().await;
+        if let None = *dict {
+            *self.dict.write().await = self.dict_store.get_zstd_dict(self.manifest.dict_id.unwrap()).await;
+            if let None = *self.dict.read().await {
                 panic!("unable to load dictionary {}", self.manifest.dict_id.unwrap())
             }
         }
     }
 
-    async fn compress(&mut self, content: Vec<u8>) -> Vec<u8> {
+    async fn compress(&self, content: Vec<u8>) -> Vec<u8> {
         if let None = self.manifest.dict_id {
             return content
         }
         
         self.ensure_dict_loaded().await;
 
+        let dict = self.dict.read().await;
+        let vec = dict.clone().unwrap();
+
         let encoder = ZstdEncoder::with_dict(
             BufReader::new(&content[..]),
             async_compression::Level::Precise(self.manifest.compression_level),
-            &self.dict.clone().unwrap()[..]);
+            &vec[..]);
         
         let mut ret = Vec::new();
         encoder.unwrap().read_to_end(&mut ret).await.expect("unable to compress record");
         ret
     }
 
-    async fn get_decompressor(&mut self, fp: fs::File) -> BufReader<Box<dyn AsyncRead + Unpin + Send>> {
+    async fn get_decompressor(&self, fp: fs::File) -> BufReader<Box<dyn AsyncRead + Unpin + Send>> {
         if let None = self.manifest.dict_id {
             return BufReader::new(Box::new(fp));
         }
 
         self.ensure_dict_loaded().await;
 
+        let dict = self.dict.read().await;
+        let vec = dict.clone().unwrap();
+
         BufReader::new(
             Box::new(
                 ZstdDecoder::with_dict(
                     BufReader::new(fp),
-                    &self.dict.clone().unwrap()[..]
+                    &vec[..]
                 ).expect(&format!("unable to load dictionary {}", self.manifest.dict_id.unwrap()))
             )
         )
     }
 
-    pub fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
+    pub async fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
         // TODO: cdx.gz
-        // TODO: async
-        Ok(CDXFileReader::open(&format!("{}/index.cdx", self.path))?)
+        Ok(CDXFileReader::open(&format!("{}/index.cdx", self.path)).await?)
     }
 
-    pub async fn get_record(&mut self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
+    pub async fn get_record(&self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
         let mut fp = fs::File::open(format!("{}/{}", self.path, filename)).await?;
 
         fp.seek(std::io::SeekFrom::Start(offset as u64)).await?;
@@ -215,7 +221,7 @@ pub async fn load_collection(collection_path: &str, dict_store: Arc<DictStore>) 
     let collection = Collection{
         path: collection_path.to_string(),
         manifest,
-        dict_store, dict: None};
+        dict_store, dict: RwLock::new(None)};
 
     info!("collection {} loaded!", collection.get_slug());
 
@@ -252,7 +258,7 @@ pub async fn create_collection(
 
     fs::create_dir(&collection_path).await?;
     fs::write(format!("{}/manifest.json", collection_path), &manifest).await?;
-    let mut coll = load_collection(&collection_path, dict_store).await?;
+    let coll = load_collection(&collection_path, dict_store).await?;
 
     let mut first_record = WarcRecord::new("warcinfo".to_string());
     first_record.set_header("Content-Type".to_string(), "application/warc-fields".to_string());

@@ -159,9 +159,7 @@ impl WarcReader {
             br: open_compressed(path).await?
         })
     }
-}
-
-impl WarcReader {
+    
     pub async fn async_next(&mut self) -> Option<WarcRecord> {
         let ret = read_record(&mut self.br).await;
         if let Ok(x) = ret {

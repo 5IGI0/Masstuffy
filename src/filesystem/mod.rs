@@ -21,11 +21,10 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use collections::{load_collection, Collection};
 use log::{debug, error, info};
 
-use crate::warc::cdx::{CDXFileReader, CDXRecord};
 use crate::{config::Config, warc::WarcRecord};
 
 mod collections;
@@ -34,9 +33,15 @@ mod dict_store;
 pub struct FileSystem {
     path: String,
     config: Config,
-    collection_uuids: Arc<Mutex<HashMap<String, Arc<RwLock<Collection>>>>>, // TODO: RWLock for hashmap
-    collection_slugs: Arc<Mutex<HashMap<String, Arc<RwLock<Collection>>>>>, // TODO: RWLock for hashmap
+    collection_create_mutex: Mutex<()>,
+    collection_uuids: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
+    collection_slugs: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
     dictionary_store: Arc<dict_store::DictStore>
+}
+
+pub enum CollID {
+    Uuid(String),
+    Slug(String)
 }
 
 pub async fn init() -> Result<FileSystem> {
@@ -80,28 +85,36 @@ pub async fn init() -> Result<FileSystem> {
 
     Ok(FileSystem{
         path, config,
-        collection_slugs: Arc::new(Mutex::new(collection_slugs)),
-        collection_uuids: Arc::new(Mutex::new(collection_uuids)),
+        collection_create_mutex: Mutex::new(()),
+        collection_slugs: RwLock::new(collection_slugs),
+        collection_uuids: RwLock::new(collection_uuids),
         dictionary_store: dictionary_store})
 }
 
 impl FileSystem {
     pub async fn has_collection_slug(&self, slug: &String) -> bool {
-        self.collection_slugs.lock().await.get(slug).is_some()
+        self.collection_slugs.read().await.get(slug).is_some()
     }
 
     pub async fn has_collection_uuid(&self, slug: &String) -> bool {
-        self.collection_uuids.lock().await.get(slug).is_some()
+        self.collection_uuids.read().await.get(slug).is_some()
     }
 
     pub async fn create_collection(&mut self, slug: String, dictionary: Option<(String, u32)>) -> anyhow::Result<bool> {
-        // TODO: fix race condition
+        if self.has_collection_slug(&slug).await {
+            return Ok(false);
+        }
+
+        // i use another mutex because i don't want
+        // to block read operations while the collection
+        // is being created.
+        let _ = self.collection_create_mutex.lock().await;
         if self.has_collection_slug(&slug).await {
             return Ok(false);
         }
 
         let coll = collections::create_collection(
-            &format!("{}/data/repository", self.path),
+            &format!("{}/data/repository/", self.path),
             &slug,
             dictionary,
             self.dictionary_store.clone()).await?;
@@ -109,35 +122,14 @@ impl FileSystem {
         let slug = coll.get_slug();
         let uuid = coll.get_uuid();
         let coll = Arc::new(RwLock::new(coll));
-        self.collection_slugs.lock().await.insert(slug, Arc::clone(&coll));
-        self.collection_uuids.lock().await.insert(uuid, Arc::clone(&coll));
+        self.collection_slugs.write().await.insert(slug, Arc::clone(&coll));
+        self.collection_uuids.write().await.insert(uuid, Arc::clone(&coll));
 
         Ok(true)
     }
 
-    pub async fn add_warc(&mut self, slug: &String, record: &WarcRecord) -> anyhow::Result<CDXRecord> {
-        if let Some(c) = self.collection_slugs.lock().await.get_mut(slug) {
-            let ret = c.write().await.add_warc(record).await;
-            if let Err(x) = ret {
-                bail!("unable to write warc: {}", x);
-            } else {
-                return Ok(ret.unwrap());
-            }
-        } else {
-            bail!("no such collection");
-        }
-    }
-
     pub async fn get_collection_list(&self) -> Vec<String>{
-        self.collection_slugs.lock().await.keys().cloned().collect()
-    }
-
-    pub async fn get_collection_cdx_iter(&self, collection_name: &str) -> anyhow::Result<CDXFileReader>{
-        if let Some(col) = self.collection_slugs.lock().await.get(collection_name) {
-            Ok(col.read().await.iter_cdx()?)
-        } else {
-            Err(anyhow::Error::msg("no such collection"))
-        }
+        self.collection_slugs.read().await.keys().cloned().collect()
     }
 
     pub fn get_database_conn_string(&self) -> String {
@@ -145,11 +137,11 @@ impl FileSystem {
     }
 
     pub async fn get_record(&self, coll_uuid: &str, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>> {
-        let colls = self.collection_uuids.lock().await;
+        let colls = self.collection_uuids.read().await;
         let coll = colls.get(coll_uuid);
 
         if let Some(coll) = coll {
-            Ok(coll.write().await.get_record(filename, offset).await?) // TODO: no need for write access
+            Ok(coll.read().await.get_record(filename, offset).await?)
         } else {
             Ok(None)
         }
@@ -185,7 +177,7 @@ impl FileSystem {
     }
 
     pub async fn delete_collection(&mut self, slug: &str) -> anyhow::Result<()> {
-        let mut colls = self.collection_slugs.lock().await;
+        let colls = self.collection_slugs.read().await;
 
         let col = colls.get(slug);
 
@@ -194,6 +186,8 @@ impl FileSystem {
             let uuid = col.get_uuid();
             col.delete().await?;
             drop(col);
+            drop(colls);
+            let mut colls = self.collection_slugs.write().await;
             colls.remove(slug); // TODO: remove from database
             colls.remove(&uuid);
         }
@@ -202,10 +196,23 @@ impl FileSystem {
     }
 
     pub async fn get_coll_uuid(&self, coll_slug: &str) -> anyhow::Result<String> {
-        if let Some(col) = self.collection_slugs.lock().await.get(coll_slug) {
+        if let Some(col) = self.collection_slugs.read().await.get(coll_slug) {
             Ok(col.read().await.get_uuid())
         } else {
             Err(anyhow::format_err!("no such collection"))
+        }
+    }
+
+    pub async fn get_collection(&self, coll_id: CollID) -> Option<Arc<RwLock<Collection>>> {
+        let (colls, k) = match coll_id {
+            CollID::Uuid(x) => (self.collection_uuids.read().await, x),
+            CollID::Slug(x) => (self.collection_slugs.read().await, x),
+        };
+
+        if let Some(coll) = colls.get(&k) {
+            Some(Arc::clone(coll))
+        } else {
+            None
         }
     }
 }

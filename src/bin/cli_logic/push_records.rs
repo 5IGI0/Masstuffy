@@ -20,7 +20,7 @@ use std::error::Error;
 use clap::Parser;
 
 use log::error;
-use masstuffy::{database::DBManager, filesystem::init, warc::WarcReader};
+use masstuffy::{database::DBManager, filesystem::{init, CollID}, warc::WarcReader};
 
 #[derive(Parser)]
 struct Args {
@@ -34,7 +34,7 @@ struct Args {
 pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let args = Args::parse_from(&argv[1..]);
 
-    let mut fs = init().await
+    let fs = init().await
         .expect("unable to initialise fs");
 
     if !fs.has_collection_slug(&args.destination).await {
@@ -53,11 +53,17 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         }
     }
 
-    let coll_uuid = fs.get_coll_uuid(&args.destination).await?;
+    let coll = fs.get_collection(CollID::Slug(args.destination)).await;
+    if let None = coll {
+        error!("no such collection");
+        return Ok(1);
+    }
+    let coll = coll.unwrap();
+    let coll_uuid = coll.read().await.get_uuid();
 
     let mut reader = WarcReader::from_file(&args.source).await?;
     while let Some(record) = reader.async_next().await {
-        let cdx = fs.add_warc(&args.destination, &record).await?;
+        let cdx = coll.write().await.add_warc(&record).await?;
         if let Some(db) = &dbm {
             db.insert_record(&coll_uuid, &cdx).await?; // TODO: bulk insert
         }

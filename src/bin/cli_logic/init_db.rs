@@ -19,7 +19,7 @@
 use std::error::Error;
 
 use log::{error, info};
-use masstuffy::{database::DBManager, filesystem::init};
+use masstuffy::{database::DBManager, filesystem::{init, CollID}};
 
 pub async fn main(_argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     let fs = init().await
@@ -34,9 +34,13 @@ pub async fn main(_argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     for col in &collections {
         info!("inserting collection '{}'", col);
         // TODO: optimise
-        for record in fs.get_collection_cdx_iter(col).await?.into_iter() {
-            if let Err(x) = db.insert_record(col, &record).await {
-                error!("error when inserting record: {}", x);
+        if let Some(col) = fs.get_collection(CollID::Slug(col.clone())).await {
+            let uuid = col.read().await.get_uuid();
+            let mut reader = col.read().await.iter_cdx().await?;
+            while let Some(record) = reader.async_next().await {
+                if let Err(x) = db.insert_record(&uuid, &record).await {
+                    error!("error when inserting record: {}", x);
+                }
             }
         }
     }
