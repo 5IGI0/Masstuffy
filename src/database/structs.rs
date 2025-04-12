@@ -28,5 +28,9 @@ pub struct DBWarcRecord {
     pub filename: String,
     pub offset: i64,
     pub r#type: String,
-    pub uri: Option<String>
+    pub uri: Option<String>,
+    pub dict_type: Option<String>,
+    pub dict_id: Option<i64>
 }
+
+pub const RECORD_FLAG_ACTIVE: i32 = 1<<0;

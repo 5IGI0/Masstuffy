@@ -20,7 +20,7 @@ use std::error::Error;
 use clap::Parser;
 
 use log::error;
-use masstuffy::{database::DBManager, filesystem::{init, CollID}, warc::WarcReader};
+use masstuffy::{database::{structs::RECORD_FLAG_ACTIVE, DBManager}, filesystem::{init, CollID}, warc::WarcReader};
 
 #[derive(Parser)]
 struct Args {
@@ -59,13 +59,24 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         return Ok(1);
     }
     let coll = coll.unwrap();
-    let coll_uuid = coll.read().await.get_uuid();
+    let coll_uuid = coll.read().await.get_uuid().await;
+
+    let (dict_id, dict_algo) = coll.read().await.get_dict().await;
+    let dict_id = if let Some(dict_id) = dict_id {
+        Some(dict_id as i64)
+    } else {
+        None
+    };
 
     let mut reader = WarcReader::from_file(&args.source).await?;
     while let Some(record) = reader.async_next().await {
         let cdx = coll.write().await.add_warc(&record).await?;
         if let Some(db) = &dbm {
-            db.insert_record(&coll_uuid, &cdx).await?; // TODO: bulk insert
+            db.insert_record(
+                &coll_uuid, &cdx,
+                RECORD_FLAG_ACTIVE,
+                dict_id, dict_algo.as_deref()
+            ).await?; // TODO: bulk insert
         }
     }
 

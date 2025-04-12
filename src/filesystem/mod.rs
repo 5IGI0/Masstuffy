@@ -74,8 +74,8 @@ pub async fn init() -> Result<FileSystem> {
             let coll_ret = load_collection(f.path().to_str().unwrap(), dictionary_store.clone()).await;
 
             if let Ok(collection) = coll_ret {
-                let slug = collection.get_slug();
-                let uuid = collection.get_uuid();
+                let slug = collection.get_slug().await;
+                let uuid = collection.get_uuid().await;
                 let collection = Arc::new(RwLock::new(collection));
                 collection_slugs.insert(slug.clone(), Arc::clone(&collection)); // TODO: check duplicate
                 collection_uuids.insert(uuid, Arc::clone(&collection));
@@ -119,8 +119,8 @@ impl FileSystem {
             dictionary,
             self.dictionary_store.clone()).await?;
         
-        let slug = coll.get_slug();
-        let uuid = coll.get_uuid();
+        let slug = coll.get_slug().await;
+        let uuid = coll.get_uuid().await;
         let coll = Arc::new(RwLock::new(coll));
         self.collection_slugs.write().await.insert(slug, Arc::clone(&coll));
         self.collection_uuids.write().await.insert(uuid, Arc::clone(&coll));
@@ -183,7 +183,7 @@ impl FileSystem {
 
         if let Some(col) = col {
             let mut col = col.write().await;
-            let uuid = col.get_uuid();
+            let uuid = col.get_uuid().await;
             col.delete().await?;
             drop(col);
             drop(colls);
@@ -197,7 +197,7 @@ impl FileSystem {
 
     pub async fn get_coll_uuid(&self, coll_slug: &str) -> anyhow::Result<String> {
         if let Some(col) = self.collection_slugs.read().await.get(coll_slug) {
-            Ok(col.read().await.get_uuid())
+            Ok(col.read().await.get_uuid().await)
         } else {
             Err(anyhow::format_err!("no such collection"))
         }

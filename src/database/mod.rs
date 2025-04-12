@@ -16,13 +16,13 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
  **/
  
+use anyhow::Ok;
+use chrono::NaiveDateTime;
 use sqlx::postgres::PgPool;
 use structs::DBWarcRecord;
 use log::info;
- 
-use crate::{constants::MASSTUFFY_DATE_FMT, warc::cdx::CDXRecord};
-use chrono::NaiveDateTime;
 
+use crate::{constants::MASSTUFFY_DATE_FMT, warc::cdx::CDXRecord};
 
 pub mod structs;
 
@@ -56,15 +56,16 @@ impl DBManager {
     }
 
     // TODO: insert from iterator
-    pub async fn insert_record(&self, coll: &str, record: &CDXRecord) -> anyhow::Result<()> {
+    pub async fn insert_record(&self, coll: &str, record: &CDXRecord, flags: i32, dict_id: Option<i64>, dict_type: Option<&str>) -> anyhow::Result<()> {
         sqlx::query(r#"
         INSERT INTO masstuffy_records(
             flags, date, identifier,
             collection, filename, "offset", "type",
-            uri)
+            uri, dict_id, dict_type)
         VALUES(
-            0, to_timestamp($1, 'YYYYMMDDHH24MISS'), $2,
-            $3, $4, $5, $6, $7)"#)
+            $1, to_timestamp($2, 'YYYYMMDDHH24MISS'), $3,
+            $4, $5, $6, $7, $8, $9, $10)"#)
+            .bind(flags)
             .bind(record.get_date())
             .bind(record.get_record_id())
             .bind(coll)
@@ -72,14 +73,45 @@ impl DBManager {
             .bind(record.get_file_offset().unwrap())
             .bind(record.get_record_type())
             .bind(record.get_url())
+            .bind(dict_id)
+            .bind(dict_type)
             .execute(&self.db).await?;
         Ok(())
     }
 
     pub async fn get_record_from_id(&self, id: String) -> anyhow::Result<DBWarcRecord> {
         let record: DBWarcRecord = sqlx::query_as!(DBWarcRecord,
-            "SELECT * FROM masstuffy_records WHERE identifier=$1 LIMIT 1", id).fetch_one(&self.db).await?.into();
+            "SELECT * FROM masstuffy_records WHERE identifier=$1 AND (flags&1) = 1 LIMIT 1", id).fetch_one(&self.db).await?.into();
         Ok(record)
+    }
+
+    pub async fn activate_records(&self, collection: &String, dict_id: Option<i64>, dict_type: Option<&str>) -> anyhow::Result<()> {
+        sqlx::query(r#"
+        UPDATE masstuffy_records
+        SET flags = flags|1
+        WHERE
+            collection = $1 AND
+            dict_id    = $2 AND
+            dict_type  = $3"#)
+            .bind(collection)
+            .bind(dict_id)
+            .bind(dict_type)
+            .execute(&self.db).await?;
+        Ok(())
+    }
+
+    pub async fn delete_records(&self, collection: &String, dict_id: Option<i64>, dict_type: Option<&str>) -> anyhow::Result<()> {
+        sqlx::query(r#"
+        DELETE FROM masstuffy_records
+        WHERE
+            collection = $1 AND
+            dict_id    = $2 AND
+            dict_type  = $3"#)
+            .bind(collection)
+            .bind(dict_id)
+            .bind(dict_type)
+            .execute(&self.db).await?;
+        Ok(())
     }
 
     pub async fn get_record_from_uri(&self, date: &String, uri: &String) -> anyhow::Result<DBWarcRecord> {
@@ -88,7 +120,8 @@ impl DBManager {
             r#"SELECT * FROM masstuffy_records
             WHERE
                 "type" != 'request' AND
-                uri=$1
+                uri=$1 AND
+                (flags&1) = 1
             ORDER BY ABS(DATE_PART('epoch', date) - DATE_PART('epoch', $2::timestamp)) ASC
             LIMIT 1
             "#, uri, NaiveDateTime::parse_from_str(date, MASSTUFFY_DATE_FMT)?).fetch_one(&self.db).await?.into();
@@ -101,6 +134,7 @@ impl DBManager {
             r#"
             SELECT * FROM masstuffy_records
             WHERE collection=$1
+            AND (flags&1) = 1
             ORDER BY hashint8(id)
             LIMIT $2"#, collection, limit).
             fetch_all(&self.db).await?) // TODO: make it random?

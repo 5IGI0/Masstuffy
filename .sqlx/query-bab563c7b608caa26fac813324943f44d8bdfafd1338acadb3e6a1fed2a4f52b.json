@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT * FROM masstuffy_records WHERE identifier=$1 LIMIT 1",
+  "query": "SELECT * FROM masstuffy_records\n            WHERE\n                \"type\" != 'request' AND\n                uri=$1 AND\n                (flags&1) = 1\n            ORDER BY ABS(DATE_PART('epoch', date) - DATE_PART('epoch', $2::timestamp)) ASC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -47,11 +47,22 @@
         "ordinal": 8,
         "name": "uri",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "dict_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "dict_id",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Text",
+        "Timestamp"
       ]
     },
     "nullable": [
@@ -63,8 +74,10 @@
       false,
       false,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "6009aff79952737a1399fc4da70df1386c2bc29acd221a8bc2ad14776bdb39f1"
+  "hash": "bab563c7b608caa26fac813324943f44d8bdfafd1338acadb3e6a1fed2a4f52b"
 }

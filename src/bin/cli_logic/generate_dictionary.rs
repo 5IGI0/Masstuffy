@@ -21,7 +21,7 @@ use std::error::Error;
 use chrono::Utc;
 use clap::Parser;
 use log::{debug, error, info};
-use masstuffy::{constants::MASSTUFFY_DATE_FMT, database::DBManager, filesystem};
+use masstuffy::{constants::MASSTUFFY_DATE_FMT, database::DBManager, filesystem::{self, CollID}};
 use rand::RngCore;
 
 #[derive(Parser)]
@@ -54,9 +54,12 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
         error!("a buffer already exists (are you doing it twice?)");
         return Ok(1);
     }
+    
+    let coll = fs.get_collection(CollID::Slug(args.collection.clone())).await.unwrap();
+    let coll = coll.read().await;
 
     info!("picking samples...");
-    let warcs = db.get_samples(&args.collection, args.num_sample).await?;
+    let warcs = db.get_samples(&coll.get_uuid().await, args.num_sample).await?;
 
     if warcs.len() == 0 {
         error!("no sample found");
@@ -73,7 +76,7 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
             count+= 1;
 
             debug!("copying {} ({})", s.id, s.identifier);
-            let content = fs.get_record(&args.collection, &s.filename, s.offset).await?.
+            let content = coll.get_record(&s.filename, s.offset).await?.
                 expect(&format!("record {} not found", s.identifier)).serialize();
             tokio::fs::write(format!("{}/{}", path, s.id), &content[..]).await?
         }
@@ -103,19 +106,11 @@ pub async fn main(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     tokio::fs::remove_dir_all(path).await?;
     fs.add_zstd_dict(&format!("{}_{}", args.collection, Utc::now().format(MASSTUFFY_DATE_FMT)), dict).await;
 
-    // if args.rebuild {
-    //     info!("rebuilding {}", args.collection);
-    //     let dst = format!("_{}", args.collection);
-    //     fs.create_collection(dst.clone(), Some(("zstd".to_string(), dict_id))).await?;
-    //     for record in fs.get_collection_cdx_iter(&args.collection).await?.into_iter() {
-    //         if let Err(x) = db.insert_record(&dst, &record).await {
-    //             panic!("error when inserting record: {}", x);
-    //         }
-    //     }
+    if args.rebuild {
+        info!("rebuilding");
 
-    //     // TODO: atomic move
-    //     fs.delete_collection(&args.collection).await?;
-    // }
+        coll.rebuild(Some(("zstd".to_string(), dict_id)), &db).await?;
+    }
     
     Ok(0)
 }

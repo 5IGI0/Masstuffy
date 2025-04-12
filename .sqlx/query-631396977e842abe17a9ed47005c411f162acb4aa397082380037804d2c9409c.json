@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT * FROM masstuffy_records\n            WHERE collection=$1\n            ORDER BY hashint8(id)\n            LIMIT $2",
+  "query": "SELECT * FROM masstuffy_records WHERE identifier=$1 AND (flags&1) = 1 LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -47,12 +47,21 @@
         "ordinal": 8,
         "name": "uri",
         "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "dict_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "dict_id",
+        "type_info": "Int8"
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -64,8 +73,10 @@
       false,
       false,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "df0e19cf806b401ebc9c08de906d8aa5566b10a83ae483826c9717cda74d3f88"
+  "hash": "631396977e842abe17a9ed47005c411f162acb4aa397082380037804d2c9409c"
 }
