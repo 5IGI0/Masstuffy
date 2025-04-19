@@ -9,8 +9,8 @@
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  * 
- *  See the GNU General Public License for more details.
- *  You should have received a copy of the GNU General Public License
+ *  See the GNU Affero General Public License for more details.
+ *  You should have received a copy of the GNU Affero General Public License
  *  along with Masstuffy. If not, see <https://www.gnu.org/licenses/>. 
  * 
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
