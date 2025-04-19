@@ -55,7 +55,7 @@ For more details, please refer to the LICENSE file.
     - [X] dictionnary
     - [ ] regenerate cdx files
     - [X] dictionnary generation
-    - [ ] collection rebuild
+    - [X] collection rebuild
   - [X] make async
 - cli
   - [x] setup file layout

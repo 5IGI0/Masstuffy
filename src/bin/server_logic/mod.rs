@@ -17,50 +17,18 @@
 **/
 use std::sync::Arc;
 
-use masstuffy::{constants::MASSTUFFY_DATE_FMT, database::DBManager, filesystem::{self, FileSystem}};
+use masstuffy::{database::DBManager, filesystem::{self, FileSystem}};
 use serde::{Deserialize, Serialize};
 use tide::{Body, Request, Response};
 use tokio::sync::RwLock;
+
+mod endpoints;
+
 
 #[derive(Clone)]
 struct AppState {
     fs: Arc<RwLock<FileSystem>>,
     db: Arc<RwLock<DBManager>>
-}
-
-async fn get_by_id(req: Request<AppState>) -> tide::Result {
-    let cdx_rec = req.state().db.read().await
-            .get_record_from_id(req.param("id").unwrap().to_string()).await?;
-    
-    let rec = req.state().fs.read().await.get_record(
-        &cdx_rec.collection, &cdx_rec.filename, cdx_rec.offset).await?.unwrap();
-
-    Ok(Response::builder(200)
-    .body(rec.serialize())
-    .build())
-}
-
-async fn get_by_url(req: Request<AppState>) -> tide::Result {
-    let url = req.param("url").unwrap().to_string(); // TODO: get GET parameters
-    let cdx_rec = req.state().db.read().await
-            .get_record_from_uri(
-                &req.param("date")?.to_string(),
-                &url).await?;
-    
-    let rec = req.state().fs.read().await.get_record(
-        &cdx_rec.collection, &cdx_rec.filename, cdx_rec.offset).await?.unwrap();
-
-    let dt = rec.get_date()?.format(MASSTUFFY_DATE_FMT).to_string();
-    if dt != req.param("date")? {
-        return Ok(Response::builder(307).
-            body("").
-            header("Location", format!("/url/{}/{}/{}", dt, req.param("flags")?, url)).
-            build())
-    }
-
-    Ok(Response::builder(200)
-    .body(rec.serialize())
-    .build())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -88,12 +56,11 @@ pub async fn main() {
     let state = AppState{
         fs: Arc::new(RwLock::new(fs)),
         db: Arc::new(RwLock::new(DBManager::new(&database_conn)))
-        };
-
+    };
     
     let mut app = tide::with_state(state);
     app.at("/").get(server_status_handler);
-    app.at("/id/:flags/:id").get(get_by_id);
-    app.at("/url/:date/:flags/*url").get(get_by_url);
+    app.at("/id/:flags/:id").get(endpoints::record_getters::get_by_id);
+    app.at("/url/:flags/:date/*url").get(endpoints::record_getters::get_by_url);
     app.listen(listen_addr).await.expect("server error");
 }

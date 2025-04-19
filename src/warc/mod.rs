@@ -16,7 +16,7 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Write};
 use tokio::{fs, io::{AsyncBufReadExt, AsyncRead, AsyncReadExt}};
 use tokio::io::BufReader;
 
@@ -57,6 +57,11 @@ impl WarcRecord {
         warc.set_header("WARC-Date".to_string(), Utc::now().to_rfc3339());
 
         warc
+    }
+
+    // TODO: remove this function and make an iterator (so we don't copy)
+    pub fn get_headers(&self) -> HashMap<String, Vec<String>> {
+        self.headers.clone()
     }
 
     pub fn set_header(&mut self, k: String, v: String) {
@@ -116,24 +121,29 @@ impl WarcRecord {
         self.body = body;
     }
 
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut ret: Vec<u8> = "WARC/1.1\r\n".to_string().into_bytes().to_vec();
-
+    pub fn write_headers<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
         for (k, v) in self.headers.iter() {
-            /*  there is no reason why i would need to clone it.
-                maybe i am doing the wrong way? */
-            let header_key = k.clone().into_bytes();
             for vv in v.iter() {
-                ret.extend_from_slice(&header_key);
-                ret.extend_from_slice(": ".as_bytes());
-                ret.extend_from_slice(&vv.clone().into_bytes());
-                ret.extend_from_slice("\r\n".as_bytes());
+                writer.write_fmt(format_args!("{}: {}\r\n", k, vv))?;
             }
         };
 
-        ret.extend_from_slice(format!("Content-Length: {}\r\n\r\n", self.body.len()).as_bytes());
-        ret.extend_from_slice(&self.body);
-        ret.extend_from_slice("\r\n\r\n".as_bytes());
+        writer.write_fmt(format_args!("Content-Length: {}\r\n\r\n", self.body.len()))?;
+
+        Ok(())
+    }
+
+    pub fn write_body<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
+        writer.write_all(&self.body)?;
+        Ok(())
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut ret: Vec<u8> = "WARC/1.1\r\n".to_string().into_bytes().to_vec();
+
+        self.write_headers(&mut ret).unwrap();
+        self.write_body(&mut ret).unwrap();
+        let _ = ret.write_all("\r\n\r\n".as_bytes());
 
         ret
     }
