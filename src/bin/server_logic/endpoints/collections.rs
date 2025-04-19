@@ -16,7 +16,9 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use masstuffy::filesystem::CollID;
+use tokio::io::BufReader;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
+use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, warc::read_record};
 use serde::Deserialize;
 use serde_json::json;
 use tide::{Request, Response};
@@ -62,4 +64,33 @@ pub async fn create_collection(mut req: Request<AppState>) -> tide::Result {
 
     Ok(Response::builder(200)
         .body(json!(result)).build())
+}
+
+pub async fn push_records(mut req: Request<AppState>) -> tide::Result {
+    let body = req.take_body();
+    let mut buf = BufReader::new(body.compat());
+
+    let coll = req.state().fs.read().await
+        .get_collection(CollID::Uuid(req.param("collection_uuid").unwrap().to_string())).await;
+
+    if let None = coll {
+        return Ok(Response::builder(404).body("collection not found").build());
+    }
+    let coll = coll.unwrap();
+    let coll_uuid = coll.read().await.get_uuid().await;
+
+    let (dict_id, dict_algo) = coll.read().await.get_dict().await;
+    let dict_id = if let Some(dict_id) = dict_id {
+        Some(dict_id as i64)
+    } else {
+        None
+    };
+
+    while let Some(record) = read_record(&mut buf).await? {
+        let cdx = coll.read().await.add_warc(&record).await?;
+        req.state().db.read().await.
+        insert_record(&coll_uuid, &cdx, RECORD_FLAG_ACTIVE, dict_id, dict_algo.as_deref()).await?;
+    }
+
+    Ok(Response::builder(200).body("success").build())
 }

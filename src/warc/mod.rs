@@ -188,7 +188,7 @@ enum ReadRecordState {
     _WaitingContent // this one is not used but still
 }
 
-pub async fn read_record(br: &mut BufReader<Box<dyn AsyncRead + Unpin + Send>>) -> anyhow::Result<Option<WarcRecord>>{
+pub async fn read_record<Bf: AsyncBufReadExt + Unpin>(mut br: Bf) -> anyhow::Result<Option<WarcRecord>>{
     let mut contentlen: Option<usize> = None;
     let mut ret = WarcRecord::new("".to_string());
     let mut state = ReadRecordState::WaitingWarcHeader;

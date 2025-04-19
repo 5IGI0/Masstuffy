@@ -19,5 +19,6 @@ serde_json = "1.0.140"
 sqlx = { version = "0.8.3", features = ["postgres", "runtime-async-std", "chrono"] }
 tide = "0.16.0"
 tokio = { version = "1.44.1", features = ["full"] }
+tokio-util = { version = "0.7.14", features = ["compat"] }
 uuid = { version = "1.16.0", features = ["v4"] }
 zstd = "0.13.3"

@@ -69,7 +69,7 @@ For more details, please refer to the LICENSE file.
 - server
   - [X] link to source code (AGPL requirement)
   - [X] create collection
-  - [ ] add records
+  - [X] add records
   - [ ] search records
   - [ ] report records
   - [ ] offload decompression (client-side decompression)

@@ -1758,6 +1758,7 @@ dependencies = [
  "sqlx",
  "tide",
  "tokio",
+ "tokio-util",
  "uuid",
  "zstd",
 ]
@@ -3086,6 +3087,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b9590b93e6fcc1739458317cccd391ad3955e2bde8913edf6f95f9e65a8f034"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "pin-project-lite 0.2.16",
+ "tokio",
 ]
 
 [[package]]
