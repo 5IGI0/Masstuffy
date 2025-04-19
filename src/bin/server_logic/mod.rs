@@ -62,5 +62,7 @@ pub async fn main() {
     app.at("/").get(server_status_handler);
     app.at("/id/:flags/:id").get(endpoints::record_getters::get_by_id);
     app.at("/url/:flags/:date/*url").get(endpoints::record_getters::get_by_url);
+    app.at("/collections").get(endpoints::collections::list_collections);
+    app.at("/collections").post(endpoints::collections::create_collection);
     app.listen(listen_addr).await.expect("server error");
 }

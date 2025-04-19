@@ -27,7 +27,7 @@ use log::{debug, error, info};
 
 use crate::{config::Config, warc::WarcRecord};
 
-mod collections;
+pub mod collections;
 mod dict_store;
 
 pub struct FileSystem {
@@ -128,6 +128,7 @@ impl FileSystem {
         Ok(true)
     }
 
+    // TODO: implement iter() instead.
     pub async fn get_collection_list(&self) -> Vec<String>{
         self.collection_slugs.read().await.keys().cloned().collect()
     }

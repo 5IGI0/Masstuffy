@@ -18,7 +18,7 @@
 
 use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}, sync::RwLock};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -29,7 +29,7 @@ use crate::{database::DBManager, warc::{cdx::{CDXFileReader, CDXRecord}, WarcRea
 
 use super::dict_store::DictStore;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct CollectionManifest {
     uuid: String,
     slug: String,
@@ -53,6 +53,11 @@ impl CollectionManifest {
 
         Ok(())
     }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CollectionInfo {
+    manifest: CollectionManifest
 }
 
 pub struct Collection {
@@ -374,6 +379,14 @@ impl Collection {
         let manifest = self.manifest.read().await;
         (manifest.dict_id, manifest.compression.clone())
     }
+
+    pub async fn get_info(&self) -> CollectionInfo {
+        let manifest = self.manifest.read().await.clone();
+
+        return CollectionInfo{
+            manifest
+        }
+    }
 }
 
 pub async fn load_collection(collection_path: &str, dict_store: Arc<DictStore>) -> Result<Collection> {
@@ -410,6 +423,13 @@ pub async fn create_collection(
     debug!("creating collection: {}", slug);
     let collection_uuid = Uuid::new_v4().to_string();
     let collection_path = format!("{}/{}/", repository_path, collection_uuid);
+
+    if let Some(x) = &dictionary {
+        // assuming it is zstd.
+        if !dict_store.has_zstd_dict(x.1).await {
+            bail!("no such dictionary");
+        }
+    }
 
     let manifest = serde_json::to_string(&CollectionManifest{
         uuid: collection_uuid,

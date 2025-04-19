@@ -68,7 +68,7 @@ For more details, please refer to the LICENSE file.
   - [ ] detect when the server runs and send commands to it
 - server
   - [X] link to source code (AGPL requirement)
-  - [ ] create collection
+  - [X] create collection
   - [ ] add records
   - [ ] search records
   - [ ] report records
