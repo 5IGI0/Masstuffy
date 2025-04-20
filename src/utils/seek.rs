@@ -55,6 +55,7 @@ impl FileManager {
         let mut file = files.get(file_path);
 
         if let None = file {
+            drop(files);
             self.open_file(file_path).await?;
             files = self.files.read().await;
             file = files.get(file_path);
@@ -72,6 +73,7 @@ impl FileManager {
         let mut file = files.get(file_path);
 
         if let None = file {
+            drop(files);
             self.open_file(file_path).await?;
             files = self.files.read().await;
             file = files.get(file_path);
