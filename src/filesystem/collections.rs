@@ -25,7 +25,7 @@ use uuid::Uuid;
 use std::{io::SeekFrom, sync::Arc};
 use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 
-use crate::{database::DBManager, warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord}};
+use crate::{database::DBManager, utils::seek::FileManager, warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord}};
 
 use super::dict_store::DictStore;
 
@@ -64,7 +64,8 @@ pub struct Collection {
     path: String,
     manifest: RwLock<CollectionManifest>,
     dict_store: Arc<DictStore>,
-    dict: RwLock<Option<Arc<Vec<u8>>>>
+    dict: RwLock<Option<Arc<Vec<u8>>>>,
+    fm: FileManager
 }
 
 impl Collection {
@@ -88,8 +89,6 @@ impl Collection {
             } else {"".to_string()})
     }
 
-    // TODO: mutex
-    // TODO: keep the files open
     // TODO: extract http response status code (when available)
     // TODO: flush .cdx to .cdx.gz when enough big \
     //       don't forget to patch list_records()  \
@@ -102,40 +101,27 @@ impl Collection {
 
         /* get the first file that can hold the record */
         let mut warc_target = String::new();
-        let mut warc_target_size = 0;
         for n in 1.. {
             warc_target = self.gen_warc_filename(n).await;
             if let Ok(m) = tokio::fs::metadata(format!("{}/{}", self.path, warc_target)).await {
-                warc_target_size = m.len();
-                if (warc_target_size+(serialized_record.len() as u64)) >= manifest.split_threshold {
+                if (m.len()+(serialized_record.len() as u64)) >= manifest.split_threshold {
                     continue;
                 }
-            } else {
-                warc_target_size = 0;
-            };
+            }
             break;
         }
 
         let mut cdx = CDXRecord::from_warc(&record)?;
-        cdx.set_file(warc_target.clone(), Some(warc_target_size));
+        let offset = self.fm.append(
+            &format!("{}/{}", self.path, warc_target),
+            &serialized_record).await?;
+        
+        cdx.set_file(warc_target, Some(offset));
 
         debug!("{} cdx: {}", record.get_record_id()?, cdx);
-        
-        OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(format!("{}/{}", self.path, warc_target)).await?
-            .write_all(&serialized_record[..]).await
-            .expect("unable to write warc file");
-
-        OpenOptions::new()
-            .write(true)
-            .append(true)
-            .create(true)
-            .open(format!("{}/index.cdx", self.path)).await?
-            .write_all(format!("{}\n", cdx).as_bytes()).await
-            .expect("unable to write cdx file");
+        self.fm.append(
+            &format!("{}/index.cdx", self.path),
+            format!("{}\n", cdx).as_bytes()).await?;
 
         Ok(cdx)
     }
@@ -405,6 +391,7 @@ pub async fn load_collection(collection_path: &str, dict_store: Arc<DictStore>) 
     }
 
     let collection = Collection{
+        fm: FileManager::new(),
         path: collection_path.to_string(),
         manifest: RwLock::new(manifest),
         dict_store, dict: RwLock::new(None)};

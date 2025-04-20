@@ -20,6 +20,8 @@ use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder, XzDecoder};
 use tokio::io::{AsyncRead, BufReader};
 use anyhow::Result;
 
+pub mod seek;
+
 pub async fn open_compressed(path: &str) -> Result<BufReader<Box<dyn AsyncRead + Unpin + Send>>> {
     let fp = tokio::fs::File::open(path).await?;
 
