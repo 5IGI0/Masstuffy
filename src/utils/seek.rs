@@ -16,13 +16,12 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::{Mutex, RwLock}};
-
+use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}, sync::{Mutex, RwLock}};
 
 pub struct FileManager {
-    files: RwLock<HashMap<String, Mutex<File>>>
+    files: RwLock<HashMap<String, Arc<Mutex<BufReader<File>>>>>
 }
 
 impl FileManager {
@@ -46,7 +45,7 @@ impl FileManager {
             .open(file_path)
             .await?;
 
-        files.insert(file_path.to_string(), Mutex::new(file));
+        files.insert(file_path.to_string(), Arc::new(Mutex::new(BufReader::new(file))));
         Ok(())
     }
 
@@ -68,6 +67,27 @@ impl FileManager {
         Ok(())
     }
 
+    pub async fn get_file(&self, file_path: &str) -> anyhow::Result<Arc<Mutex<BufReader<File>>>> {
+        let mut files = self.files.read().await;
+        let mut file = files.get(file_path);
+
+        if let None = file {
+            drop(files);
+            self.open_file(file_path).await?;
+            files = self.files.read().await;
+            file = files.get(file_path);
+        }
+
+        return Ok(file.unwrap().clone());
+    }
+
+    // when a file is deleed, we have to "unmanage it" or we will keep an alive fp on it.
+    pub async fn unmanage_file(&self, file_path: &str) {
+        let mut files = self.files.write().await;
+
+        files.remove(file_path);
+    }
+
     pub async fn append(&self, file_path: &str, buf: &[u8]) -> anyhow::Result<u64> {
         let mut files = self.files.read().await;
         let mut file = files.get(file_path);
@@ -83,6 +103,7 @@ impl FileManager {
         file.seek(std::io::SeekFrom::End(0)).await?;
         let ret = file.stream_position().await?;
         file.write_all(buf).await?;
+        file.flush().await?;
 
         Ok(ret)
     }

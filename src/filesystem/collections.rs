@@ -16,7 +16,7 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use tokio::{fs::{self, OpenOptions}, io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}, sync::RwLock};
+use tokio::{fs, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}, sync::RwLock};
 
 use anyhow::{bail, Result};
 use log::{debug, info, warn};
@@ -25,7 +25,7 @@ use uuid::Uuid;
 use std::{io::SeekFrom, sync::Arc};
 use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 
-use crate::{database::DBManager, utils::seek::FileManager, warc::{cdx::{CDXFileReader, CDXRecord}, WarcReader, WarcRecord}};
+use crate::{database::DBManager, utils::seek::FileManager, warc::{cdx::{CDXFileReader, CDXRecord}, read_record, WarcRecord}};
 
 use super::dict_store::DictStore;
 
@@ -97,9 +97,11 @@ impl Collection {
         let manifest = self.manifest.read().await;
         info!("writing new record to `{}`: {}", manifest.slug, record.get_record_id()?);
 
+        debug!("compressing record...");
         let serialized_record = self.compress(record.serialize()).await;
 
         /* get the first file that can hold the record */
+        debug!("finding available slot...");
         let mut warc_target = String::new();
         for n in 1.. {
             warc_target = self.gen_warc_filename(n).await;
@@ -111,6 +113,7 @@ impl Collection {
             break;
         }
 
+        debug!("generate cdx...");
         let mut cdx = CDXRecord::from_warc(&record)?;
         let offset = self.fm.append(
             &format!("{}/{}", self.path, warc_target),
@@ -159,38 +162,34 @@ impl Collection {
         ret
     }
 
-    async fn get_decompressor(&self, fp: fs::File) -> BufReader<Box<dyn AsyncRead + Unpin + Send>> {
-        let manifest = self.manifest.read().await;
-        if let None = manifest.dict_id {
-            return BufReader::new(Box::new(fp));
-        }
-
-        self.ensure_dict_loaded().await;
-
-        let dict = self.dict.read().await;
-        let vec = dict.as_ref().unwrap();
-
-        BufReader::new(
-            Box::new(
-                ZstdDecoder::with_dict(
-                    BufReader::new(fp),
-                    &vec[..]
-                ).expect(&format!("unable to load dictionary {}", manifest.dict_id.unwrap()))
-            )
-        )
-    }
-
     pub async fn iter_cdx(&self) -> anyhow::Result<CDXFileReader> {
         // TODO: cdx.gz
         Ok(CDXFileReader::open(&format!("{}/index.cdx", self.path)).await?)
     }
 
     pub async fn get_record(&self, filename: &str, offset: i64) -> anyhow::Result<Option<WarcRecord>>{
-        let mut fp = fs::File::open(format!("{}/{}", self.path, filename)).await?;
+        let mfp = self.fm.get_file(&format!("{}/{}", self.path, filename)).await?;
+        let mut lfp = mfp.lock().await;
 
-        fp.seek(SeekFrom::Start(offset as u64)).await?;
+        lfp.seek(SeekFrom::Start(offset as u64)).await?;
 
-        Ok(WarcReader::from_bufreader(self.get_decompressor(fp).await).async_next().await)
+        let manifest = self.manifest.read().await;
+
+        if let Some(_) = manifest.compression {
+            self.ensure_dict_loaded().await;
+            let dict = self.dict.read().await;
+            let vec = dict.as_ref().unwrap();
+            Ok(read_record(BufReader::new(
+                Box::new(
+                    ZstdDecoder::with_dict(
+                        &mut *lfp,
+                        &vec[..]
+                    ).expect(&format!("unable to load dictionary {}", manifest.dict_id.unwrap()))
+                )
+            )).await?)
+        } else {
+            Ok(read_record(&mut *lfp).await?)
+        }
     }
 
     // TODO: atomic
@@ -207,6 +206,12 @@ impl Collection {
     pub async fn rebuild(&self, dict: Option<(String, u32)>, db: &DBManager) -> anyhow::Result<()> {
         let manifest = self.manifest.read().await;
         let dict_id = dict.unwrap().1; // TODO: check Some(dict)
+        let mut old_dict: Option<tokio::sync::RwLockReadGuard<Option<Arc<Vec<u8>>>>> = None;
+
+        if let Some(_) = manifest.compression {
+            self.ensure_dict_loaded().await;
+            old_dict = Some(self.dict.read().await);
+        }
 
         /*  enumerate records because the underlying file could be corrupted
             since it might be zero'd to delete specific records or whatever reason
@@ -244,12 +249,15 @@ impl Collection {
             &manifest.slug,
             Some(dict_id as i64),
             Some("zstd")).await?;
+        let _ = fs::remove_dir(format!("{}/.index.cdx", self.path)).await;
         // TODO: delete files too
 
         // TODO: check Some(dict)
+        debug!("loading new dictionary...");
         let dict = self.dict_store.get_zstd_dict(dict_id).await.unwrap();
         let dict_vec = dict.as_ref();
 
+        debug!("start rebuilding...");
         let mut output_file_name = format!("records.1.{}.warc.zstd", dict_id);
         let mut output_file_id = 1;
         let mut output_index = fs::OpenOptions::new()
@@ -263,13 +271,35 @@ impl Collection {
             .append(true)
             .open(format!("{}/{}", self.path, output_file_name)).await.expect("unable to open dst file");
 
+        let mut fp_id: u16 = records[0].0;
+        let mut fp_mutex = self.fm.get_file(&format!("{}/{}", self.path, &record_files[fp_id as usize])).await?;
+        let mut fp = fp_mutex.lock().await;
         for r in records {
-            // TODO: keep fp open
-            let mut fp = fs::File::open(format!("{}/{}", self.path, &record_files[r.0 as usize])).await?;
+            if fp_id != r.0 {
+                drop(fp);
+                fp_mutex = self.fm.get_file(&format!("{}/{}", self.path, &record_files[r.0 as usize])).await?;
+                fp = fp_mutex.lock().await;
+                fp_id = r.0;
+                
+            }
+
             fp.seek(SeekFrom::Start(r.1)).await?;
-            let dec_fp = self.get_decompressor(fp).await;
+            let record: Option<WarcRecord>;
+
+            if let Some(ref dict) = old_dict {
+                record = read_record(BufReader::new(
+                    Box::new(
+                        ZstdDecoder::with_dict(
+                            &mut *fp,
+                            &dict.as_ref().unwrap()[..],
+                        ).expect(&format!("unable to load dictionary {}", manifest.dict_id.unwrap()))
+                    )
+                )).await?
+            } else {
+                record = read_record(&mut *fp).await?
+            }
             
-            if let Some(record) = WarcReader::from_bufreader(dec_fp).async_next().await {
+            if let Some(record) = record {
                 let content = record.serialize();
                 let mut cdxr = CDXRecord::from_warc(&record)?;
 
@@ -303,12 +333,12 @@ impl Collection {
             }
         }
 
-        info!("commiting rebuld...");
+        info!("commiting rebuild...");
         db.activate_records(&manifest.uuid,
             Some(dict_id as i64),
             Some("zstd")).await?;
         db.delete_records(&manifest.uuid,
-            Some(manifest.dict_id.unwrap() as i64),
+            manifest.dict_id.map(|e| e as i64),
             manifest.compression.as_deref()).await?;
 
         let old_dict_id = manifest.dict_id;
@@ -336,6 +366,7 @@ impl Collection {
                 break;
             }
 
+            self.fm.unmanage_file(&target_file).await;
             fs::remove_file(target_file).await?;
         }
 
