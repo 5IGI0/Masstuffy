@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::utils::open_compressed;
 
 pub mod cdx;
+pub mod massaged_url;
 
 #[derive(Debug)]
 pub struct WarcRecord {
