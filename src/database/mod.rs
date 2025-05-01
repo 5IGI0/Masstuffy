@@ -22,7 +22,7 @@ use sqlx::postgres::PgPool;
 use structs::DBWarcRecord;
 use log::info;
 
-use crate::{constants::MASSTUFFY_DATE_FMT, warc::{cdx::CDXRecord, massaged_url::massage_url}};
+use crate::{constants::MASSTUFFY_DATE_FMT, warc::{cdx::CDXRecord, massaged_url::{massage_url, massaged_url_pattern, Match}}};
 
 pub mod structs;
 
@@ -139,5 +139,21 @@ impl DBManager {
             ORDER BY hashint8(id)
             LIMIT $2"#, collection, limit).
             fetch_all(&self.db).await?) // TODO: make it random?
+    }
+
+    pub async fn search(&self, 
+        host: Match,
+        port: Option<u16>,
+        path: Match,
+        limit: i64) -> anyhow::Result<Vec<DBWarcRecord>> {
+        let pattern = massaged_url_pattern(host, port, path);
+
+        Ok(sqlx::query_as!(
+            DBWarcRecord,
+            r#"
+            SELECT * FROM masstuffy_records
+            WHERE massaged_url ~ $1
+            LIMIT $2"#, pattern, limit).
+            fetch_all(&self.db).await?)
     }
 }

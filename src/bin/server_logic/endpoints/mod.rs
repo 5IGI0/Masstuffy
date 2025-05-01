@@ -18,3 +18,4 @@
 
 pub mod record_getters;
 pub mod collections;
+pub mod record_search;

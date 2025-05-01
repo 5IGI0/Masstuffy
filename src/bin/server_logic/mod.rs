@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use masstuffy::{database::DBManager, filesystem::{self, FileSystem}};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tide::{Body, Request, Response};
 use tokio::sync::RwLock;
 
@@ -31,7 +31,7 @@ struct AppState {
     db: Arc<RwLock<DBManager>>
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 struct ServerStatus {
     repository: String,
     version: String
@@ -63,6 +63,7 @@ pub async fn main() {
     app.at("/id/:flags/:id").get(endpoints::record_getters::get_by_id);
     app.at("/url/:flags/:date/*url").get(endpoints::record_getters::get_by_url);
     app.at("/collections").get(endpoints::collections::list_collections);
+    app.at("/search").get(endpoints::record_search::search_record);
     app.at("/collections").post(endpoints::collections::create_collection);
     app.at("/collection/:collection_uuid/records").post(endpoints::collections::push_records);
     app.listen(listen_addr).await.expect("server error");
