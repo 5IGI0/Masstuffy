@@ -22,7 +22,7 @@ use sqlx::postgres::PgPool;
 use structs::DBWarcRecord;
 use log::info;
 
-use crate::{constants::MASSTUFFY_DATE_FMT, warc::cdx::CDXRecord};
+use crate::{constants::MASSTUFFY_DATE_FMT, warc::{cdx::CDXRecord, massaged_url::massage_url}};
 
 pub mod structs;
 
@@ -61,10 +61,10 @@ impl DBManager {
         INSERT INTO masstuffy_records(
             flags, date, identifier,
             collection, filename, "offset", "type",
-            uri, dict_id, dict_type)
+            uri, dict_id, dict_type, massaged_url)
         VALUES(
             $1, to_timestamp($2, 'YYYYMMDDHH24MISS'), $3,
-            $4, $5, $6, $7, $8, $9, $10)"#)
+            $4, $5, $6, $7, $8, $9, $10, $11)"#)
             .bind(flags)
             .bind(record.get_date())
             .bind(record.get_record_id())
@@ -75,6 +75,7 @@ impl DBManager {
             .bind(record.get_url())
             .bind(dict_id)
             .bind(dict_type)
+            .bind(massage_url(record.get_url().as_deref().unwrap_or("")).as_deref().unwrap_or(""))
             .execute(&self.db).await?;
         Ok(())
     }

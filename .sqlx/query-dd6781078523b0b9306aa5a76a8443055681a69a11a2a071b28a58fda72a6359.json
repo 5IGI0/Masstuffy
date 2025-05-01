@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "dict_id",
         "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "massaged_url",
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -76,7 +81,8 @@
       false,
       true,
       true,
-      true
+      true,
+      false
     ]
   },
   "hash": "dd6781078523b0b9306aa5a76a8443055681a69a11a2a071b28a58fda72a6359"
