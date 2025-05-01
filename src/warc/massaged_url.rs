@@ -29,18 +29,13 @@ fn default_port_from_scheme(scheme: &str) -> Option<u16> {
     }
 }
 
-/* NOTE:    this function is not exactly in line with the webarchive's massaged urls.
-            it differs by adding an & at the beginning and end of the query
-            this allows for a better LIKE search in sql */
 pub fn massage_url(url: &str) -> Result<String> {
     let mut ret = String::new();
     let url = Url::parse(url)?;
 
     /* massaged host or ip */
     if let Some(domain) = url.domain() {
-        let mut splitted_domain: Vec<String> = domain.trim_matches('.').split(".").into_iter().map(|x| x.to_string()).collect();
-        splitted_domain.reverse();
-        ret.write_str(&splitted_domain.join(","))?;
+        ret.write_str(&domain2massaged(domain))?;
     } else if let Some(host) = url.host_str() {
         ret.write_str(host)?;
     }
@@ -59,15 +54,68 @@ pub fn massage_url(url: &str) -> Result<String> {
 
     let mut pairs: Vec<(String,String)> = url.query_pairs().map(|p| (p.0.to_string(), encode(&p.1).to_string())).collect();
     if pairs.len() != 0 {
-        ret.write_str("?&")?;
+        ret.write_str("?")?;
+        let mut is_first = true;
         pairs.sort();
         for (key, val) in &pairs {
+            if !is_first {
+                ret.write_char('&')?;
+            }
+            is_first = false;
             ret.write_str(key)?;
             ret.write_char('=')?;
             ret.write_str(val)?;
-            ret.write_char('&')?;
         }
     }
 
     Ok(ret)
+}
+
+pub enum Match {
+    None,
+    ExactMatch(String),
+    PartialMatch(String)
+}
+
+// TODO: check input values
+pub fn massaged_url_pattern(
+    host: Match,
+    port: Option<u16>,
+    path: Match
+) -> String {
+    let mut ret = String::new();
+
+    // TODO: it's assuming host is a domain (must detect IPs)
+    match &host {
+        Match::None => ret.write_str(".*").unwrap(),
+        Match::ExactMatch(d) => ret.write_str(&domain2massaged(d)).unwrap(),
+        Match::PartialMatch(d) => ret.write_fmt(format_args!("{}{}", domain2massaged(d), "(,[a-z0-9]+){0,}")).unwrap()
+    }
+
+    match port {
+        Some(port) => ret.write_fmt(format_args!(":{port}")).unwrap(),
+        None => if !ret.ends_with(".*") {ret.write_str("(:[0-9]{1,5})?").unwrap()}
+    }
+
+    if !ret.ends_with(".*") {
+        ret.write_str("\\)").unwrap();
+    }
+
+    // TODO: escape path
+    match &path {
+        Match::None => if !ret.ends_with(".*") {ret.write_str(".*").unwrap()},
+        Match::ExactMatch(p) => ret.write_str(p).unwrap(),
+        Match::PartialMatch(p) => ret.write_fmt(format_args!("{}.*", p)).unwrap()
+    }
+
+    // TODO: GET parameters.
+
+    ret
+}
+
+// TODO: IDNA encode
+fn domain2massaged(domain: &str) -> String {
+    let mut splitted_domain: Vec<String> = domain.trim_matches('.').split(".").into_iter().map(|x| x.to_string()).collect();
+    splitted_domain.reverse();
+    return splitted_domain.join(",");
 }
