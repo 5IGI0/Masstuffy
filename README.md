@@ -64,15 +64,16 @@ For more details, please refer to the LICENSE file.
     - [ ] custom dictionnary
   - [X] add records
   - [X] get record
-  - [ ] search records
+  - [X] search records
   - [ ] detect when the server runs and send commands to it
 - server
   - [X] link to source code (AGPL requirement)
   - [X] create collection
   - [X] add records
-  - [ ] search records
+  - [X] search records
   - [ ] report records
   - [ ] offload decompression (client-side decompression)
+  - [ ] offload compression (client-side compression)
   - [X] get record(s)
     - [X] by id
     - [X] by url

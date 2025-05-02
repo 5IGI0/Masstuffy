@@ -26,6 +26,7 @@ mod create_collection;
 mod init_db;
 mod get_record;
 mod generate_dictionary;
+mod search;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -38,6 +39,7 @@ push_records      - push new records to repository
 init_db           - init database
 get_record        - get record from its id
 generate_dict     - generate dictionnary
+search            - search records in db
 "#,
     argv[0]);
     Ok(0)
@@ -60,6 +62,7 @@ pub async fn main() {
         "get_record" => get_record::main(argv).await,
         "init_db" => init_db::main(argv).await,
         "generate_dict" => generate_dictionary::main(argv).await,
+        "search" => search::main(argv).await,
         _ => print_help(argv),
     };
 
