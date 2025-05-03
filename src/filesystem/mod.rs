@@ -164,6 +164,10 @@ impl FileSystem {
         }
     }
 
+    pub async fn get_zstd_dict(&self, id: u32) -> Option<Arc<Vec<u8>>> {
+        self.dictionary_store.get_zstd_dict(id).await
+    }
+
     pub async fn has_zstd_dict(&self, id: u32) -> bool {
         self.dictionary_store.has_zstd_dict(id).await
     }

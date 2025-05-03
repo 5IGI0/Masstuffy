@@ -66,5 +66,6 @@ pub async fn main() {
     app.at("/search").get(endpoints::record_search::search_record);
     app.at("/collections").post(endpoints::collections::create_collection);
     app.at("/collection/:collection_uuid/records").post(endpoints::collections::push_records);
+    app.at("/dictionary/:dict_id").get(endpoints::dictionaries::get_dictionary);
     app.listen(listen_addr).await.expect("server error");
 }

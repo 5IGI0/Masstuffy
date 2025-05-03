@@ -16,7 +16,19 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-pub mod record_getters;
-pub mod collections;
-pub mod record_search;
-pub mod dictionaries;
+use tide::{Request, Response};
+use crate::server_logic::AppState;
+
+pub async fn get_dictionary(req: Request<AppState>) -> tide::Result {
+    let dict = req.state().fs.read().await
+        .get_zstd_dict(req.param("dict_id")?.parse()?)
+        .await;
+
+    if let Some(dict) = dict {
+        Ok(Response::builder(200)
+            .body(dict.as_slice()).build())
+    } else {
+        Ok(Response::builder(404)
+            .body("404 Not Found\n").build())
+    }
+}
