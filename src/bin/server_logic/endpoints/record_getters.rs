@@ -45,23 +45,39 @@ pub async fn get_by_url(req: Request<AppState>) -> tide::Result {
 
 const RECORD_FLAGS_WARC_HEADER: u64 = 1<<0;
 const RECORD_FLAGS_FORCE_DOWNLOAD: u64 = 1<<1;
+const RECORD_FLAGS_RAW: u64 = 1<<2;
 
 async fn unified_handler(req: Request<AppState>, record: DBWarcRecord) -> tide::Result {
-    let rec = req.state().fs.read().await.get_record(
-        &record.collection, &record.filename, record.offset).await?.unwrap();
-
-    let mut ret = Response::builder(200);
-    let mut tmp_body: Vec<u8> = Vec::new();
-
     /* convert char flags to bit flags */
     let mut flags: u64 = 0;
     for c in req.param("flags").unwrap().chars().into_iter() {
         flags |= match c {
             'h' => RECORD_FLAGS_WARC_HEADER,
             'd' => RECORD_FLAGS_FORCE_DOWNLOAD,
+            'r' => RECORD_FLAGS_RAW,
             _ => 0
         }
     }
+
+    if (flags & RECORD_FLAGS_RAW) != 0 {
+        let record = req.state().fs.read().await.get_raw_record(
+            &record.collection,
+            &record.filename,
+            record.offset,
+            record.raw_size as usize).await?;
+        return if let Some(record) = record {
+            Ok(Response::builder(200)
+                .body(record)
+                .build())
+        } else {
+            Ok(Response::builder(404).body("404 Not Found").build())
+        }
+    }
+
+    let mut ret = Response::builder(200);
+    let mut tmp_body: Vec<u8> = Vec::new();
+    let rec = req.state().fs.read().await.get_record(
+        &record.collection, &record.filename, record.offset).await?.unwrap();
 
     if (flags&RECORD_FLAGS_WARC_HEADER) != 0 {
         rec.write_headers(&mut tmp_body).unwrap();

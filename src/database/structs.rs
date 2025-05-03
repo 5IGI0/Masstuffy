@@ -31,7 +31,8 @@ pub struct DBWarcRecord {
     pub uri: Option<String>,
     pub dict_type: Option<String>,
     pub dict_id: Option<i64>,
-    pub massaged_url: String
+    pub massaged_url: String,
+    pub raw_size: i64
 }
 
 pub const RECORD_FLAG_ACTIVE: i32 = 1<<0;

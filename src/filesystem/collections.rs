@@ -119,7 +119,7 @@ impl Collection {
             &format!("{}/{}", self.path, warc_target),
             &serialized_record).await?;
         
-        cdx.set_file(warc_target, Some(offset));
+        cdx.set_file(warc_target, Some(offset), Some(serialized_record.len() as u64));
 
         debug!("{} cdx: {}", record.get_record_id()?, cdx);
         self.fm.append(
@@ -190,6 +190,19 @@ impl Collection {
         } else {
             Ok(read_record(&mut *lfp).await?)
         }
+    }
+
+    pub async fn get_raw_record(&self, filename: &str, offset: i64, size: usize) -> anyhow::Result<Vec<u8>> {
+        let mfp = self.fm.get_file(&format!("{}/{}", self.path, filename)).await?;
+        let mut lfp = mfp.lock().await;
+
+        lfp.seek(SeekFrom::Start(offset as u64)).await?;
+        
+        let mut raw: Vec<u8> = Vec::new();
+        raw.resize(size, 0);
+        lfp.read_exact(&mut raw[..]).await?;
+        
+        Ok(raw)
     }
 
     // TODO: atomic
@@ -320,7 +333,10 @@ impl Collection {
                         .open(&format!("{}/{}", self.path, output_file_name)).await
                         .expect("unable to open dst file");
                 }
-                cdxr.set_file(output_file_name.clone(), Some(output_fp.stream_position().await?));
+                cdxr.set_file(
+                    output_file_name.clone(),
+                    Some(output_fp.stream_position().await?),
+                    Some(compressed.len() as u64));
                 output_fp.write_all(&compressed).await?;
                 output_index.write_all(format!("{}\n", cdxr).as_bytes()).await?;
                 db.insert_record(

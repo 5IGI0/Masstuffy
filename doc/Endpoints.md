@@ -20,3 +20,4 @@ flags|description
 -|-
 h|Print WARC headers to the response's body.
 d|Force download (will set `Content-Type: application/octet-stream`)
+r|Raw record (used for offload-decompression)

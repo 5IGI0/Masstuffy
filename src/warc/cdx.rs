@@ -34,7 +34,8 @@ pub struct CDXRecord {
     record_id: String,
     date: String,
     file_name: Option<String>,
-    file_offset: Option<String>
+    file_offset: Option<String>,
+    raw_size: Option<u64>
 }
 
 fn part2option(part: &str) -> Option<String> {
@@ -53,15 +54,16 @@ impl CDXRecord {
             record_id: warc.get_record_id()?,
             date: warc.get_date()?.format("%Y%m%d%H%M%S").to_string(),
             file_name: None,
-            file_offset: None
+            file_offset: None,
+            raw_size: None
         })
     }
 
     pub fn from_line(line: &str) -> anyhow::Result<Self> {
         let parts: Vec<&str> = line.split(' ').collect();
 
-        if parts.len() != 6 && (parts.len() != 7 || parts[6] != "\n"){
-            bail!("expected 6 parts but found {}", parts.len());
+        if parts.len() != 7 && (parts.len() != 7 || parts[6] != "\n"){
+            bail!("expected 7 parts but found {}", parts.len());
         }
 
         Ok(CDXRecord{
@@ -70,12 +72,14 @@ impl CDXRecord {
             record_id: parts[2].to_string(),
             date: parts[3].to_string(),
             file_name: part2option(parts[4]),
-            file_offset: part2option(parts[5].trim())
+            file_offset: part2option(parts[5]),
+            raw_size: part2option(parts[6].trim()).map(|p| p.parse::<u64>().expect("invald raw_size"))
         })
     }
 
-    pub fn set_file(&mut self, filename: String, offset: Option<u64>) {
+    pub fn set_file(&mut self, filename: String, offset: Option<u64>, size: Option<u64>) {
         self.file_name = Some(filename);
+        self.raw_size = size;
         if let Some(x) = offset{
             self.file_offset = Some(format!("{}", x));
         } else {
@@ -83,6 +87,7 @@ impl CDXRecord {
         }
     }
 
+    pub fn get_raw_size(&self) -> Option<u64> {self.raw_size}
     pub fn get_date(&self) -> String {self.date.clone()}
     pub fn get_record_id(&self) -> String {self.record_id.clone()}
     pub fn get_record_type(&self) -> String {self.record_type.clone()}
@@ -104,11 +109,12 @@ impl CDXRecord {
 impl fmt::Display for CDXRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             self.url.clone().unwrap_or("-".to_string()), self.record_type,
             self.record_id, self.date,
             self.file_name.clone().unwrap_or("-".to_string()),
-            self.file_offset.clone().unwrap_or("-".to_string())
+            self.file_offset.clone().unwrap_or("-".to_string()),
+            self.raw_size.map(|r| format!("{}", r)).as_deref().unwrap_or("-")
         )?;
         Ok(())
     }

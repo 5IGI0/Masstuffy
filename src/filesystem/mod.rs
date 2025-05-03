@@ -148,6 +148,17 @@ impl FileSystem {
         }
     }
 
+    pub async fn get_raw_record(&self, coll_uuid: &str, filename: &str, offset: i64, size: usize) -> anyhow::Result<Option<Vec<u8>>> {
+        let colls = self.collection_uuids.read().await;
+        let coll = colls.get(coll_uuid);
+
+        if let Some(coll) = coll {
+            Ok(Some(coll.read().await.get_raw_record(filename, offset, size).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn get_listen_addr(&self) -> String {
         self.config.listen_addr.clone()
     }
