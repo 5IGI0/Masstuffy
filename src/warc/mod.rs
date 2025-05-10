@@ -141,8 +141,7 @@ impl WarcRecord {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut ret: Vec<u8> = "WARC/1.1\r\n".to_string().into_bytes().to_vec();
-
+        let mut ret: Vec<u8> = Vec::new();
         self.write_headers(&mut ret).unwrap();
         self.write_body(&mut ret).unwrap();
         let _ = ret.write_all("\r\n\r\n".as_bytes());
