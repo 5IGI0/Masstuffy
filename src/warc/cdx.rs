@@ -26,8 +26,6 @@ use crate::utils::open_compressed;
 
 use super::WarcRecord;
 
-
-// TODO: "massaged url"
 pub struct CDXRecord {
     url: Option<String>,
     record_type: String,

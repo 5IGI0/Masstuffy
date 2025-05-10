@@ -47,7 +47,6 @@ impl DBManager {
         info!("setting up database...");
 
         // TODO: [improvement] use numeric value for collections (or maybe enum?) and filename
-        // TODO: massaged url
         sqlx::migrate!()
             .run(&self.db)
             .await.expect("unable to init db");

@@ -123,6 +123,7 @@ impl WarcRecord {
     }
 
     pub fn write_headers<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
+        writer.write_all("WARC/1.1\r\n".as_bytes())?;
         for (k, v) in self.headers.iter() {
             for vv in v.iter() {
                 writer.write_fmt(format_args!("{}: {}\r\n", k, vv))?;

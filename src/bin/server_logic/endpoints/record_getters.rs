@@ -60,14 +60,15 @@ async fn unified_handler(req: Request<AppState>, record: DBWarcRecord) -> tide::
     }
 
     if (flags & RECORD_FLAGS_RAW) != 0 {
-        let record = req.state().fs.read().await.get_raw_record(
+        let raw_record = req.state().fs.read().await.get_raw_record(
             &record.collection,
             &record.filename,
             record.offset,
             record.raw_size as usize).await?;
-        return if let Some(record) = record {
+        return if let Some(raw_record) = raw_record {
             Ok(Response::builder(200)
-                .body(record)
+                .header("Warc-Dictionary-Id", record.dict_id.map(|a| format!("{}", a)).unwrap_or("".to_string()))
+                .body(raw_record)
                 .build())
         } else {
             Ok(Response::builder(404).body("404 Not Found").build())
