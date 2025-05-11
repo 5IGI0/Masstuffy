@@ -72,8 +72,8 @@ For more details, please refer to the LICENSE file.
   - [X] add records
   - [X] search records
   - [ ] report records
-  - [ ] offload decompression (client-side decompression)
-  - [ ] offload compression (client-side compression)
+  - [X] offload decompression (client-side decompression)
+  - [X] offload compression (client-side compression)
   - [X] get record(s)
     - [X] by id
     - [X] by url

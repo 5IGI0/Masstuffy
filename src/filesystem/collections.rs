@@ -129,6 +129,38 @@ impl Collection {
         Ok(cdx)
     }
 
+    pub async fn add_raw_warc(&self, raw_record: Vec<u8>, mut cdx: CDXRecord) -> anyhow::Result<CDXRecord> {
+        let manifest = self.manifest.read().await;
+        info!("writing new record to `{}`: {}", manifest.slug, cdx.get_record_id());
+
+        /* get the first file that can hold the record */
+        debug!("finding available slot...");
+        let mut warc_target = String::new();
+        for n in 1.. {
+            warc_target = self.gen_warc_filename(n).await;
+            if let Ok(m) = tokio::fs::metadata(format!("{}/{}", self.path, warc_target)).await {
+                if (m.len()+(raw_record.len() as u64)) >= manifest.split_threshold {
+                    continue;
+                }
+            }
+            break;
+        }
+
+        let offset = self.fm.append(
+            &format!("{}/{}", self.path, warc_target),
+            &raw_record).await?;
+
+        cdx.set_file(warc_target, Some(offset), Some(raw_record.len() as u64));
+
+
+        debug!("{} cdx: {}", cdx.get_record_id(), cdx);
+        self.fm.append(
+            &format!("{}/index.cdx", self.path),
+            format!("{}\n", cdx).as_bytes()).await?;
+
+        Ok(cdx)
+    }
+
     async fn ensure_dict_loaded(&self) {
         let manifest = self.manifest.read().await;
         let dict = self.dict.read().await;

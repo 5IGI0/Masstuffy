@@ -37,7 +37,7 @@ struct Args {
     max_dict_size: usize,
 
     // should rebuild the collection?
-    #[arg(short, long, default_value_t=true)]
+    #[arg(short, long, default_value_t=false)]
     rebuild: bool,
 }
 

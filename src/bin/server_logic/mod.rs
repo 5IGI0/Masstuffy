@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use masstuffy::{database::DBManager, filesystem::{self, FileSystem}};
 use serde::Serialize;
-use tide::{Body, Request, Response};
+use tide::{utils::After, Body, Request, Response};
 use tokio::sync::RwLock;
 
 mod endpoints;
@@ -59,6 +59,14 @@ pub async fn main() {
     };
     
     let mut app = tide::with_state(state);
+
+    app.with(After(|mut res: Response| async {
+        if let Some(err) = res.error() {
+            res.set_body(format!("Error: {:?}", err));
+        }
+        Ok(res)
+    }));
+
     app.at("/").get(server_status_handler);
     app.at("/id/:flags/:id").get(endpoints::record_getters::get_by_id);
     app.at("/url/:flags/:date/*url").get(endpoints::record_getters::get_by_url);
@@ -66,6 +74,7 @@ pub async fn main() {
     app.at("/search").get(endpoints::record_search::search_record);
     app.at("/collections").post(endpoints::collections::create_collection);
     app.at("/collection/:collection_uuid/records").post(endpoints::collections::push_records);
+    app.at("/collection/:collection_uuid/raw_records").post(endpoints::collections::push_raw_records);
     app.at("/dictionary/:dict_id").get(endpoints::dictionaries::get_dictionary);
     app.listen(listen_addr).await.expect("server error");
 }

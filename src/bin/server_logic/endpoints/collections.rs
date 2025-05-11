@@ -16,12 +16,12 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, warc::read_record};
+use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, warc::{cdx, read_record}};
 use serde::Deserialize;
 use serde_json::json;
-use tide::{Request, Response};
+use tide::{http::bail, Request, Response};
 use masstuffy::filesystem::collections::CollectionInfo;
 use crate::server_logic::AppState;
 
@@ -91,6 +91,51 @@ pub async fn push_records(mut req: Request<AppState>) -> tide::Result {
         req.state().db.read().await.
         insert_record(&coll_uuid, &cdx, RECORD_FLAG_ACTIVE, dict_id, dict_algo.as_deref()).await?;
     }
+
+    Ok(Response::builder(200).body("success").build())
+}
+
+pub async fn push_raw_records(mut req: Request<AppState>) -> tide::Result {
+    let body = req.take_body();
+    let mut buf = BufReader::new(body.compat());
+
+    let coll = req.state().fs.read().await
+        .get_collection(CollID::Uuid(req.param("collection_uuid").unwrap().to_string())).await;
+
+    if let None = coll {
+        return Ok(Response::builder(404).body("collection not found").build());
+    }
+    let coll = coll.unwrap();
+    let coll_uuid = coll.read().await.get_uuid().await;
+
+    let (dict_id, dict_algo) = coll.read().await.get_dict().await;
+    let dict_id = if let Some(dict_id) = dict_id {
+        Some(dict_id as i64)
+    } else {
+        None
+    };
+
+    let mut cdx_line = String::new();
+    buf.read_line(&mut cdx_line).await?;
+    let cdx_entry = cdx::CDXRecord::from_line(&cdx_line)?;
+    let record_size = cdx_entry.get_raw_size().unwrap_or(0) as usize;
+
+    if record_size == 0 {
+        bail!("invalid record size");
+    }
+
+    let mut raw_record: Vec<u8> = Vec::new();
+    raw_record.resize(record_size, 0);
+
+    let nread = buf.read_exact(&mut raw_record).await?;
+    if nread != raw_record.len() {
+        bail!("truncated record");
+    }
+
+
+    let cdx = coll.read().await.add_raw_warc(raw_record, cdx_entry).await?;
+    req.state().db.read().await.
+        insert_record(&coll_uuid, &cdx, RECORD_FLAG_ACTIVE, dict_id, dict_algo.as_deref()).await?;
 
     Ok(Response::builder(200).body("success").build())
 }
