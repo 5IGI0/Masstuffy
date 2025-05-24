@@ -25,6 +25,7 @@ use anyhow::{anyhow, Result};
 use collections::{load_collection, Collection};
 use log::{debug, error, info};
 
+use crate::database::DBManager;
 use crate::{config::Config, warc::WarcRecord};
 
 pub mod collections;
@@ -192,7 +193,7 @@ impl FileSystem {
         self.dictionary_store.reload().await;
     }
 
-    pub async fn delete_collection(&mut self, slug: &str) -> anyhow::Result<()> {
+    pub async fn delete_collection(&mut self, slug: &str, db: &DBManager) -> anyhow::Result<()> {
         let colls = self.collection_slugs.read().await;
 
         let col = colls.get(slug);
@@ -203,8 +204,11 @@ impl FileSystem {
             col.delete().await?;
             drop(col);
             drop(colls);
+            db.delete_collection(&uuid).await?;
             let mut colls = self.collection_slugs.write().await;
-            colls.remove(slug); // TODO: remove from database
+            colls.remove(slug);
+            drop(colls);
+            let mut colls = self.collection_uuids.write().await;
             colls.remove(&uuid);
         }
 

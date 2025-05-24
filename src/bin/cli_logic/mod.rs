@@ -28,6 +28,7 @@ mod get_record;
 mod generate_dictionary;
 mod search;
 mod rebuild;
+mod delete_collection;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -42,6 +43,7 @@ get_record        - get record from its id
 generate_dict     - generate dictionnary
 search            - search records in db
 rebuild           - rebuild a collection
+delete_collection - delete a collection
 "#,
     argv[0]);
     Ok(0)
@@ -66,6 +68,7 @@ pub async fn main() {
         "generate_dict" => generate_dictionary::main(argv).await,
         "search" => search::main(argv).await,
         "rebuild" => rebuild::main(argv).await,
+        "delete_collection" => delete_collection::main(argv).await,
         _ => print_help(argv),
     };
 

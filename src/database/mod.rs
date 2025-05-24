@@ -158,4 +158,13 @@ impl DBManager {
             LIMIT $2"#, pattern, limit).
             fetch_all(&self.db).await?)
     }
+
+    pub async fn delete_collection(&self, collection: &String) -> anyhow::Result<()> {
+        sqlx::query!(
+        r#"
+        DELETE FROM masstuffy_records
+        WHERE collection = $1
+        "#, collection).execute(&self.db).await?;
+        Ok(())
+    }
 }
