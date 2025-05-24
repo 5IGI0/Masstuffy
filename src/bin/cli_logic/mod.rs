@@ -27,6 +27,7 @@ mod init_db;
 mod get_record;
 mod generate_dictionary;
 mod search;
+mod rebuild;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -40,6 +41,7 @@ init_db           - init database
 get_record        - get record from its id
 generate_dict     - generate dictionnary
 search            - search records in db
+rebuild           - rebuild a collection
 "#,
     argv[0]);
     Ok(0)
@@ -63,6 +65,7 @@ pub async fn main() {
         "init_db" => init_db::main(argv).await,
         "generate_dict" => generate_dictionary::main(argv).await,
         "search" => search::main(argv).await,
+        "rebuild" => rebuild::main(argv).await,
         _ => print_help(argv),
     };
 
