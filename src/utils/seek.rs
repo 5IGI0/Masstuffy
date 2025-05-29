@@ -16,18 +16,20 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
 **/
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, os::unix::fs::MetadataExt, sync::Arc};
 
 use tokio::{fs::{File, OpenOptions}, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader}, sync::{Mutex, RwLock}};
 
 pub struct FileManager {
-    files: RwLock<HashMap<String, Arc<Mutex<BufReader<File>>>>>
+    files: RwLock<HashMap<String, Arc<Mutex<BufReader<File>>>>>,
+    filesizes: RwLock<HashMap<String, Option<u64>>>
 }
 
 impl FileManager {
     pub fn new() -> FileManager {
         FileManager {
-            files: RwLock::new(HashMap::new())
+            files: RwLock::new(HashMap::new()),
+            filesizes: RwLock::new(HashMap::new())
         }
     }
 
@@ -105,6 +107,20 @@ impl FileManager {
         file.write_all(buf).await?;
         file.flush().await?;
 
+        self.filesizes.write().await.insert(file_path.to_string(), Some(ret+buf.len() as u64));
+
         Ok(ret)
+    }
+
+    pub async fn get_file_size(&self, file_path: String) -> Option<u64> {
+        let filesize = self.filesizes.read().await.get(&file_path).cloned();
+
+        if let Some(filesize) = filesize {
+            filesize
+        } else {
+            let ret = tokio::fs::metadata(&file_path).await.ok().map(|f| f.size());
+            self.filesizes.write().await.insert(file_path, ret);
+            ret
+        }
     }
 }

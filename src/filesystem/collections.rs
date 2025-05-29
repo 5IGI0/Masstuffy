@@ -65,7 +65,8 @@ pub struct Collection {
     manifest: RwLock<CollectionManifest>,
     dict_store: Arc<DictStore>,
     dict: RwLock<Option<Arc<Vec<u8>>>>,
-    fm: FileManager
+    fm: FileManager,
+    cur_record_file: RwLock<u32> // cache to not reuse stat for every single insert
 }
 
 impl Collection {
@@ -77,7 +78,7 @@ impl Collection {
         self.manifest.read().await.slug.clone()
     }
 
-    async fn gen_warc_filename(&self, n: i32) -> String{
+    async fn gen_warc_filename(&self, n: u32) -> String{
         let manifest = self.manifest.read().await;
         format!(
             "records.{}{}.warc{}", n,
@@ -103,14 +104,21 @@ impl Collection {
         /* get the first file that can hold the record */
         debug!("finding available slot...");
         let mut warc_target = String::new();
-        for n in 1.. {
+        let cached_warc_file_id = *self.cur_record_file.read().await;
+        let mut warc_file_id = cached_warc_file_id;
+        for n in warc_file_id.. {
+            warc_file_id = n;
             warc_target = self.gen_warc_filename(n).await;
-            if let Ok(m) = tokio::fs::metadata(format!("{}/{}", self.path, warc_target)).await {
-                if (m.len()+(serialized_record.len() as u64)) >= manifest.split_threshold {
+            if let Some(size) = self.fm.get_file_size(format!("{}/{}", self.path, warc_target)).await {
+                if (size+(serialized_record.len() as u64)) >= manifest.split_threshold {
                     continue;
                 }
             }
             break;
+        }
+
+        if warc_file_id != cached_warc_file_id {
+            *self.cur_record_file.write().await = warc_file_id;
         }
 
         debug!("generate cdx...");
@@ -136,14 +144,21 @@ impl Collection {
         /* get the first file that can hold the record */
         debug!("finding available slot...");
         let mut warc_target = String::new();
-        for n in 1.. {
+        let cached_warc_file_id = *self.cur_record_file.read().await;
+        let mut warc_file_id = cached_warc_file_id;
+        for n in warc_file_id.. {
+            warc_file_id = n;
             warc_target = self.gen_warc_filename(n).await;
-            if let Ok(m) = tokio::fs::metadata(format!("{}/{}", self.path, warc_target)).await {
-                if (m.len()+(raw_record.len() as u64)) >= manifest.split_threshold {
+            if let Some(size) = self.fm.get_file_size(format!("{}/{}", self.path, warc_target)).await {
+                if (size+(raw_record.len() as u64)) >= manifest.split_threshold {
                     continue;
                 }
             }
             break;
+        }
+
+        if warc_file_id != cached_warc_file_id {
+            *self.cur_record_file.write().await = warc_file_id;
         }
 
         let offset = self.fm.append(
@@ -473,7 +488,8 @@ pub async fn load_collection(collection_path: &str, dict_store: Arc<DictStore>) 
         fm: FileManager::new(),
         path: collection_path.to_string(),
         manifest: RwLock::new(manifest),
-        dict_store, dict: RwLock::new(None)};
+        dict_store, dict: RwLock::new(None),
+        cur_record_file: RwLock::new(1)};
 
     info!("collection {} loaded!", collection.get_slug().await);
 
