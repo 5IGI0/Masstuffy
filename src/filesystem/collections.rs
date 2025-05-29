@@ -22,7 +22,7 @@ use anyhow::{bail, Result};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use std::{io::SeekFrom, sync::Arc};
+use std::{fmt::Write, io::SeekFrom, sync::Arc};
 use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 
 use crate::{database::DBManager, utils::seek::FileManager, warc::{cdx::{CDXFileReader, CDXRecord}, read_record, WarcRecord}};
@@ -91,17 +91,27 @@ impl Collection {
     }
 
     // TODO: extract http response status code (when available)
-    // TODO: flush .cdx to .cdx.gz when enough big \
-    //       don't forget to patch list_records()  \
-    //       and add the CDX header if it is the first flush
     pub async fn add_warc(&self, record: &WarcRecord) -> anyhow::Result<CDXRecord>{
         let manifest = self.manifest.read().await;
         info!("writing new record to `{}`: {}", manifest.slug, record.get_record_id()?);
 
         debug!("compressing record...");
         let serialized_record = self.compress(record.serialize()).await;
+        let mut cdx = CDXRecord::from_warc(record)?;
+        cdx.set_file("-".to_string(), None, Some(serialized_record.len() as u64));
 
-        /* get the first file that can hold the record */
+        let mut cdx_vec: Vec<CDXRecord> = vec![cdx];
+        self.add_raw_warcs(&serialized_record, &mut cdx_vec).await?;
+        Ok(cdx_vec.remove(0))
+    }
+
+    // TODO: flush .cdx to .cdx.gz when enough big \
+    //       don't forget to patch list_records()  \
+    //       and add the CDX header if it is the first flush
+    pub async fn add_raw_warcs(&self, raw_records: &Vec<u8>, cdx_records: &mut Vec<CDXRecord>)  -> anyhow::Result<()> {
+        let manifest = self.manifest.read().await.clone();
+        info!("writing {} new record(s) to {}", cdx_records.len(), manifest.slug);
+
         debug!("finding available slot...");
         let mut warc_target = String::new();
         let cached_warc_file_id = *self.cur_record_file.read().await;
@@ -110,7 +120,7 @@ impl Collection {
             warc_file_id = n;
             warc_target = self.gen_warc_filename(n).await;
             if let Some(size) = self.fm.get_file_size(format!("{}/{}", self.path, warc_target)).await {
-                if (size+(serialized_record.len() as u64)) >= manifest.split_threshold {
+                if (size+(raw_records.len() as u64)) >= manifest.split_threshold {
                     continue;
                 }
             }
@@ -118,62 +128,37 @@ impl Collection {
         }
 
         if warc_file_id != cached_warc_file_id {
+            debug!("{}: switching to warc file {}", manifest.slug, warc_file_id);
             *self.cur_record_file.write().await = warc_file_id;
         }
 
-        debug!("generate cdx...");
-        let mut cdx = CDXRecord::from_warc(&record)?;
-        let offset = self.fm.append(
+        debug!("writing...");
+        let file_offset = self.fm.append(
             &format!("{}/{}", self.path, warc_target),
-            &serialized_record).await?;
-        
-        cdx.set_file(warc_target, Some(offset), Some(serialized_record.len() as u64));
+            &raw_records).await?;
 
-        debug!("{} cdx: {}", record.get_record_id()?, cdx);
-        self.fm.append(
-            &format!("{}/index.cdx", self.path),
-            format!("{}\n", cdx).as_bytes()).await?;
+        debug!("updating cdx...");
+        let mut warc_offset = 0;
+        let mut cdx_records_str = String::new();
+        for cdx_rec in cdx_records {
+            cdx_rec.set_file(warc_target.clone(), Some(file_offset+warc_offset), cdx_rec.get_raw_size());
+            warc_offset += cdx_rec.get_raw_size().unwrap();
+            cdx_records_str.write_fmt(format_args!("{}\n", cdx_rec))?;
+        }
 
-        Ok(cdx)
+        debug!("writing cdx...");
+        self.fm.append(&format!("{}/index.cdx", self.path), cdx_records_str.as_bytes()).await?;
+
+        Ok(())
     }
 
-    pub async fn add_raw_warc(&self, raw_record: Vec<u8>, mut cdx: CDXRecord) -> anyhow::Result<CDXRecord> {
+    pub async fn add_raw_warc(&self, raw_record: Vec<u8>, cdx: CDXRecord) -> anyhow::Result<CDXRecord> {
         let manifest = self.manifest.read().await;
         info!("writing new record to `{}`: {}", manifest.slug, cdx.get_record_id());
 
-        /* get the first file that can hold the record */
-        debug!("finding available slot...");
-        let mut warc_target = String::new();
-        let cached_warc_file_id = *self.cur_record_file.read().await;
-        let mut warc_file_id = cached_warc_file_id;
-        for n in warc_file_id.. {
-            warc_file_id = n;
-            warc_target = self.gen_warc_filename(n).await;
-            if let Some(size) = self.fm.get_file_size(format!("{}/{}", self.path, warc_target)).await {
-                if (size+(raw_record.len() as u64)) >= manifest.split_threshold {
-                    continue;
-                }
-            }
-            break;
-        }
-
-        if warc_file_id != cached_warc_file_id {
-            *self.cur_record_file.write().await = warc_file_id;
-        }
-
-        let offset = self.fm.append(
-            &format!("{}/{}", self.path, warc_target),
-            &raw_record).await?;
-
-        cdx.set_file(warc_target, Some(offset), Some(raw_record.len() as u64));
-
-
-        debug!("{} cdx: {}", cdx.get_record_id(), cdx);
-        self.fm.append(
-            &format!("{}/index.cdx", self.path),
-            format!("{}\n", cdx).as_bytes()).await?;
-
-        Ok(cdx)
+        let mut cdx_vec: Vec<CDXRecord> = vec![cdx];
+        self.add_raw_warcs(&raw_record, &mut cdx_vec).await?;
+        Ok(cdx_vec.remove(0))
     }
 
     async fn ensure_dict_loaded(&self) {

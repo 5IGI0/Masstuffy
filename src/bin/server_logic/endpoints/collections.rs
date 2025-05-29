@@ -18,12 +18,14 @@
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, warc::{cdx, read_record}};
+use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, warc::{cdx::{self, CDXRecord}, read_record}};
 use serde::Deserialize;
 use serde_json::json;
 use tide::{http::bail, Request, Response};
 use masstuffy::filesystem::collections::CollectionInfo;
 use crate::server_logic::AppState;
+
+const WARC_RECORD_BUFFER_SIZE: usize = 50_000_000;
 
 pub async fn list_collections(req: Request<AppState>) -> tide::Result {
     let fs = req.state().fs.read().await;
@@ -116,26 +118,48 @@ pub async fn push_raw_records(mut req: Request<AppState>) -> tide::Result {
     };
 
     let mut cdx_line = String::new();
-    buf.read_line(&mut cdx_line).await?;
-    let cdx_entry = cdx::CDXRecord::from_line(&cdx_line)?;
-    let record_size = cdx_entry.get_raw_size().unwrap_or(0) as usize;
+    let mut cdx_records: Vec<CDXRecord> = Vec::new();
+    let mut warc_buffer: Vec<u8> = Vec::new();
+    loop {
+        cdx_line.clear();
+        buf.read_line(&mut cdx_line).await?;
+        if cdx_line.len() == 0 {
+            break;
+        }
+        let cdx_record = cdx::CDXRecord::from_line(&cdx_line)?;
+        let record_size = cdx_record.get_raw_size().unwrap_or(0) as usize;
 
-    if record_size == 0 {
-        bail!("invalid record size");
+        if record_size == 0 {
+            bail!("invalid record size");
+        }
+
+        if (warc_buffer.len() > 0) && (record_size + warc_buffer.len() > WARC_RECORD_BUFFER_SIZE) {
+            coll.read().await.add_raw_warcs(&warc_buffer, &mut cdx_records).await?;
+            warc_buffer.clear();
+            let db = req.state().db.read().await;
+            for rec in &cdx_records {
+                db.insert_record(&coll_uuid, &rec, RECORD_FLAG_ACTIVE, dict_id, dict_algo.as_deref()).await?;
+            }
+            cdx_records.clear();
+        }
+    
+        cdx_records.push(cdx_record);
+        let slice_start = warc_buffer.len();
+        warc_buffer.resize(slice_start+record_size, 0);
+
+        let nread = buf.read_exact(&mut warc_buffer[slice_start..slice_start+record_size]).await?;
+        if nread != record_size {
+            bail!("truncated record");
+        }
     }
 
-    let mut raw_record: Vec<u8> = Vec::new();
-    raw_record.resize(record_size, 0);
-
-    let nread = buf.read_exact(&mut raw_record).await?;
-    if nread != raw_record.len() {
-        bail!("truncated record");
+    if warc_buffer.len() > 0 {
+        coll.read().await.add_raw_warcs(&warc_buffer, &mut cdx_records).await?;
+        let db = req.state().db.read().await;
+        for rec in &cdx_records {
+            db.insert_record(&coll_uuid, &rec, RECORD_FLAG_ACTIVE, dict_id, dict_algo.as_deref()).await?;
+        }
     }
-
-
-    let cdx = coll.read().await.add_raw_warc(raw_record, cdx_entry).await?;
-    req.state().db.read().await.
-        insert_record(&coll_uuid, &cdx, RECORD_FLAG_ACTIVE, dict_id, dict_algo.as_deref()).await?;
 
     Ok(Response::builder(200).body("success").build())
 }

@@ -26,6 +26,7 @@ use crate::utils::open_compressed;
 
 use super::WarcRecord;
 
+#[derive(Clone)]
 pub struct CDXRecord {
     url: Option<String>,
     record_type: String,
