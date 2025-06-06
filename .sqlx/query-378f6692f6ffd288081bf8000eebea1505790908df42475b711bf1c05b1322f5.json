@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM masstuffy_records\n        WHERE\n            collection = $1 AND\n            dict_id    = $2 AND\n            dict_type  = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "378f6692f6ffd288081bf8000eebea1505790908df42475b711bf1c05b1322f5"
+}

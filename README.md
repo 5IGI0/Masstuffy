@@ -66,10 +66,13 @@ For more details, please refer to the LICENSE file.
   - [X] get record
   - [X] search records
   - [ ] detect when the server runs and send commands to it
+  - [X] create permissions
+  - [ ] delete permissions
 - server
   - [X] link to source code (AGPL requirement)
   - [X] create collection
   - [X] add records
+  - [ ] delete records
   - [X] search records
   - [ ] report records
   - [X] offload decompression (client-side decompression)
@@ -77,3 +80,13 @@ For more details, please refer to the LICENSE file.
   - [X] get record(s)
     - [X] by id
     - [X] by url
+  - [ ] permissions
+    - [ ] create permissions
+    - [ ] delete permissions
+    - [ ] permissions
+      - [ ] read records
+      - [ ] write records
+      - [ ] delete records
+      - [ ] create collections
+      - [ ] delete collections
+      - [ ] enum collections

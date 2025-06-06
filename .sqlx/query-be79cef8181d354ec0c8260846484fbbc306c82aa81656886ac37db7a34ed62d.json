@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE masstuffy_records\n        SET flags = flags|1\n        WHERE\n            collection = $1 AND\n            dict_id    = $2 AND\n            dict_type  = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "be79cef8181d354ec0c8260846484fbbc306c82aa81656886ac37db7a34ed62d"
+}

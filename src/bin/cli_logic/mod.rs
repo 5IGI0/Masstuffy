@@ -29,6 +29,7 @@ mod generate_dictionary;
 mod search;
 mod rebuild;
 mod delete_collection;
+mod create_token;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -44,6 +45,7 @@ generate_dict     - generate dictionnary
 search            - search records in db
 rebuild           - rebuild a collection
 delete_collection - delete a collection
+create_token      - create an access token
 "#,
     argv[0]);
     Ok(0)
@@ -69,6 +71,7 @@ pub async fn main() {
         "search" => search::main(argv).await,
         "rebuild" => rebuild::main(argv).await,
         "delete_collection" => delete_collection::main(argv).await,
+        "create_token" => create_token::main(argv).await,
         _ => print_help(argv),
     };
 

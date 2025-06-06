@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT * FROM masstuffy_tokens",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "token",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "comment",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "read_perms_kind",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "read_perms",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "write_perms_kind",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 5,
+        "name": "write_perms",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "delete_perms_kind",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "delete_perms",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d338c3c1d056db2728e162e607dd1f25cd47f0e053f35a5663238c5c053b84d4"
+}

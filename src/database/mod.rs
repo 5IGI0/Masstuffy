@@ -22,7 +22,7 @@ use sqlx::postgres::PgPool;
 use structs::DBWarcRecord;
 use log::info;
 
-use crate::{constants::MASSTUFFY_DATE_FMT, warc::{cdx::CDXRecord, massaged_url::{massage_url, massaged_url_pattern, Match}}};
+use crate::{constants::MASSTUFFY_DATE_FMT, database::structs::{DBToken, TokenInfo}, warc::{cdx::CDXRecord, massaged_url::{massage_url, massaged_url_pattern, Match}}};
 
 pub mod structs;
 
@@ -56,7 +56,9 @@ impl DBManager {
 
     // TODO: insert from iterator
     pub async fn insert_record(&self, coll: &str, record: &CDXRecord, flags: i32, dict_id: Option<i64>, dict_type: Option<&str>) -> anyhow::Result<()> {
-        sqlx::query(r#"
+        let massaged_url = massage_url(record.get_url().as_deref().unwrap_or("")).unwrap_or("".to_string());
+
+        sqlx::query!(r#"
         INSERT INTO masstuffy_records(
             flags, date, identifier,
             collection, filename, "offset", "type",
@@ -65,19 +67,11 @@ impl DBManager {
         VALUES(
             $1, to_timestamp($2, 'YYYYMMDDHH24MISS'), $3,
             $4, $5, $6, $7, $8, $9, $10, $11,
-            $12)"#)
-            .bind(flags)
-            .bind(record.get_date())
-            .bind(record.get_record_id())
-            .bind(coll)
-            .bind(record.get_file_name().unwrap())
-            .bind(record.get_file_offset().unwrap())
-            .bind(record.get_record_type())
-            .bind(record.get_url())
-            .bind(dict_id)
-            .bind(dict_type)
-            .bind(massage_url(record.get_url().as_deref().unwrap_or("")).as_deref().unwrap_or(""))
-            .bind(record.get_raw_size().unwrap() as i32)
+            $12)"#,
+        flags, record.get_date(), record.get_record_id(),
+        coll, record.get_file_name().unwrap(), record.get_file_offset().unwrap(),
+        record.get_record_type(), record.get_url(), dict_id, dict_type,
+        massaged_url, record.get_raw_size().unwrap() as i32)
             .execute(&self.db).await?;
         Ok(())
     }
@@ -89,30 +83,26 @@ impl DBManager {
     }
 
     pub async fn activate_records(&self, collection: &String, dict_id: Option<i64>, dict_type: Option<&str>) -> anyhow::Result<()> {
-        sqlx::query(r#"
+        sqlx::query!(r#"
         UPDATE masstuffy_records
         SET flags = flags|1
         WHERE
             collection = $1 AND
             dict_id    = $2 AND
-            dict_type  = $3"#)
-            .bind(collection)
-            .bind(dict_id)
-            .bind(dict_type)
+            dict_type  = $3"#,
+        collection, dict_id, dict_type)
             .execute(&self.db).await?;
         Ok(())
     }
 
     pub async fn delete_records(&self, collection: &String, dict_id: Option<i64>, dict_type: Option<&str>) -> anyhow::Result<()> {
-        sqlx::query(r#"
+        sqlx::query!(r#"
         DELETE FROM masstuffy_records
         WHERE
             collection = $1 AND
             dict_id    = $2 AND
-            dict_type  = $3"#)
-            .bind(collection)
-            .bind(dict_id)
-            .bind(dict_type)
+            dict_type  = $3"#,
+            collection, dict_id, dict_type)
             .execute(&self.db).await?;
         Ok(())
     }
@@ -165,6 +155,44 @@ impl DBManager {
         DELETE FROM masstuffy_records
         WHERE collection = $1
         "#, collection).execute(&self.db).await?;
+        Ok(())
+    }
+
+    pub async fn get_permissions(&self, token: &String) -> anyhow::Result<Option<DBToken>> {
+        Ok(sqlx::query_as!(
+            DBToken,
+            r#"
+            SELECT * FROM masstuffy_tokens
+            WHERE token = $1
+            LIMIT 1"#, token).
+            fetch_optional(&self.db).await?)
+    }
+
+    pub async fn get_all_permissions(&self) -> anyhow::Result<Vec<TokenInfo>> {
+        Ok(sqlx::query_as!(
+            DBToken,
+            "SELECT * FROM masstuffy_tokens").
+            fetch_all(&self.db).await?
+                .into_iter().map(|t| TokenInfo::from_db_row(t)).collect())
+    }
+
+    pub async fn create_permissions(&self, perms: TokenInfo) -> anyhow::Result<()> {
+        sqlx::query!(r#"
+        INSERT INTO masstuffy_tokens(
+                token, comment,
+                read_perms_kind, read_perms,
+                write_perms_kind, write_perms,
+                delete_perms_kind, delete_perms)
+        VALUES(
+            $1, $2,
+            $3, $4,
+            $5, $6,
+            $7, $8)"#,
+            perms.token, perms.comment,
+            perms.read_perms.get_perms_kind(), perms.read_perms.get_perms(),
+            perms.write_perms.get_perms_kind(), perms.write_perms.get_perms(),
+            perms.delete_perms.get_perms_kind(), perms.delete_perms.get_perms())
+            .execute(&self.db).await?;
         Ok(())
     }
 }
