@@ -168,6 +168,14 @@ impl DBManager {
             fetch_optional(&self.db).await?)
     }
 
+    pub async fn delete_permissions(&self, token: &String) -> anyhow::Result<()> {
+        sqlx::query_as!(
+            DBToken,
+            r#"DELETE FROM masstuffy_tokens WHERE token = $1"#, token).
+            execute(&self.db).await?;
+        Ok(())
+    }
+
     pub async fn get_all_permissions(&self) -> anyhow::Result<Vec<TokenInfo>> {
         Ok(sqlx::query_as!(
             DBToken,

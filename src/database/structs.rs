@@ -16,6 +16,7 @@
  *  Copyright (C) 2025 5IGI0 / Ethan L. C. Lorenzetti
  **/
 
+use std::fmt::Display;
 use chrono::{NaiveDateTime};
 
 #[derive(sqlx::FromRow)]
@@ -97,6 +98,15 @@ impl TokenPermission {
         }
     }
 
+    pub fn get_perms_kind_str(&self) -> &str {
+        match self {
+            TokenPermission::None => "none",
+            TokenPermission::Any => "any",
+            TokenPermission::List(_) => "list",
+            TokenPermission::Prefix(_) => "prefix"
+        }
+    }
+
     pub fn from_db_perms(kind: i16, perms: String) -> Self {
         match kind {
             0 => Self::None,
@@ -105,5 +115,11 @@ impl TokenPermission {
             3 => Self::Prefix(perms),
             _ => Self::None
         }
+    }
+}
+
+impl Display for TokenPermission {
+    fn fmt(&self, format: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        format.write_fmt(format_args!("{}({})", self.get_perms_kind_str(), self.get_perms()))
     }
 }

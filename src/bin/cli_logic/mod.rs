@@ -30,6 +30,8 @@ mod search;
 mod rebuild;
 mod delete_collection;
 mod create_token;
+mod list_tokens;
+mod delete_token;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -46,6 +48,8 @@ search            - search records in db
 rebuild           - rebuild a collection
 delete_collection - delete a collection
 create_token      - create an access token
+list_tokens       - list access tokens
+delete_token      - delete an access token
 "#,
     argv[0]);
     Ok(0)
@@ -72,6 +76,8 @@ pub async fn main() {
         "rebuild" => rebuild::main(argv).await,
         "delete_collection" => delete_collection::main(argv).await,
         "create_token" => create_token::main(argv).await,
+        "list_tokens" => list_tokens::main(argv).await,
+        "delete_token" => delete_token::main(argv).await,
         _ => print_help(argv),
     };
 

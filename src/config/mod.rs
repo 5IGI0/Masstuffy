@@ -23,6 +23,12 @@ pub struct Config {
     pub listen_addr: String,
     pub secret_key: Option<String>,
     pub database: String,
+    pub anonymous_read_perms_kind: String,
+    pub anonymous_read_perms: String,
+    pub anonymous_write_perms_kind: String,
+    pub anonymous_write_perms: String,
+    pub anonymous_delete_perms_kind: String,
+    pub anonymous_delete_perms: String,
 }
 
 impl Config {
@@ -36,6 +42,13 @@ impl Default for Config {
         Config{
             listen_addr: "127.0.0.1:8080".to_string(),
             secret_key: None,
-            database: String::new()}
+            database: String::new(),
+            anonymous_read_perms_kind: "any".to_string(),
+            anonymous_read_perms: String::new(),
+            anonymous_write_perms_kind: "any".to_string(),
+            anonymous_write_perms: String::new(),
+            anonymous_delete_perms_kind: "any".to_string(),
+            anonymous_delete_perms: String::new(),
+        }
     }
 }
