@@ -22,7 +22,7 @@ use sqlx::postgres::PgPool;
 use structs::DBWarcRecord;
 use log::info;
 
-use crate::{constants::MASSTUFFY_DATE_FMT, database::structs::{DBToken, TokenInfo}, warc::{cdx::CDXRecord, massaged_url::{massage_url, massaged_url_pattern, Match}}};
+use crate::{constants::MASSTUFFY_DATE_FMT, database::structs::DBToken, permissions::TokenInfo, warc::{cdx::CDXRecord, massaged_url::{massage_url, massaged_url_pattern, Match}}};
 
 pub mod structs;
 
@@ -158,14 +158,14 @@ impl DBManager {
         Ok(())
     }
 
-    pub async fn get_permissions(&self, token: &String) -> anyhow::Result<Option<DBToken>> {
+    pub async fn get_permissions(&self, token: &str) -> anyhow::Result<Option<TokenInfo>> {
         Ok(sqlx::query_as!(
             DBToken,
             r#"
             SELECT * FROM masstuffy_tokens
             WHERE token = $1
             LIMIT 1"#, token).
-            fetch_optional(&self.db).await?)
+            fetch_optional(&self.db).await?.map(|t| TokenInfo::from_db_row(t)))
     }
 
     pub async fn delete_permissions(&self, token: &String) -> anyhow::Result<()> {

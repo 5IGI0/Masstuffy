@@ -26,6 +26,7 @@ use collections::{load_collection, Collection};
 use log::{debug, error, info};
 
 use crate::database::DBManager;
+use crate::permissions::{TokenInfo, TokenPermission};
 use crate::{config::Config, warc::WarcRecord};
 
 pub mod collections;
@@ -234,5 +235,14 @@ impl FileSystem {
         } else {
             None
         }
+    }
+
+    pub fn get_default_permissions(&self) -> TokenInfo {
+        TokenInfo {
+            token: "anonymous".to_string(),
+            comment: String::new(),
+            read_perms: TokenPermission::from_fs_perms(&self.config.anonymous_read_perms_kind, &self.config.anonymous_read_perms),
+            write_perms: TokenPermission::from_fs_perms(&self.config.anonymous_write_perms_kind, &self.config.anonymous_write_perms),
+            delete_perms: TokenPermission::from_fs_perms(&self.config.anonymous_delete_perms_kind, &self.config.anonymous_delete_perms)}
     }
 }

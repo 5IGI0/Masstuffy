@@ -17,9 +17,9 @@
 **/
 
 use std::io::Write;
-use masstuffy::database::structs::DBWarcRecord;
+use masstuffy::{database::structs::DBWarcRecord, filesystem::CollID, permissions::PermissionType};
 use tide::{Request, Response};
-use crate::server_logic::AppState;
+use crate::server_logic::{assert_access_http, AppState};
 
 /* FRONTEND HANDLERS */
 
@@ -48,6 +48,15 @@ const RECORD_FLAGS_FORCE_DOWNLOAD: u64 = 1<<1;
 const RECORD_FLAGS_RAW: u64 = 1<<2;
 
 async fn unified_handler(req: Request<AppState>, record: DBWarcRecord) -> tide::Result {
+    /* check access */
+    let coll_slug = req.state().fs.read().await.
+        get_collection(CollID::Uuid(record.collection.clone())).await.
+        unwrap().read().await.get_slug().await; // if we found a record, it is unlikely we will not find the associated collection.
+
+    assert_access_http(
+        &req, PermissionType::READ,
+        &coll_slug).await?;
+
     /* convert char flags to bit flags */
     let mut flags: u64 = 0;
     for c in req.param("flags").unwrap().chars().into_iter() {

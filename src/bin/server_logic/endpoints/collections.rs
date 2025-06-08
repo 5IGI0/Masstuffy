@@ -18,12 +18,12 @@
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, warc::{cdx::{self, CDXRecord}, read_record}};
+use masstuffy::{database::structs::RECORD_FLAG_ACTIVE, filesystem::CollID, permissions::{PermissionType}, warc::{cdx::{self, CDXRecord}, read_record}};
 use serde::Deserialize;
 use serde_json::json;
 use tide::{http::bail, Request, Response};
 use masstuffy::filesystem::collections::CollectionInfo;
-use crate::server_logic::AppState;
+use crate::server_logic::{assert_access_http, AppState};
 
 const WARC_RECORD_BUFFER_SIZE: usize = 50_000_000;
 
@@ -78,8 +78,13 @@ pub async fn push_records(mut req: Request<AppState>) -> tide::Result {
     if let None = coll {
         return Ok(Response::builder(404).body("collection not found").build());
     }
+
     let coll = coll.unwrap();
     let coll_uuid = coll.read().await.get_uuid().await;
+
+    assert_access_http(
+        &req, PermissionType::WRITE,
+        &coll.read().await.get_slug().await).await?;
 
     let (dict_id, dict_algo) = coll.read().await.get_dict().await;
     let dict_id = if let Some(dict_id) = dict_id {
@@ -109,6 +114,10 @@ pub async fn push_raw_records(mut req: Request<AppState>) -> tide::Result {
     }
     let coll = coll.unwrap();
     let coll_uuid = coll.read().await.get_uuid().await;
+
+    assert_access_http(
+        &req, PermissionType::WRITE,
+        &coll.read().await.get_slug().await).await?;
 
     let (dict_id, dict_algo) = coll.read().await.get_dict().await;
     let dict_id = if let Some(dict_id) = dict_id {

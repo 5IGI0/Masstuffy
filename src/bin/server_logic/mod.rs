@@ -17,7 +17,7 @@
 **/
 use std::sync::Arc;
 
-use masstuffy::{database::DBManager, filesystem::{self, FileSystem}};
+use masstuffy::{database::DBManager, filesystem::{self, FileSystem}, permissions::{assert_access, PermissionType}};
 use serde::Serialize;
 use tide::{utils::After, Body, Request, Response};
 use tokio::sync::RwLock;
@@ -77,4 +77,20 @@ pub async fn main() {
     app.at("/collection/:collection_uuid/raw_records").post(endpoints::collections::push_raw_records);
     app.at("/dictionary/:dict_id").get(endpoints::dictionaries::get_dictionary);
     app.listen(listen_addr).await.expect("server error");
+}
+
+async fn assert_access_http(req: &Request<AppState>, permtype: PermissionType, coll_slug: &String) -> anyhow::Result<()> {
+    let token_header = req.header("Authorization");
+    let token = // TODO: is there a proper way to do it?
+    if let Some(h) = token_header {
+        &h.as_str()[7..] // remove "Bearer "
+    } else {
+        ""
+    };
+
+    assert_access(
+        &*req.state().db.read().await,
+        &*req.state().fs.read().await,
+        permtype, token,
+        coll_slug).await
 }

@@ -67,7 +67,8 @@ For more details, please refer to the LICENSE file.
   - [X] search records
   - [ ] detect when the server runs and send commands to it
   - [X] create permissions
-  - [ ] delete permissions
+  - [X] delete permissions
+  - [X] list permissions
 - server
   - [X] link to source code (AGPL requirement)
   - [X] create collection
@@ -84,8 +85,8 @@ For more details, please refer to the LICENSE file.
     - [ ] create permissions
     - [ ] delete permissions
     - [ ] permissions
-      - [ ] read records
-      - [ ] write records
+      - [X] read records
+      - [X] write records
       - [ ] delete records
       - [ ] create collections
       - [ ] delete collections

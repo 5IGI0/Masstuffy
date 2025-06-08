@@ -22,3 +22,4 @@ pub mod warc;
 pub mod database;
 pub mod constants;
 pub mod utils;
+pub mod permissions;

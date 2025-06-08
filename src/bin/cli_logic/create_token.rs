@@ -18,7 +18,7 @@
 
 use std::{error::Error};
 use clap::Parser;
-use masstuffy::{database::{self, structs::{TokenInfo, TokenPermission}}, filesystem};
+use masstuffy::{database, filesystem, permissions::{TokenInfo, TokenPermission}};
 
 #[derive(Parser)]
 struct Args {

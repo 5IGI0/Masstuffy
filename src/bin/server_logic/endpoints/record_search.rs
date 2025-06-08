@@ -62,7 +62,6 @@ struct RecordSearchJson{
     r#type: String,
     collection: String,
     date: String
-
 }
 
 async fn format_response_json(records: Vec<DBWarcRecord>) -> tide::Result {
