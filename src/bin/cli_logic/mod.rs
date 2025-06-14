@@ -32,6 +32,7 @@ mod delete_collection;
 mod create_token;
 mod list_tokens;
 mod delete_token;
+mod grep;
 
 fn print_help(argv: Vec<String>) -> Result<i32, Box<dyn Error>> {
     print!(
@@ -50,6 +51,7 @@ delete_collection - delete a collection
 create_token      - create an access token
 list_tokens       - list access tokens
 delete_token      - delete an access token
+grep              - search text inside objects
 "#,
     argv[0]);
     Ok(0)
@@ -78,6 +80,7 @@ pub async fn main() {
         "create_token" => create_token::main(argv).await,
         "list_tokens" => list_tokens::main(argv).await,
         "delete_token" => delete_token::main(argv).await,
+        "grep" => grep::main(argv).await,
         _ => print_help(argv),
     };
 

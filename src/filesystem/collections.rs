@@ -23,7 +23,7 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::{fmt::Write, io::SeekFrom, sync::Arc};
-use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
+use async_compression::{tokio::bufread::{ZstdDecoder, ZstdEncoder}};
 
 use crate::{database::DBManager, utils::seek::FileManager, warc::{cdx::{CDXFileReader, CDXRecord}, read_record, WarcRecord}};
 
