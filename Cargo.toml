@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 thiserror = "2.0.21"
+url = { version = "2.5.8", default-features = false, features = ["std"] }
 uuid = { version = "1.29.2", default-features = false, features = ["std", "v4"] }
 
 [workspace.lints.rust]

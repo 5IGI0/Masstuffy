@@ -29,12 +29,17 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 - External deps: `thiserror`, optional `uuid`.
 
 **`crates/urlkey` — `masstuffy-urlkey`**: massaged-URL canonicalisation and URL pattern queries (spec 1, 4.3).
-- `massage(&str) -> Option<String>` (rules 1–6 of spec 1, plus IDNA and IP handling; `None` instead of "").
-- `UrlPattern { domain | host, include_subdomains, port, path: Exact | Prefix }` built from user input,
-  every component escaped.
-- `UrlPattern::key_ranges() -> Vec<Range<String>>` (ordered-key prefix ranges) and `matches(&str) -> bool`
-  (residual filter). No regex.
-- External deps: `url` (WHATWG parsing, IDNA), `thiserror`. Features: none.
+- `massage(&str) -> Option<String>`: rules 1–6 of spec 1 plus IDNA and IP handling; `None` (never `""`) for
+  unparseable input, schemes other than http/https, or hosts outside `[a-z0-9_-]` labels. IPv6 keys are
+  `[addr]`; the query is canonicalised (sorted pairs, form-decoding).
+- `UrlPattern::new(host, HostMatch, PortFilter, PathFilter) -> Result<UrlPattern, PatternError>`:
+  `HostMatch::{Exact, WithSubdomains}`, `PortFilter::{Any, Default, Explicit(u16)}`,
+  `PathFilter::{Any, Exact(&str), Prefix(&str)}`; every component validated and normalised. The path
+  filter applies to path+query (`Exact` = exact canonical key tail, point range; `Prefix` = begins-with,
+  query prefix canonicalised piece-wise, pywb `matchType` semantics).
+- `UrlPattern::key_ranges() -> &[Range<String>]` (sorted, disjoint, built once in `new`) and
+  `matches(&str) -> bool` (exact filter to apply to scan results). No regex.
+- External deps: `url` 2.5 (`std` only; WHATWG parsing, IDNA), `thiserror`. Features: none.
 
 **`crates/zframe` — `masstuffy-zframe`**: one-record zstd frames and zstd dictionaries (spec 3.2, 3.3).
 - `inspect_frame(&[u8]) -> Result<FrameInfo { dict_id, content_size }>`: pure header parse, validates magic
@@ -202,6 +207,8 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M19 | `masstuffy`: `put_raw`, `read_raw`, `scan`, `search` | delegated frames with wrong dict_id rejected; scan skips orphan bytes |
 | M20 | `masstuffy`: `train_dictionary`, `rebuild` orchestration | deterministic sample; reads keep working during a rebuild (concurrent test) |
 | M21 | `masstuffy`: `delete_collection`, `rename` | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates |
+
+M3 and M4 are delivered together (one plan → code → review cycle).
 
 Milestones M0, M1 and M2 are delivered together by the first milestone.
 
