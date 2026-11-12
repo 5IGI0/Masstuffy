@@ -50,7 +50,8 @@ pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>
     let (head_len, block_end) = loop {
         let window = input.get(pos..window_end).unwrap_or_default();
         let Some(idx) = window.iter().position(|&b| b == b'\n') else {
-            return Err(if input.len() > limits.max_header_bytes {
+            // At or past the cap with no line end in the window: no valid head can fit any more.
+            return Err(if input.len() >= limits.max_header_bytes {
                 ParseError::HeaderSectionTooLarge {
                     limit: limits.max_header_bytes,
                 }
@@ -78,21 +79,29 @@ pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>
             .windows(2)
             .position(|w| w == b": ")
             .ok_or(ParseError::MalformedHeaderLine { offset: pos })?;
-        let (name_bytes, rest) = line.split_at(sep); // sep < line.len()
+        let (name_bytes, rest) = line
+            .split_at_checked(sep)
+            .ok_or(ParseError::MalformedHeaderLine { offset: pos })?;
         let value_bytes = rest.get(2..).unwrap_or_default();
         let value_start = pos + sep + 2;
         if !validate_name(name_bytes) {
             return Err(ParseError::InvalidHeaderName { offset: pos });
         }
-        if let Some(i) = first_invalid_value_byte(value_bytes) {
+        // Report the first offending byte, whether it is a control byte or invalid UTF-8.
+        let utf8 = std::str::from_utf8(value_bytes);
+        let bad_utf8 = utf8.as_ref().err().map(|e| e.valid_up_to());
+        if let Some(i) = first_invalid_value_byte(value_bytes)
+            .into_iter()
+            .chain(bad_utf8)
+            .min()
+        {
             return Err(ParseError::InvalidHeaderValue {
                 offset: value_start + i,
             });
         }
-        let value =
-            std::str::from_utf8(value_bytes).map_err(|e| ParseError::InvalidHeaderValue {
-                offset: value_start + e.valid_up_to(),
-            })?;
+        let value = utf8.map_err(|e| ParseError::InvalidHeaderValue {
+            offset: value_start + e.valid_up_to(),
+        })?;
         // The name is a token, hence ASCII.
         let name = std::str::from_utf8(name_bytes)
             .map_err(|_| ParseError::InvalidHeaderName { offset: pos })?;
@@ -522,6 +531,43 @@ mod tests {
         }
         // HT is allowed.
         assert!(parse(&with_extra(b"X: a\tb\r\n")).is_ok());
+    }
+
+    #[test]
+    fn bad_value_offset_is_first_offending_byte() {
+        // Value starts at 31 ("WARC/1.1\r\nWARC-Type: resource\r\n") + 3 ("X: ").
+        for l in [&b"X: \xff\x01\r\n"[..], b"X: \x01\xff\r\n"] {
+            assert_eq!(
+                err(&with_extra(l)),
+                ParseError::InvalidHeaderValue { offset: 34 },
+                "{l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_ending_at_header_cap_is_too_large() {
+        let b = min();
+        let head_len = b.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        // Head without its final empty line, cap exactly at the input length.
+        let input = &b[..head_len - 2];
+        let limits = Limits {
+            max_header_bytes: input.len(),
+            ..Limits::DEFAULT
+        };
+        assert_eq!(
+            RecordRef::parse(input, &limits).unwrap_err(),
+            ParseError::HeaderSectionTooLarge { limit: input.len() }
+        );
+        // Below the cap, the same input is only truncated.
+        let limits = Limits {
+            max_header_bytes: input.len() + 1,
+            ..Limits::DEFAULT
+        };
+        assert_eq!(
+            RecordRef::parse(input, &limits).unwrap_err(),
+            ParseError::Truncated
+        );
     }
 
     #[test]

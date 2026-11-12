@@ -181,8 +181,8 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | # | Delivers | Test focus |
 |---|---|---|
 | M0 | Workspace `Cargo.toml`, `[workspace.lints]`, empty crates, this file | `cargo fmt/clippy/test` pass |
-| M1 | `warc`: `parse`, `write_to`, ordered headers, `WarcDate` | byte-exact round trip; every malformed case from 3.1; caps; no panic on truncated input at every offset |
-| M2 | `warc`: `RecordReader` streaming | multi-record files, garbage between records, header-size limit |
+| M1 | `warc`: `RecordRef::parse`, `RecordBuilder::build`, ordered headers, `WarcDate` | byte-exact round trip; every malformed case from 3.1; caps; no panic on truncated input at every offset |
+| M2 | `warc`: `WarcReader` streaming | multi-record files, garbage between records, header-size limit |
 | M3 | `urlkey`: `massage` | spec example; default ports; IP v4/v6; IDNA; query sort/encoding; unparseable → `None` |
 | M4 | `urlkey`: `UrlPattern`, `key_ranges`, `matches` | subdomain vs exact host, port, path prefix/exact, escaping of `,` `)` |
 | M5 | `durable`: `atomic_write`, `sync_dir`, `DirLock`, trash | lock held twice fails; tmp leftovers ignored; trash sweep |

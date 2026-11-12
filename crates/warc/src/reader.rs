@@ -50,6 +50,11 @@ impl<R: BufRead> WarcReader<R> {
     /// # Errors
     /// `Io` from the underlying reader; `Parse` for malformed or truncated records (a partial record
     /// at EOF is `Parse(Truncated)`); after any error, every later call returns `Poisoned`.
+    /// `ErrorKind::Interrupted` from the underlying reader is retried, never reported.
+    ///
+    /// The reader checks line endings, the header count and the header-size cap line by line
+    /// while reading, before the full head is validated. For an invalid record it may therefore
+    /// report a different error than [`RecordRef::parse`] on the same bytes; both always reject it.
     pub fn next_record(&mut self) -> Result<Option<RecordRef<'_>>, ReadError> {
         if self.poisoned {
             return Err(ReadError::Poisoned);
@@ -99,7 +104,14 @@ impl<R: BufRead> WarcReader<R> {
 
     /// Reads one full record into `self.buf`. `Ok(false)` on clean EOF before any byte.
     fn fill(&mut self) -> Result<bool, ReadError> {
-        if self.inner.fill_buf()?.is_empty() {
+        let at_eof = loop {
+            match self.inner.fill_buf() {
+                Ok(b) => break b.is_empty(),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if at_eof {
             return Ok(false);
         }
         let max = self.limits.max_header_bytes;
@@ -368,6 +380,33 @@ mod tests {
             assert!(matches!(r.next_record(), Err(ReadError::Io(_))), "n={n}");
             assert!(matches!(r.next_record(), Err(ReadError::Poisoned)));
         }
+    }
+
+    /// Returns `Interrupted` on the first read, then serves `data`.
+    struct InterruptOnce<'a> {
+        data: &'a [u8],
+        fired: bool,
+    }
+
+    impl Read for InterruptOnce<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if !self.fired {
+                self.fired = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.data.read(out)
+        }
+    }
+
+    #[test]
+    fn interrupted_is_retried() {
+        let b = rec(MIN, MIN_BODY);
+        let mut r = WarcReader::new(BufReader::new(InterruptOnce {
+            data: &b,
+            fired: false,
+        }));
+        assert_eq!(r.next_record().unwrap().unwrap().as_bytes(), &b[..]);
+        assert!(r.next_record().unwrap().is_none());
     }
 
     #[test]
