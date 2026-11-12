@@ -68,10 +68,19 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 ### Storage layer (filesystem, still WARC-agnostic where possible)
 
 **`crates/durable` — `masstuffy-durable`**: crash-safe filesystem primitives (spec 5.3).
-- `atomic_write(dir, name, bytes)`: tmp + fsync + rename + fsync(dir). `sync_dir(path)`.
-- `DirLock`: exclusive `flock` on `<dir>/.lock` (std `File::try_lock`), released on drop.
-- `trash_dir(path)`: atomic rename to `.trash-<name>` then removal; `sweep_trash(dir)` at startup.
-- External deps: none (std only, errors are `io::Error` with path context). Features: none.
+- All functions are blocking `std::fs` I/O (fsync can take tens of ms): async callers use `spawn_blocking`.
+- `atomic_write(dir, name, bytes)`: unique `.tmp-<pid>-<seq>` file (`create_new`) + fsync + rename +
+  fsync(dir); the temp file is removed on any failure before the rename. `sync_dir(path)`.
+- `DirLock::try_acquire(dir)`: exclusive `flock` on `<dir>/.lock` (std `File::try_lock`, per open file
+  description), never waits, released on drop; `.lock` is never unlinked.
+- `trash_dir(path)`: atomic rename to `.trash-<name>-<pid>-<seq>` + fsync(parent) (commit point), then
+  removal. `sweep_trash(dir)` and `sweep_tmp(dir)` remove leftover `.trash-*` / `.tmp-*` entries; they
+  are for startup only, under the repository `DirLock`, before any writer runs. `.tmp-*` files are
+  created next to their target, so `sweep_tmp` must run on **every** directory `atomic_write` writes into
+  (repository root, each collection dir, the dictionary store), not only on `repository/`.
+- Reserved names `.lock`, `.tmp-*`, `.trash-*` (`is_reserved`): directory scanners in higher crates skip them.
+- Errors: `thiserror` enum `Error { Io { op, path, source }, Locked, InvalidName }` (every error names
+  the failing path; `Locked` is matchable). External deps: `thiserror`. Features: none.
 
 **`crates/seglog` — `masstuffy-seglog`**: an append-only, segmented byte log with positioned reads.
 - Files `<stem>.<N>.<ext>` in one directory, `N` from 1 without gaps; the caller picks `stem`/`ext`

@@ -1,0 +1,13 @@
+[package]
+name = "masstuffy-durable"
+version = "0.1.0"
+description = "Crash-safe filesystem primitives: atomic replace, directory fsync, directory lock, atomic delete"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
