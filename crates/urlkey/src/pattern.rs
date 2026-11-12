@@ -766,12 +766,17 @@ mod tests {
         }
     }
 
-    fn oracle(host: &str, subs: bool, port: PortFilter, path: PathFilter<'_>, url: &str) -> bool {
-        let u = Url::parse(url).unwrap();
+    /// Pattern host as `url` normalises it (lowercase, IDNA).
+    fn oracle_host(host: &str) -> String {
         let ph = Url::parse(&format!("http://{host}/")).unwrap();
-        let ph = ph.host_str().unwrap().to_owned();
+        ph.host_str().unwrap().to_owned()
+    }
+
+    /// Independent predicate on an already parsed URL (parsing once per corpus entry keeps the
+    /// pattern × corpus product fast in debug builds).
+    fn oracle(ph: &str, subs: bool, port: PortFilter, path: PathFilter<'_>, u: &Url) -> bool {
         let uh = u.host_str().unwrap();
-        let host_ok = uh == ph || (subs && uh.ends_with(&format!(".{ph}")));
+        let host_ok = uh == ph || (subs && uh.strip_suffix(ph).is_some_and(|r| r.ends_with('.')));
         let port_ok = match port {
             PortFilter::Any => true,
             PortFilter::Default => u.port().is_none(),
@@ -829,7 +834,7 @@ mod tests {
             "/a/..foo",
         ];
         let queries = ["", "?x=1", "?a=&b"];
-        let mut corpus: Vec<(String, String)> = Vec::new();
+        let mut corpus: Vec<(Url, String)> = Vec::new();
         for s in ["http", "https"] {
             for h in hosts {
                 for p in ports {
@@ -837,7 +842,7 @@ mod tests {
                         for q in queries {
                             let url = format!("{s}://{h}{p}{pa}{q}");
                             let k = massage(&url).unwrap();
-                            corpus.push((url, k));
+                            corpus.push((Url::parse(&url).unwrap(), k));
                         }
                     }
                 }
@@ -873,6 +878,7 @@ mod tests {
         ];
         let mut npat = 0usize;
         for ph in phosts {
+            let oh = oracle_host(ph);
             let is_ip = ph == "127.0.0.1" || ph == "[::1]";
             for hm in [HostMatch::Exact, HostMatch::WithSubdomains] {
                 if is_ip && hm == HostMatch::WithSubdomains {
@@ -894,7 +900,7 @@ mod tests {
                         let mut expected = BTreeSet::new();
                         for (url, k) in &corpus {
                             let m = p.matches(k);
-                            assert_eq!(m, oracle(ph, subs, port, path, url), "{ph} {url} {k}");
+                            assert_eq!(m, oracle(&oh, subs, port, path, url), "{ph} {url} {k}");
                             let inr = r.iter().any(|x| {
                                 x.start.as_str() <= k.as_str() && k.as_str() < x.end.as_str()
                             });
