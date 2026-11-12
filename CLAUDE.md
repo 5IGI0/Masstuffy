@@ -6,6 +6,16 @@ Single-machine object storage built on WARC records, written in Rust. This is a 
 - Do not port or imitate the legacy implementation. The spec and the rules below decide.
 - Out of scope unless explicitly requested: HTTP API, CLI, authentication.
 
+## Workspace layout
+
+The project is a Cargo workspace made of small, **independently reusable crates** under `crates/`.
+
+- Each crate has one clear responsibility and a minimal public API, and is usable outside Masstuffy (e.g. the WARC parser must not know about collections, segments or zstd).
+- Dependencies point one way only: low-level format crates → storage crates → the Masstuffy engine. No cycles, and no low-level crate depends on a higher-level one.
+- A crate only pulls the dependencies it needs. Optional integrations (tokio, zstd, serde…) go behind cargo features when a crate is useful without them.
+- Shared dependency versions live in `[workspace.dependencies]`. Shared lints live in `[workspace.lints]`.
+- The crate map and the dependency graph are documented in [`docs/architecture.md`](docs/architecture.md). Keep it up to date when a crate is added or its role changes.
+
 ## Workflow
 
 ### Small tasks: do them directly

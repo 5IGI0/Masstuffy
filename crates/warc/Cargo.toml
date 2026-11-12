@@ -1,0 +1,19 @@
+[package]
+name = "masstuffy-warc"
+version = "0.1.0"
+description = "Strict, zero-copy WARC/1.1 record parser and serialiser"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["generate"]
+## Generate WARC-Record-ID (uuid v4) for records that lack one.
+generate = ["dep:uuid"]
+
+[dependencies]
+thiserror.workspace = true
+uuid = { workspace = true, optional = true }
+
+[lints]
+workspace = true
