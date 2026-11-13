@@ -73,6 +73,11 @@ impl Snapshot {
         })
     }
 
+    /// The segment reader (recovery).
+    pub(crate) fn reader(&self) -> &Reader {
+        &self.reader
+    }
+
     /// The manifest this snapshot was built from.
     #[must_use]
     pub fn manifest(&self) -> &Arc<Manifest> {

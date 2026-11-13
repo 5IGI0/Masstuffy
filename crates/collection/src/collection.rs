@@ -17,9 +17,10 @@ use crate::id::CollectionId;
 use crate::layout::{MANIFEST_NAME, cdx_name, create_cdx, segment_naming};
 use crate::manifest::{Codec, Generation, Manifest};
 use crate::prepare::Preparer;
+use crate::recover::{self, RecoveryOptions, RecoveryReport};
 use crate::resolve::DictResolver;
 use crate::snapshot::Snapshot;
-use crate::writer::Writer;
+use crate::writer::{ScanState, Writer};
 
 /// Parameters of a new collection.
 #[derive(Debug, Clone, Copy)]
@@ -47,8 +48,8 @@ impl Collection {
     ///
     /// Order: segment file, CDX header, warcinfo data and CDX line (all fsynced), then the manifest
     /// by atomic replace (the commit point), then an fsync of the parent directory. `create` never
-    /// deletes anything on error: a directory without `manifest.json` is not a collection (the
-    /// engine trashes it), and one with `manifest.json` after an `Err` must not be registered.
+    /// deletes anything on error: a directory without `manifest.json` is not a collection (`open` returns
+    /// `ManifestMissing`; the engine trashes it), and one with `manifest.json` after an `Err` must not be registered.
     ///
     /// # Errors
     ///
@@ -106,7 +107,21 @@ impl Collection {
         let appender =
             Appender::create(dir, segment_naming(1, &spec.codec)?, spec.split_threshold)?;
         let cdx = create_cdx(dir, 1)?;
-        let mut writer = Writer::from_parts(Arc::clone(&ctx), appender, cdx, dir.join(cdx_name(1)));
+        let cdx_path = dir.join(cdx_name(1));
+        let header_len = fs::metadata(&cdx_path)
+            .map_err(|source| Error::Io {
+                op: "stat",
+                path: cdx_path.clone(),
+                source,
+            })?
+            .len();
+        let state = ScanState {
+            cdx_len: header_len,
+            entries: 0,
+            seg_ends: Vec::new(),
+            valid: true,
+        };
+        let mut writer = Writer::from_parts(Arc::clone(&ctx), appender, cdx, cdx_path, state);
         let mut preparer = Preparer::new(Arc::clone(&ctx))?;
         let prepared = preparer.prepare(warcinfo_record(&json)?)?;
         let entry = writer
@@ -123,6 +138,43 @@ impl Collection {
         Ok((Collection { writer, snapshot }, entry))
     }
 
+    /// Opens the collection in `dir`, recovering it after a crash.
+    ///
+    /// **Precondition**: the caller guarantees exclusive access to `dir` (no other process, and
+    /// in this process no other `Collection`, `Writer`, rebuild or manifest rewrite for this
+    /// collection; a previous `Writer` has been dropped). No lock is taken.
+    ///
+    /// Phase A reads only (plus one directory fsync): manifest, dictionaries, directory
+    /// classification, segments, then the CDX header (I4) and lines (from the checkpoint if it is
+    /// valid), with the cheap I2 check on every scanned line and a digest check on the last
+    /// `verify_last` `Add` entries. Phase B mutates: it truncates a torn CDX tail (or, with
+    /// `RepairPolicy::TruncateAtCorruption`, cuts at the first corrupt or I2-violating line),
+    /// maintains the checkpoint, sweeps `.tmp-*` files and deletes the files of every
+    /// non-active generation. Unknown files are kept and reported. A failed phase A changes
+    /// nothing on disk. See `RecoveryReport` for what was done.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidOptions`, `ManifestMissing` (an aborted `create`: the engine trashes the
+    /// directory), `Manifest`, `Io`, `Resolve`, `DictMismatch`, `Durable`, `Segment` (no segment,
+    /// a gap, a bad name), `CdxMissing`, `CdxRead`, `CdxGeneration`, `CdxCorrupt`, `I2Violation`,
+    /// `Internal`.
+    pub fn open(
+        dir: &Path,
+        opts: &Options,
+        recovery: &RecoveryOptions,
+        resolver: &dyn DictResolver,
+    ) -> Result<(Collection, RecoveryReport), Error> {
+        let (writer, snapshot, report) = recover::open(dir, opts, recovery, resolver)?;
+        Ok((
+            Collection {
+                writer,
+                snapshot: Arc::new(snapshot),
+            },
+            report,
+        ))
+    }
+
     /// The manifest (the snapshot's).
     #[must_use]
     pub fn manifest(&self) -> &Arc<Manifest> {
@@ -133,6 +185,22 @@ impl Collection {
     #[must_use]
     pub fn snapshot(&self) -> &Arc<Snapshot> {
         &self.snapshot
+    }
+
+    /// Path of the generation's CDX, for re-reading it with `CdxReader::resume` (secondary-index
+    /// catch-up).
+    #[must_use]
+    pub fn cdx_path(&self) -> &Path {
+        self.writer.cdx_path()
+    }
+
+    /// Writes the scan checkpoint; see [`Writer::checkpoint`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Writer::checkpoint`].
+    pub fn checkpoint(&mut self) -> Result<bool, Error> {
+        self.writer.checkpoint()
     }
 
     /// The single writer.

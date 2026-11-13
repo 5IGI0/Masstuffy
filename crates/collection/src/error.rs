@@ -205,6 +205,46 @@ pub enum ReadError {
     EntryMismatch(&'static str),
 }
 
+/// How a CDX line violates I2 (spec 05 §5.1).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum I2Violation {
+    /// The segment number is 0 or above the number of segments of the generation.
+    #[error("segment {segment} does not exist (generation has {segments})")]
+    SegmentMissing {
+        /// Segment named by the line.
+        segment: u32,
+        /// Number of segments of the generation.
+        segments: u32,
+    },
+    /// `offset + raw_size` passes the end of the segment (or overflows).
+    #[error("segment {segment}: [{offset}, +{raw_size}) passes its end {segment_len}")]
+    PastEnd {
+        /// Segment named by the line.
+        segment: u32,
+        /// Offset in the segment.
+        offset: u64,
+        /// Stored size.
+        raw_size: u64,
+        /// Length of the segment file.
+        segment_len: u64,
+    },
+    /// The stored bytes do not have the entry's digest (deep check).
+    #[error("segment {segment} offset {offset}: digest {actual:016x}, entry says {expected:016x}")]
+    DigestMismatch {
+        /// Segment named by the line.
+        segment: u32,
+        /// Offset in the segment.
+        offset: u64,
+        /// Stored size.
+        raw_size: u64,
+        /// Digest in the entry.
+        expected: u64,
+        /// Digest of the bytes read.
+        actual: u64,
+    },
+}
+
 /// Errors of collection-level operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -287,6 +327,57 @@ pub enum Error {
     /// Committing a batch failed.
     #[error(transparent)]
     Commit(#[from] CommitError),
+    /// The active generation's CDX does not exist.
+    #[error("index missing: {}", path.display())]
+    CdxMissing {
+        /// The index path.
+        path: PathBuf,
+    },
+    /// Reading the CDX failed (I/O, missing or bad header, offset overflow).
+    #[error("reading {} failed: {source}", path.display())]
+    CdxRead {
+        /// The index path.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: masstuffy_cdx::ReadError,
+    },
+    /// The CDX header names another generation than the manifest (I4).
+    #[error("{} is for generation {found}, manifest says {expected}", path.display())]
+    CdxGeneration {
+        /// The index path.
+        path: PathBuf,
+        /// Generation in the manifest.
+        expected: u32,
+        /// Generation in the header.
+        found: u32,
+    },
+    /// Corruption that is not a torn tail, at byte `at`. Repairable with
+    /// `RepairPolicy::TruncateAtCorruption`.
+    #[error("corrupt index {} at byte {at} of {end}: {source}", path.display())]
+    CdxCorrupt {
+        /// The index path.
+        path: PathBuf,
+        /// Offset of the first bad line.
+        at: u64,
+        /// File length.
+        end: u64,
+        /// What is wrong with the line.
+        #[source]
+        source: masstuffy_cdx::LineError,
+    },
+    /// The CDX line at byte `at` violates I2. Repairable with
+    /// `RepairPolicy::TruncateAtCorruption`.
+    #[error("index {} line at byte {at} violates I2: {violation}", path.display())]
+    I2Violation {
+        /// The index path.
+        path: PathBuf,
+        /// Offset of the offending line.
+        at: u64,
+        /// How it violates I2.
+        #[source]
+        violation: I2Violation,
+    },
     /// An internal invariant did not hold.
     #[error("internal error: {0}")]
     Internal(&'static str),

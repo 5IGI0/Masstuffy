@@ -11,13 +11,22 @@
 //! seg.<gen>.<N>.warc       segments of generation <gen> (codec none)
 //! seg.<gen>.<N>.warc.zst   segments of generation <gen> (codec zstd)
 //! index.<gen>.cdx          the CDX of generation <gen>
+//! scan.<gen>.json          optional scan checkpoint (derived cache, safe to delete)
 //! ```
 //!
-//! Flow: [`Collection::create`] builds a collection; a [`Preparer`] (one per worker thread)
+//! Flow: [`Collection::create`] builds a collection, [`Collection::open`] loads one and recovers it
+//! after a crash; a [`Preparer`] (one per worker thread)
 //! turns a record into a [`Prepared`] outside any lock; the single [`Writer`] commits batches of
 //! them; readers share an `Arc<`[`Snapshot`]`>` and use a per-thread [`ReadCtx`].
+//!
+//! Recovery: `open` truncates a torn CDX tail, checks I2 (cheaply on every scanned line, deeply on
+//! the last few) and I4, scans only the CDX past the checkpoint when there is a valid one, and
+//! deletes the files of non-active generations and `.tmp-*` leftovers. It takes no lock: the
+//! caller guarantees exclusive access to the directory (see the `recover` module docs, and
+//! [`Collection::open`]).
 #![forbid(unsafe_code)]
 
+mod checkpoint;
 mod collection;
 mod context;
 mod error;
@@ -25,6 +34,7 @@ mod id;
 mod layout;
 mod manifest;
 mod prepare;
+mod recover;
 mod resolve;
 mod snapshot;
 #[cfg(test)]
@@ -33,13 +43,18 @@ mod writer;
 
 use std::num::NonZeroU64;
 
+pub use checkpoint::{CHECKPOINT_MIN_GROWTH, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_SEGMENTS};
 pub use collection::{Collection, CreateSpec};
 pub use context::{GenContext, Options};
-pub use error::{CommitError, Error, ManifestError, PrepareError, ReadError};
+pub use error::{CommitError, Error, I2Violation, ManifestError, PrepareError, ReadError};
 pub use id::CollectionId;
 pub use manifest::{Codec, Generation, Manifest};
-pub use masstuffy_cdx::{Entry, Kind};
+pub use masstuffy_cdx::{Entry, Kind, LineError};
 pub use prepare::{Prepared, Preparer, RawCheck};
+pub use recover::{
+    DEFAULT_VERIFY_LAST, FullScanReason, MAX_REPORTED_UNKNOWN, MAX_VERIFY_LAST, RecoveryOptions,
+    RecoveryReport, Repair, RepairPolicy, RepairReason, ScanMode, TornTail,
+};
 pub use resolve::{DictResolver, ResolveError};
 pub use snapshot::{RawEncoding, ReadCtx, Snapshot};
 pub use writer::Writer;

@@ -283,3 +283,155 @@ pub(crate) fn create_zstd(dir: &Path) -> (Collection, Entry<'static>) {
         &Options::default(),
     )
 }
+
+// ---- Recovery test helpers.
+
+use std::collections::BTreeSet;
+use std::io::BufReader;
+
+use masstuffy_cdx::{CdxReader, CdxWriter, DEFAULT_MAX_LINE, Step, Tail, digest};
+
+use crate::Error;
+use crate::prepare::{Prepared, Preparer};
+use crate::recover::{RecoveryOptions, RecoveryReport};
+
+/// Copies every regular file of `src` into the new directory `dst` (flat).
+pub(crate) fn clone_dir(src: &Path, dst: &Path) {
+    fs::create_dir(dst).unwrap();
+    for e in fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() {
+            fs::copy(e.path(), dst.join(e.file_name())).unwrap();
+        }
+    }
+}
+
+/// Sorted (name, content) of every regular file of `dir`.
+pub(crate) fn listing(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let e = e.unwrap();
+            e.file_type().unwrap().is_file().then(|| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    fs::read(e.path()).unwrap(),
+                )
+            })
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A checksum-valid CDX line: `content`, a space, the 8 hex digits of its check, a newline.
+pub(crate) fn with_check(content: &[u8]) -> Vec<u8> {
+    let mut v = content.to_vec();
+    v.extend_from_slice(format!(" {:08x}\n", digest(content) & 0xffff_ffff).as_bytes());
+    v
+}
+
+/// Appends one entry to a CDX file.
+pub(crate) fn append_cdx_line(path: &Path, e: &Entry<'_>) {
+    let file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    let mut w = CdxWriter::append(file, DEFAULT_MAX_LINE);
+    w.push(e).unwrap();
+    w.write_pending().unwrap();
+}
+
+/// `(start, end, entry)` of every valid line of `index.<gen>.cdx`.
+pub(crate) fn cdx_lines(dir: &Path, generation: u32) -> Vec<(u64, u64, Entry<'static>)> {
+    let f = fs::File::open(dir.join(format!("index.{generation}.cdx"))).unwrap();
+    let mut r = CdxReader::open(BufReader::new(f), DEFAULT_MAX_LINE).unwrap();
+    let mut v = Vec::new();
+    loop {
+        match r.next_step().unwrap() {
+            Step::Entry { offset, entry } => {
+                let e = entry.into_owned();
+                v.push((offset, r.offset(), e));
+            }
+            Step::End(_) => return v,
+        }
+    }
+}
+
+/// All entries of `index.<gen>.cdx` and how it ends.
+pub(crate) fn read_cdx_all(dir: &Path, generation: u32) -> (Vec<Entry<'static>>, Tail) {
+    let f = fs::File::open(dir.join(format!("index.{generation}.cdx"))).unwrap();
+    let mut r = CdxReader::open(BufReader::new(f), DEFAULT_MAX_LINE).unwrap();
+    let mut v = Vec::new();
+    loop {
+        match r.next_step().unwrap() {
+            Step::Entry { entry, .. } => v.push(entry.into_owned()),
+            Step::End(t) => return (v, t),
+        }
+    }
+}
+
+/// `{lo, hi}`, `{b-1, b, b+1}` for each boundary (clamped to `[lo, hi]`) and `lo + k * stride`.
+pub(crate) fn offsets(lo: u64, hi: u64, boundaries: &[u64], stride: u64) -> BTreeSet<u64> {
+    let mut s = BTreeSet::from([lo, hi]);
+    for &b in boundaries {
+        for x in [b.saturating_sub(1), b, b.saturating_add(1)] {
+            s.insert(x.clamp(lo, hi));
+        }
+    }
+    let mut x = lo;
+    while x <= hi {
+        s.insert(x);
+        x += stride;
+    }
+    s
+}
+
+pub(crate) fn open_with(
+    dir: &Path,
+    recovery: &RecoveryOptions,
+) -> Result<(Collection, RecoveryReport), Error> {
+    Collection::open(dir, &Options::default(), recovery, &MapResolver::standard())
+}
+
+pub(crate) fn open_ok(dir: &Path) -> (Collection, RecoveryReport) {
+    open_with(dir, &RecoveryOptions::default()).unwrap()
+}
+
+/// Prepares and commits `recs` as one batch.
+pub(crate) fn commit_batch(
+    c: &mut Collection,
+    p: &mut Preparer,
+    recs: Vec<Record>,
+) -> Vec<Entry<'static>> {
+    let batch: Vec<Prepared> = recs.into_iter().map(|r| p.prepare(r).unwrap()).collect();
+    c.writer().commit(&batch).unwrap()
+}
+
+/// Path of segment `n` of generation 1.
+pub(crate) fn seg1(dir: &Path, zstd: bool, n: u32) -> PathBuf {
+    dir.join(format!(
+        "seg.1.{n}.{}",
+        if zstd { "warc.zst" } else { "warc" }
+    ))
+}
+
+pub(crate) fn flip_byte(path: &Path, pos: u64) {
+    let mut b = fs::read(path).unwrap();
+    let i = usize::try_from(pos).unwrap();
+    b[i] ^= 0x01;
+    fs::write(path, b).unwrap();
+}
+
+pub(crate) fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).unwrap().len()
+}
+
+type Create = fn(&Path) -> (Collection, Entry<'static>);
+
+/// Both codecs.
+pub(crate) fn creators() -> [(&'static str, Create); 2] {
+    [("none", create_none), ("zstd", create_zstd)]
+}
+
+pub(crate) fn truncate(path: &Path, len: u64) {
+    let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_len(len).unwrap();
+}

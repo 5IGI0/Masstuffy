@@ -89,7 +89,8 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
   description), never waits, released on drop; `.lock` is never unlinked.
 - `trash_dir(path)`: atomic rename to `.trash-<name>-<pid>-<seq>` + fsync(parent) (commit point), then
   removal. `sweep_trash(dir)` and `sweep_tmp(dir)` remove leftover `.trash-*` / `.tmp-*` entries; they
-  are for startup only, under the repository `DirLock`, before any writer runs. `.tmp-*` files are
+  are for startup only, under the repository `DirLock`, before any writer runs (or, for one collection
+  dir, by `Collection::open` under the engine's exclusivity guarantee: no `atomic_write` into that dir in flight). `.tmp-*` files are
   created next to their target, so `sweep_tmp` must run on **every** directory `atomic_write` writes into
   (repository root, each collection dir, the dictionary store), not only on `repository/`.
 - Reserved names `.lock`, `.tmp-*`, `.trash-*` (`is_reserved`): directory scanners in higher crates skip them.
@@ -143,11 +144,37 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   hyphenated): `uuid`, `slug`, `split_threshold`, `next_gen_id`, `active: Generation { id: u32, codec:
   None | Zstd { dict_id, level } }`. The manifest is the **single commit point**; it is written only through
   `atomic_write`. Any format extension bumps `version`.
-- Files: `manifest.json`, `seg.<gen>.<N>.warc[.zst]`, `index.<gen>.cdx` (one CDX per generation).
+- Files: `manifest.json`, `seg.<gen>.<N>.warc[.zst]`, `index.<gen>.cdx` (one CDX per generation),
+  `scan.<gen>.json` (derived checkpoint: line-aligned fsynced CDX offset, entry count, per-segment max end;
+  written with `atomic_write`; deleting it is always safe).
 - `Collection::create(dir, CreateSpec { uuid, slug, codec, split_threshold }, &Options, &dyn DictResolver)
   -> (Collection, warcinfo Entry)` creates `dir` itself and writes the `warcinfo` first record (entry 0,
-  holding the manifest); `Collection::open(dir, &Options, &dyn DictResolver) -> (Collection, RecoveryReport)`
-  (M13: fsck: drop torn CDX tail, delete files of non-active generations, check I2 on the last entries).
+  holding the manifest); `Collection::open(dir, &Options, &RecoveryOptions { repair: RepairPolicy::
+  {Refuse (default), TruncateAtCorruption}, verify_last (default 8), full_scan }, &dyn DictResolver) ->
+  (Collection, RecoveryReport)`: no lock (the caller guarantees exclusive access: repository `DirLock` +
+  per-collection admin mutex). Phase A (read-only, plus a dir fsync making the manifest durable): manifest,
+  dictionaries, directory classification, `Appender::open` (gap/missing segment = error), CDX header always
+  checked (I4); CDX scanned from the checkpoint when it is valid (generation, offset <= CDX length and
+  line-aligned, segments present and not shorter than recorded ends: stat only), else in full (reason
+  reported); `RecoveryOptions::full_scan` forces it. Cheap I2 on every scanned line (segment exists, end <=
+  length; the prefix is covered by the checkpoint's segment ends), deep I2 (pread + digest) on the last
+  `verify_last` scanned Add entries; bit rot in the prefix is caught on read or by a full scan. Phase B:
+  truncate the torn tail (or, with repair, at the first corrupt/I2-violating line) + fsync; fsync the CDX
+  whenever lines were scanned (they may come from a commit that died before its CDX fsync, and a later
+  checkpoint must only cover durable lines); remove a
+  checkpoint made stale by a repair cut, or rewrite it after a full scan or >= 1 MiB of newly scanned CDX;
+  `sweep_tmp`; unlink every `seg.<g>.*`/`index.<g>.cdx`/`scan.<g>.json` with `g != active` + dir fsync.
+  Unknown files are kept and reported. A failed open changes nothing. `RecoveryReport { generation,
+  segments, entries, cdx_len, cdx_torn, repair, verified, tmp_removed, removed, unknown, unknown_count,
+  scan: ScanMode::{Partial{from}, Full{reason}}, checkpoint_written }`. `Collection::cdx_path()` for CDX
+  re-reads (`CdxReader::resume`). `Writer::checkpoint()` / `Collection::checkpoint()` (engine: on clean
+  shutdown and periodically from the writer task; never inside `commit`).
+  Engine duties: `Repository::open` runs `Collection::open(.., &RecoveryOptions::default(), ..)` per
+  collection dir; `ManifestMissing` -> `trash_dir` (aborted create); any other error -> collection skipped
+  and reported, startup continues; repair is an explicit operator action; after a poisoned `Writer`, drop it
+  and `Collection::open` again under the admin mutex (re-commit the unacknowledged batch); M18 resumes the
+  CDX at its checkpoint on `Collection::cdx_path()`, and rebuilds the collection's index entries if
+  `report.repair` is `Some` and the checkpoint offset is above `repair.at`.
   `Options { max_record_bytes, max_open_files }`.
 - `Preparer` (one per worker: `Compressor` + `Arc<GenContext>`), run outside any lock:
   `prepare(Record) -> Prepared` (serialize + compress, records over 1 MiB without dictionary) and
@@ -258,7 +285,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M10 | `cdx`: entry, writer, reader, torn tail, legacy + envelope | round trip with spaces/newlines in URLs; torn/zeroed tail at every byte; checksum mismatch; envelope size cap |
 | M11 | `dictstore` | name/header mismatch, duplicate id fatal, id probing, atomic install, cache bound |
 | M12 | `collection`: manifest, `create` (warcinfo), `Writer::commit`, `Snapshot::read` (codec None and Zstd) | warcinfo is entry 0; read back equals input; locators contiguous; raw import validation; concurrent readers while committing; manifest rejection |
-| M13 | `collection`: `open` + recovery | crash simulated after each commit step (truncate files) → `open` yields I2/I4; orphan generation removed |
+| M13 | `collection`: `open` + recovery | crash states after each commit step (segment truncated at many offsets, CDX truncated at every byte, zero-filled tail) → `open` yields a clean CDX satisfying I2/I4, committed entries readable; corrupt mid-CDX → error, repair → cut + report; leftovers removed, unknown kept; aborted create → `ManifestMissing`; open idempotent; reopen after poison; partial scan from checkpoint; fallback reasons; stale checkpoint removed after repair |
 | M14 | `collection`: tombstones, `Rebuilder` | rebuild None→Zstd, Zstd(D1)→Zstd(D1); crash before/after manifest rename; tombstoned records not copied |
 | M15 | `index`: trait, `MemIndex`, conformance suite | nearest-date semantics, `request` excluded, ACTIVE only, pattern queries, checkpoint atomic with ops |
 | M16 | `index-redb` | conformance suite; reopen after drop; concurrent readers during `apply` |
@@ -297,7 +324,8 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
    tail at startup.
 6. **Generations are explicit** (spec 6): `gen_id: u32` increasing, in the manifest, in file names
    (`seg.<gen>.<N>.warc[.zst]`, `index.<gen>.cdx`) and in the index. Any file of a non-active
-   generation found at `open` is deleted. Rebuild to the same dictionary is just a new gen.
+   generation (including `scan.<g>.json`) found at `open` is deleted, after the active generation was
+   verified and after a dir fsync that makes the manifest durable. Rebuild to the same dictionary is just a new gen.
 7. **One process per repository**: `DirLock` on `<workdir>/.lock` at `open`. Within the process, a
    `tokio::Mutex` per collection serializes admin operations (rebuild, train, delete) — it replaces the
    buffer-directory lock; training samples are held in memory under a byte cap, not written as files.
@@ -349,4 +377,6 @@ These override the spec where they differ.
 6. **Deduplication by digest / `revisit`**: *Recommend out of scope*; the digest field makes it possible later.
 7. **CDX torn tail vs corruption**: *Recommend* a bad region at the end with no valid line
    after it is a torn tail (truncated at open); a valid line after a bad one is a hard error (fail-safe),
-   with an explicit operator repair in M13 if ever needed.
+   with an explicit operator repair in M13 if ever needed. **Decided (M13)**: torn tail truncated at open;
+   `Corrupt` and I2 violations are errors unless `RepairPolicy::TruncateAtCorruption`; open scans from a
+   checkpoint.
