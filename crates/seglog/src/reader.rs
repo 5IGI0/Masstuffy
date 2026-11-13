@@ -226,8 +226,21 @@ impl Reader {
             offset: loc.offset,
             len: loc.len,
         };
-        loc.end().ok_or_else(out_of_bounds)?;
+        let end = loc.end().ok_or_else(out_of_bounds)?;
         let file = self.handle(loc.segment)?;
+        // Check the length before allocating: a bogus locator must not cost `len` zeroed bytes.
+        // A truncation racing with the read is still caught by `UnexpectedEof` below.
+        let file_len = file
+            .metadata()
+            .map_err(|source| Error::Io {
+                op: Op::Stat,
+                path: self.path(loc.segment),
+                source,
+            })?
+            .len();
+        if end > file_len {
+            return Err(out_of_bounds());
+        }
         buf.resize(n, 0);
         if let Err(e) = file.read_exact_at(buf, loc.offset) {
             buf.clear();
@@ -317,6 +330,26 @@ mod tests {
         let mut v: Vec<u32> = r.lock().slots.iter().map(|s| s.segment).collect();
         v.sort_unstable();
         v
+    }
+
+    #[test]
+    fn huge_len_past_eof_does_not_allocate() {
+        let d = TestDir::new();
+        let mut a = Appender::create(d.path(), naming(), nz(1 << 20)).unwrap();
+        let locs = a.append_batch(&[b"hello".to_vec()]).unwrap();
+        a.sync().unwrap();
+        let r = Reader::new(d.path(), naming(), opts(4, 1 << 30));
+        let mut buf = Vec::new();
+        let loc = Locator {
+            segment: 1,
+            offset: locs[0].offset,
+            len: 1 << 29,
+        };
+        assert!(matches!(
+            r.read_at(&loc, &mut buf),
+            Err(Error::OutOfBounds { .. })
+        ));
+        assert!(buf.capacity() < 1024);
     }
 
     #[test]
