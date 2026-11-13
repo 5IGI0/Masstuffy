@@ -10,6 +10,8 @@ license = "AGPL-3.0-or-later"
 [workspace.dependencies]
 thiserror = "2.0.21"
 masstuffy-durable = { path = "crates/durable", version = "0.1.0" }
+masstuffy-warc = { path = "crates/warc", version = "0.1.0", default-features = false }
+xxhash-rust = { version = "0.8.16", default-features = false, features = ["xxh3"] }
 zstd = { version = "0.14.4", default-features = false }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 uuid = { version = "1.29.2", default-features = false, features = ["std", "v4"] }

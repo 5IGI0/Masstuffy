@@ -1,0 +1,15 @@
+[package]
+name = "masstuffy-cdx"
+version = "0.1.0"
+description = "Versioned, checksummed collection index (CDX) format: writer, torn-tail-aware reader, legacy parser and raw-import envelope"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+masstuffy-warc.workspace = true
+xxhash-rust.workspace = true
+
+[lints]
+workspace = true

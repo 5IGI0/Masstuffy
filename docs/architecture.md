@@ -60,17 +60,24 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
   thin clients.
 
 **`crates/cdx` — `masstuffy-cdx`**: the versioned collection index format (replaces spec 3.4, per spec 6).
-- `Entry { kind: Add | Tombstone, url, warc_type, record_id, date: WarcDate, segment: u32, offset: u64,
-  raw_size: u64, digest: u64 }`; `digest` = xxh3-64 of the stored bytes.
-- Text, one line per entry, header line `#masstuffy-cdx/1 gen=<gen_id>`; fields percent-escaped
-  (space, `%`, control bytes), `-` = absent; each line ends with an xxh3 line checksum, so a torn or
-  zero-filled tail is detected, not misparsed.
-- `CdxReader<R: Read>` yields `(byte_offset, Result<Entry>)` and reports a torn tail as `Tail::Torn{at}`
-  instead of failing; `CdxWriter<W: Write>` (no fsync, caller decides).
-- `legacy::parse_line` and `EnvelopeReader<R>` for the raw-import envelope (CDX line + `raw_size` bytes),
-  with a per-record size cap.
-- External deps: `thiserror`, `xxhash-rust` (xxh3). Internal: `masstuffy-warc` (for `WarcDate` only).
-  Features: `serde` (derive on `Entry`).
+- `Entry<'a> { kind: Add | Tombstone, segment: u32, offset: u64, raw_size: u64, digest: u64, date:
+  WarcDate, warc_type, record_id, url: Option<_> }` (text fields `Cow<'a, str>`: borrowed when read,
+  `into_owned()` to keep); `digest` = xxh3-64 of the stored bytes (`cdx::digest`). No urlkey (the index
+  computes it from `url`), no `dict_id` (in the frame header and the generation).
+- Text, header line `#masstuffy-cdx/1 gen=<gen>`, then one line per entry:
+  `kind segment offset raw_size digest date warc_type record_id url check`. Only `url` is escaped
+  (`%XX` for bytes 0x00–0x20, `%`, 0x7F; `-` = absent, `%2D` = a literal `-`); `check` = low 32 bits of
+  xxh3-64 of the line, so a torn or zero-filled tail is detected, not misparsed. A tombstone repeats
+  the full fields of the entry it deletes (matched by `(segment, offset)`). Lines capped (256 KiB).
+- `CdxReader<R: BufRead>` (lending, `next_step() -> Step::{Entry{offset, entry}, End(Tail)}`): invalid
+  bytes with no valid line after them are `Tail::Torn{at}` (truncate there); a bad line followed by a
+  valid one, or a checksum-valid but malformed line, is `ReadError::Corrupt`. `resume` for checkpoint
+  replay. `CdxWriter<W: Write>`: one buffer, one `write_all` per batch, no fsync (caller decides).
+- `legacy::parse_line` (spec 3.4, read-only; URLs with spaces recovered) and `EnvelopeReader<R>` for
+  the raw-import envelope (optional `#masstuffy-cdx/1` header selects V1 lines, else legacy lines;
+  each followed by `raw_size` bytes), with a per-record size cap and incremental payload reads.
+- External deps: `thiserror`, `xxhash-rust` (`xxh3`). Internal: `masstuffy-warc` (for `WarcDate`
+  only, default features off). Features: none.
 
 ### Storage layer (filesystem, still WARC-agnostic where possible)
 
@@ -297,3 +304,6 @@ These override the spec where they differ.
    automatic rebuild, no special structure (M20 makes this a policy, not new storage).
 5. **CDX rotation**: *Recommend none for v1*: one `index.<gen>.cdx` per generation, compacted by rebuild.
 6. **Deduplication by digest / `revisit`**: *Recommend out of scope*; the digest field makes it possible later.
+7. **CDX torn tail vs corruption**: *Recommend* a bad region at the end with no valid line
+   after it is a torn tail (truncated at open); a valid line after a bad one is a hard error (fail-safe),
+   with an explicit operator repair in M13 if ever needed.
