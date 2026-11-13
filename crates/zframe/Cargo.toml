@@ -1,0 +1,22 @@
+[package]
+name = "masstuffy-zframe"
+version = "0.1.0"
+description = "One-record zstd frames and zstd dictionaries: frame/dictionary header inspection, prepared dictionaries, reusable contexts, training"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+zstd = { workspace = true, optional = true }
+
+[features]
+default = ["codec"]
+codec = ["dep:zstd"]
+train = ["codec", "zstd/zdict_builder"]
+
+[dev-dependencies]
+zstd = { workspace = true, features = ["zdict_builder"] }
+
+[lints]
+workspace = true

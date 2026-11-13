@@ -42,15 +42,22 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 - External deps: `url` 2.5 (`std` only; WHATWG parsing, IDNA), `thiserror`. Features: none.
 
 **`crates/zframe` — `masstuffy-zframe`**: one-record zstd frames and zstd dictionaries (spec 3.2, 3.3).
-- `inspect_frame(&[u8]) -> Result<FrameInfo { dict_id, content_size }>`: pure header parse, validates magic
-  (used to check delegated compression on raw import).
-- `DictHeader::parse(&[u8])`, `set_dict_id(&mut [u8], u32)`: pure, checks magic `0xEC30A437`.
-- `Dictionary` (prepared `EncoderDictionary` + `DecoderDictionary`, shared via `Arc`) and
-  `FrameCodec` with reusable `Compressor`/`Decompressor` contexts and an output-size cap.
-- `train(samples, max_size) -> Vec<u8>`.
-- External deps: `thiserror`; `zstd` behind features. Features: `codec` (default, `Dictionary`,
-  `FrameCodec`), `train` (implies `codec`). With no features the crate is a dependency-free frame/dict
-  inspector usable by thin clients.
+- `inspect_frame(&[u8]) -> Result<FrameInfo { dict_id, content_size, window_size, single_segment,
+  has_checksum, header_len }>`: pure header parse, validates magic (skippable and legacy frames rejected).
+  `inspect_single_frame` also walks the block headers and rejects trailing bytes, so raw import can prove a
+  delegated payload is exactly one frame (and check its `dict_id`).
+- `DictHeader::parse(&[u8])`, `set_dict_id(&mut [u8], u32)`: pure, checks magic `0xEC30A437`;
+  `is_allocatable_dict_id` (`[32768, 2^31)`).
+- `DecoderDict` (prepared `DecoderDictionary`, level-independent) and `EncoderDict` (prepared
+  `EncoderDictionary` for one level), each built from the dictionary bytes, validating the header id, shared
+  via `Arc`, with `mem_size()`; reusable `Compressor`/`Decompressor` contexts (no dictionary held between
+  calls, so one pool serves every dictionary); output-size cap. Frames carry `dict_id` (0 = none) and the
+  content size, with no frame checksum.
+- `SampleSet`/`TrainOptions` (bounded in-memory samples) and `train(&SampleSet) -> Vec<u8>`.
+- External deps: `thiserror`; `zstd` 0.14.4 (default features off; builds the zstd C sources via `zstd-sys`)
+  behind features. Features: `codec` (default: `DecoderDict`, `EncoderDict`, `Compressor`, `Decompressor`),
+  `train` (implies `codec`). With no features the crate is a dependency-free frame/dict inspector usable by
+  thin clients.
 
 **`crates/cdx` — `masstuffy-cdx`**: the versioned collection index format (replaces spec 3.4, per spec 6).
 - `Entry { kind: Add | Tombstone, url, warc_type, record_id, date: WarcDate, segment: u32, offset: u64,
@@ -98,7 +105,10 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 - Scan `dict/zstd/<label>.<dict_id>.zstdict`; validate name/header agreement; duplicate id = error (I6).
 - `install(label, bytes) -> dict_id`: keeps the trained id if free, else probes ids in `[32768, 2^31)`
   derived deterministically from xxh3 of the content; writes with `atomic_write`.
-- `get(dict_id) -> Arc<Dictionary>`: lazy load, bounded cache; never deletes a file (I5).
+- `decoder(dict_id) -> Arc<DecoderDict>` cached by `dict_id`; `encoder(dict_id, level) ->
+  Arc<EncoderDict>` cached by `(dict_id, level)`, requested only by writers of active generations; both caches
+  bounded by `mem_size` bytes and evictable (an evicted entry is rebuilt from the file on the next request).
+  Never deletes a file (I5).
 - Internal: `masstuffy-zframe` (`codec`), `masstuffy-durable`. External: `thiserror`, `xxhash-rust`.
 
 **`crates/collection` — `masstuffy-collection`**: one collection on disk: manifest, generations,
@@ -218,6 +228,8 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M21 | `masstuffy`: `delete_collection`, `rename` | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates |
 
 M3 and M4 are delivered together (one plan → code → review cycle).
+
+M6 and M7 are delivered together (one plan → code → review cycle).
 
 Milestones M0, M1 and M2 are delivered together by the first milestone.
 
