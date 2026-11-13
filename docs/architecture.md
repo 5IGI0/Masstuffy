@@ -139,21 +139,34 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 
 **`crates/collection` — `masstuffy-collection`**: one collection on disk: manifest, generations,
 append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secondary index.
-- `Manifest` (JSON, versioned): `uuid`, `slug`, `split_threshold`, `next_gen_id`, `active:
-  Generation { id: u32, codec: None | Zstd { dict_id, level } }`. The manifest is the **single commit
-  point**; it is written only through `atomic_write`.
-- `Collection::create(dir, uuid, slug, codec, &dyn DictResolver)` (writes the `warcinfo` first record),
-  `Collection::open(dir, &dyn DictResolver) -> (Collection, RecoveryReport)` (fsck: drop torn CDX tail,
-  delete files of non-active generations, check I2 on the last entries).
-- `Writer` (`&mut self`): `commit(batch: &[Prepared]) -> Vec<Entry>` = data append → data fsync →
-  CDX append → CDX fsync. `prepare(Record) -> Prepared` (serialize + compress, no lock needed) and
-  `prepare_raw(entry, bytes)` (frame/dict-id check) are free functions callers run in parallel.
-- `Snapshot` (`Arc`, immutable: manifest + `seglog::Reader` + codec): `read(&Entry)`, `read_raw(&Entry)`,
-  `entries()` (CDX iterator, tombstones applied).
-- `Rebuilder`: writes generation `next_gen_id` beside the active one, then commits by manifest swap.
-- Internal: `warc`, `zframe` (`codec`), `cdx`, `seglog`, `durable`. External: `thiserror`, `serde`,
-  `serde_json`. Features: none. `DictResolver` is a one-method trait here, implemented by the engine on
-  top of `dictstore` (keeps this crate usable with any dictionary source).
+- `Manifest` (JSON, schema `version` 1, `deny_unknown_fields`, 64 KiB cap, `CollectionId` canonical lowercase
+  hyphenated): `uuid`, `slug`, `split_threshold`, `next_gen_id`, `active: Generation { id: u32, codec:
+  None | Zstd { dict_id, level } }`. The manifest is the **single commit point**; it is written only through
+  `atomic_write`. Any format extension bumps `version`.
+- Files: `manifest.json`, `seg.<gen>.<N>.warc[.zst]`, `index.<gen>.cdx` (one CDX per generation).
+- `Collection::create(dir, CreateSpec { uuid, slug, codec, split_threshold }, &Options, &dyn DictResolver)
+  -> (Collection, warcinfo Entry)` creates `dir` itself and writes the `warcinfo` first record (entry 0,
+  holding the manifest); `Collection::open(dir, &Options, &dyn DictResolver) -> (Collection, RecoveryReport)`
+  (M13: fsck: drop torn CDX tail, delete files of non-active generations, check I2 on the last entries).
+  `Options { max_record_bytes, max_open_files }`.
+- `Preparer` (one per worker: `Compressor` + `Arc<GenContext>`), run outside any lock:
+  `prepare(Record) -> Prepared` (serialize + compress, records over 1 MiB without dictionary) and
+  `prepare_raw(&ImportMeta, Vec<u8>, RawCheck) -> Prepared` (single frame, dict-id rule, declared-size cap,
+  digest; `Full` also decompresses, parses and compares the envelope metadata). These replace the earlier
+  "free functions". With `HeaderOnly`, records whose envelope metadata disagrees with the payload, or whose
+  payload is not a WARC, can only be read with `read_raw`; `read` returns `EntryMismatch`/`Record`
+  (M17/M19 must handle this on purpose).
+- `Writer` (`&mut self`): `commit(batch: &[Prepared]) -> Vec<Entry<'static>>` = data append → data fsync →
+  CDX append → CDX fsync. `WrongGeneration` for an item prepared for another collection or generation; any
+  I/O error after the append starts poisons the writer.
+- `Snapshot` (`Arc`, immutable: manifest + `seglog::Reader` + `GenContext`): `read(&Entry, &mut ReadCtx,
+  &mut Vec<u8>) -> RecordRef` (one pread, digest verified on every read, zstd decode, strict parse),
+  `read_raw -> RawEncoding`. `entries()` (CDX iterator, tombstones applied) moves to M14.
+- `Rebuilder` (M14): writes generation `next_gen_id` beside the active one, then commits by manifest swap.
+- `DictResolver` has **two** methods (`decoder`, `encoder`), implemented by the engine on top of `dictstore`
+  (keeps this crate usable with any dictionary source).
+- Internal: `warc` (feature `generate`), `zframe` (`codec`), `cdx`, `seglog`, `durable`. External: `thiserror`,
+  `serde`, `serde_json` (+ `uuid` via `warc`). Features: none.
 
 ### Index layer
 
@@ -184,6 +197,8 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `put_raw(envelope stream)`, `get_by_id`, `get_by_url`, `search`, `scan`, `read_raw`.
 - `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`; `rebuild_index()`.
 - Per-collection writer task with a bounded queue and group commit; readers use `Arc<Snapshot>`.
+- Reads `MASSTUFFY_RAW_IMPORT_CHECK` once at `Repository::open` (→ `RawCheck`) and passes it to every
+  `prepare_raw` of `put_raw` (M17/M19).
 - Internal: all crates above. External: `tokio` (`rt-multi-thread`, `sync`), `uuid` (v4), `tracing`,
   `thiserror`. Features: `redb` (default) selects `index-redb`.
 
@@ -242,7 +257,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M9 | `seglog`: `Reader` (pread, LRU) | N tasks reading while one appends; eviction; reading past EOF errors |
 | M10 | `cdx`: entry, writer, reader, torn tail, legacy + envelope | round trip with spaces/newlines in URLs; torn/zeroed tail at every byte; checksum mismatch; envelope size cap |
 | M11 | `dictstore` | name/header mismatch, duplicate id fatal, id probing, atomic install, cache bound |
-| M12 | `collection`: manifest, `create` (warcinfo), `Writer::commit`, `Snapshot::read` (codec None and Zstd) | warcinfo is entry 0; read back equals input; locators contiguous |
+| M12 | `collection`: manifest, `create` (warcinfo), `Writer::commit`, `Snapshot::read` (codec None and Zstd) | warcinfo is entry 0; read back equals input; locators contiguous; raw import validation; concurrent readers while committing; manifest rejection |
 | M13 | `collection`: `open` + recovery | crash simulated after each commit step (truncate files) → `open` yields I2/I4; orphan generation removed |
 | M14 | `collection`: tombstones, `Rebuilder` | rebuild None→Zstd, Zstd(D1)→Zstd(D1); crash before/after manifest rename; tombstoned records not copied |
 | M15 | `index`: trait, `MemIndex`, conformance suite | nearest-date semantics, `request` excluded, ACTIVE only, pattern queries, checkpoint atomic with ops |
@@ -271,7 +286,7 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
    `collection::Writer` (`&mut`, no lock). Requests arrive on a bounded `mpsc`; the task drains what is
    queued and does one `commit` (one data fsync + one CDX fsync for the group), then replies via
    `oneshot`. Serialization and compression (`prepare`) happen in the caller's `spawn_blocking`, before
-   queuing, so the writer only appends.
+   queuing, so the writer only appends. The engine keeps a bounded per-worker `Preparer` pool for this.
 4. **Lock-free readers**: readers clone an `Arc<Snapshot>` (published under a `std::sync::RwLock<Arc<_>>`
    held only for the clone) and use `pread` on shared file handles. Appends never invalidate a snapshot;
    a rebuild publishes a new one. A read through a retired snapshot that finds its file gone returns
@@ -305,6 +320,20 @@ These override the spec where they differ.
 - **Segment rollover** (`seglog`): the rule is `size > 0 && size + batch > threshold` (strict `>`, the spec said
   `>=`), so `split_threshold` is an inclusive maximum for multi-batch segments; an oversize batch goes alone
   into an empty segment. Zero-length items are rejected. `Reader` caps a read at 1 GiB by default.
+- **Raw import check**: `collection::RawCheck::Full` (default) decompresses each delegated record, parses
+  the WARC and rejects envelope metadata that does not match; `HeaderOnly` keeps only single frame, dict-id
+  rule, declared-size cap and digest, and indexes the envelope metadata. Consequence: records whose envelope
+  metadata disagrees with the payload, or whose payload is not a WARC, can only be read with `read_raw`;
+  `read` returns `EntryMismatch`/`Record`, and M17/M19 must handle this on purpose. The engine selects it with the
+  env var `MASSTUFFY_RAW_IMPORT_CHECK` = `full` (default) | `header`; any other value is a startup error.
+  Library crates never read env vars.
+- **Batch atomicity**: not guaranteed in the CDX. A crash during the CDX write may leave a prefix of an
+  unacknowledged batch indexed after recovery (every such line points to fsynced data). Delivery is
+  at-least-once; duplicates are allowed (see duplicate `record_id`).
+- **Dict-less frames**: `prepare` compresses records > 1 MiB without dictionary; raw dict-0 frames must declare
+  a content size > 1 MiB.
+- **Aborted create**: a collection dir without `manifest.json` is trashed by the engine at open; `create`
+  never deletes on error.
 
 ## 6. Open questions (recommended answers)
 
@@ -312,8 +341,8 @@ These override the spec where they differ.
    generation keeps I4 and recovery simple; the manifest format is versioned so a list can come later.
 2. **`record_id` uniqueness** (spec 6)? *Recommend not enforced* (re-importing a WARC must not fail);
    `by_id` returns the **most recently committed** active copy, which is deterministic.
-3. **Per-record compression without dictionary** (spec 6, Q4)? *Recommend allow* `dict_id = 0` frames
-   for records over 1 MiB; `zframe`/`cdx` already carry the information, cost is one branch in `collection`.
+3. **Per-record compression without dictionary** (spec 6, Q4)? Decided in section 5: `dict_id = 0` frames
+   are allowed for records over 1 MiB; `zframe`/`cdx` already carry the information, cost is one branch in `collection`.
 4. **Pending-dictionary buffer** (spec 6, Q2)? *Recommend*: a normal uncompressed generation followed by an
    automatic rebuild, no special structure (M20 makes this a policy, not new storage).
 5. **CDX rotation**: *Recommend none for v1*: one `index.<gen>.cdx` per generation, compacted by rebuild.

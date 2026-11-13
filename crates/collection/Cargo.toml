@@ -1,0 +1,23 @@
+[package]
+name = "masstuffy-collection"
+version = "0.1.0"
+description = "One Masstuffy collection on disk: manifest, generations, batch append, positioned reads"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+masstuffy-warc = { workspace = true, features = ["generate"] }
+masstuffy-zframe = { workspace = true, features = ["codec"] }
+masstuffy-cdx.workspace = true
+masstuffy-seglog.workspace = true
+masstuffy-durable.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+masstuffy-zframe = { workspace = true, features = ["train"] }
+
+[lints]
+workspace = true
