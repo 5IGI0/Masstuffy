@@ -232,6 +232,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "masstuffy-seglog"
+version = "0.1.0"
+dependencies = [
+ "masstuffy-durable",
+ "thiserror",
+]
+
+[[package]]
 name = "masstuffy-urlkey"
 version = "0.1.0"
 dependencies = [

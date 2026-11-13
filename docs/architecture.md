@@ -93,12 +93,17 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 - Files `<stem>.<N>.<ext>` in one directory, `N` from 1 without gaps; the caller picks `stem`/`ext`
   (the engine uses `seg.<gen>` and `warc` / `warc.zst`). Knows nothing about WARC or zstd.
 - `Locator { segment: u32, offset: u64, len: u64 }`.
-- `Appender` (`&mut self`, single writer): `append_batch(&[&[u8]]) -> Vec<Locator>` writes one batch
-  contiguously in one segment (I9), rolls over when `size + batch > threshold`, writes an oversize batch
-  alone in a fresh segment; `sync()` fsyncs every segment touched since the last sync.
-- `Reader` (`Clone`, `Send + Sync`): `read_at(&Locator, &mut Vec<u8>)` via `FileExt::read_exact_at`
-  on a shared handle; bounded LRU of open files; `len_of(segment)`.
-- `remove_all()` for discarding an uncommitted or retired generation.
+- `Appender` (`&mut self`, single writer): `append_batch<B: AsRef<[u8]>>(&[B]) -> Vec<Locator>` writes one
+  batch contiguously in one segment (I9). It rolls over when `size > 0 && size + batch > threshold` (spec 02/04
+  say `>=`; `>` deliberately makes the threshold an inclusive max). An empty current segment takes any batch,
+  so an oversize batch is written alone without an extra empty file. Empty items are rejected (`EmptyItem`).
+  Any I/O error poisons the Appender (reopen continues at the file length). `sync()` fsyncs every segment
+  touched since the last sync, and the directory after a rollover.
+- `Reader` (`Clone`, `Send + Sync`, `ReaderOptions { max_open_files, max_read_len }`): `read_at(&Locator,
+  &mut Vec<u8>)` via `FileExt::read_exact_at` on a shared handle, `len_of(segment)`, `forget(segment)` /
+  `forget_all()`. Hand-written bounded LRU of open files; its lock is never held during open or read.
+- `remove_all(dir, &Naming)` is a free function for discarding an uncommitted or retired generation
+  (descending order, then a directory fsync; Readers must call `forget_all`).
 - Internal: `masstuffy-durable`. External: `thiserror`. Features: none.
 
 **`crates/dictstore` — `masstuffy-dictstore`**: the repository-wide dictionary store (spec 2, 3.3, 4.4).
@@ -276,6 +281,9 @@ These override the spec where they differ.
   collection (the legacy forbade it).
 - **Duplicate unique WARC headers** (`WARC-Type`, `WARC-Record-ID`, `WARC-Date`, `Content-Length`) in parsed
   input: rejected with `DuplicateHeader`. The builder keeps "replace" semantics (the spec said "last wins").
+- **Segment rollover** (`seglog`): the rule is `size > 0 && size + batch > threshold` (strict `>`, the spec said
+  `>=`), so `split_threshold` is an inclusive maximum for multi-batch segments; an oversize batch goes alone
+  into an empty segment. Zero-length items are rejected. `Reader` caps a read at 1 GiB by default.
 
 ## 6. Open questions (recommended answers)
 

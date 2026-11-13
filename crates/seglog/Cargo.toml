@@ -1,0 +1,14 @@
+[package]
+name = "masstuffy-seglog"
+version = "0.1.0"
+description = "Append-only segmented byte log with positioned reads"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+masstuffy-durable.workspace = true
+
+[lints]
+workspace = true
