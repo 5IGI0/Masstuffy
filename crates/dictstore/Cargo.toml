@@ -1,0 +1,19 @@
+[package]
+name = "masstuffy-dictstore"
+version = "0.1.0"
+description = "Repository-wide zstd dictionary store: scan, id allocation, atomic install, bounded prepared-dictionary cache"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+masstuffy-durable.workspace = true
+masstuffy-zframe = { workspace = true, features = ["codec"] }
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+masstuffy-zframe = { workspace = true, features = ["train"] }
+
+[lints]
+workspace = true

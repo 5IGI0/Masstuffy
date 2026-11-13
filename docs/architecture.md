@@ -114,14 +114,28 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 - Internal: `masstuffy-durable`. External: `thiserror`. Features: none.
 
 **`crates/dictstore` — `masstuffy-dictstore`**: the repository-wide dictionary store (spec 2, 3.3, 4.4).
-- Scan `dict/zstd/<label>.<dict_id>.zstdict`; validate name/header agreement; duplicate id = error (I6).
-- `install(label, bytes) -> dict_id`: keeps the trained id if free, else probes ids in `[32768, 2^31)`
-  derived deterministically from xxh3 of the content; writes with `atomic_write`.
-- `decoder(dict_id) -> Arc<DecoderDict>` cached by `dict_id`; `encoder(dict_id, level) ->
-  Arc<EncoderDict>` cached by `(dict_id, level)`, requested only by writers of active generations; both caches
-  bounded by `mem_size` bytes and evictable (an evicted entry is rebuilt from the file on the next request).
-  Never deletes a file (I5).
+- `DictStore::open(dir, Options { max_file_size, cache_bytes }) -> (DictStore, ScanReport)`: runs
+  `sweep_tmp`, then scans `<label>.<dict_id>.zstdict` (label `[A-Za-z0-9_-]{1,128}`, canonical decimal
+  non-zero u32 id, exactly 3 parts). It reads **headers only**. Name/header mismatch, bad header,
+  non-regular file, oversize file and duplicate id (I6) are fatal; non-matching names are ignored and
+  reported (capped). Dictionaries are prepared lazily on first use.
+- `install(label, bytes) -> Installed { dict_id, created }`: formatted dictionaries only (magic
+  required), validated by zstd, size-capped. It keeps the trained id if it is allocatable and free,
+  else uses linear probing in `[32768, 2^31)` from xxh3 of the content (id field zeroed) and rewrites
+  the header id. It is idempotent on identical content (returns the existing id). Installs are
+  serialised by an install-only mutex. It writes with `atomic_write`, never overwrites or deletes (I5),
+  and the id is visible only once durable.
+- `decoder(dict_id)`/`encoder(dict_id, level)`: one LRU cache of prepared dictionaries bounded by the
+  sum of zstd `sizeof` (`cache_bytes`). Concurrent misses on a key prepare it once (`OnceLock` slot).
+  An entry larger than the budget is returned uncached. Locks are never held during I/O or
+  preparation. Lock order: `install` -> `files`; `cache` is standalone.
+- Spec 4.4 split: id allocation and the write are in `dictstore`; sampling/training (in-memory
+  `SampleSet`), label generation (`<slug>_<ts>` sanitised with `is_valid_label`) and rebuild are in the
+  engine (M20).
+- `DictResolver` stays in `collection` and is implemented by the engine on a newtype over
+  `Arc<DictStore>` (orphan rule; `collection` does not depend on `dictstore`).
 - Internal: `masstuffy-zframe` (`codec`), `masstuffy-durable`. External: `thiserror`, `xxhash-rust`.
+  Features: none.
 
 **`crates/collection` — `masstuffy-collection`**: one collection on disk: manifest, generations,
 append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secondary index.

@@ -234,6 +234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "masstuffy-dictstore"
+version = "0.1.0"
+dependencies = [
+ "masstuffy-durable",
+ "masstuffy-zframe",
+ "thiserror",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "masstuffy-durable"
 version = "0.1.0"
 dependencies = [
