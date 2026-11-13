@@ -72,8 +72,21 @@ mod tests {
     const DIR_VAR: &str = "MASSTUFFY_DURABLE_CHILD_DIR";
     const EXPECT_VAR: &str = "MASSTUFFY_DURABLE_CHILD_EXPECT";
 
+    // Between fork and exec a spawned child briefly holds a copy of every open descriptor,
+    // including another test's lock file, so a `drop` does not release that flock until the
+    // child execs. Tests that release and re-take a lock in-process, and the test that spawns
+    // children, take this guard so they never overlap.
+    static SPAWN_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn second_handle_same_process_fails() {
+        let _g = spawn_guard();
         let t = TestDir::new();
         let a = DirLock::try_acquire(t.path()).unwrap();
         assert_eq!(a.lock_file(), t.path().join(".lock"));
@@ -112,6 +125,7 @@ mod tests {
 
     #[test]
     fn lock_across_process() {
+        let _g = spawn_guard();
         let t = TestDir::new();
         let a = DirLock::try_acquire(t.path()).unwrap();
         run_child(t.path(), "locked", "child-ran-locked");
