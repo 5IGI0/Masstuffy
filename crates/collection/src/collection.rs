@@ -12,11 +12,13 @@ use masstuffy_warc::{BuildError, Record, RecordBuilder};
 
 use crate::SOFTWARE;
 use crate::context::{GenContext, Options};
+use crate::entries::Entries;
 use crate::error::{Error, PrepareError};
 use crate::id::CollectionId;
 use crate::layout::{MANIFEST_NAME, cdx_name, create_cdx, segment_naming};
 use crate::manifest::{Codec, Generation, Manifest};
 use crate::prepare::Preparer;
+use crate::rebuild::{OldGeneration, RebuildOptions, RebuildReport, Rebuilder};
 use crate::recover::{self, RecoveryOptions, RecoveryReport};
 use crate::resolve::DictResolver;
 use crate::snapshot::Snapshot;
@@ -217,6 +219,56 @@ impl Collection {
         Preparer::new(Arc::clone(self.snapshot.context()))
     }
 
+    /// Live entries of the active generation up to the durable CDX length (see
+    /// [`Snapshot::entries`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Snapshot::entries`].
+    pub fn entries(&self) -> Result<Entries, Error> {
+        self.snapshot.entries(self.writer.cdx_len())
+    }
+
+    /// Prepares and writes tombstones for `targets` (one CDX fsync).
+    ///
+    /// # Errors
+    ///
+    /// `Tombstone { index, source }` (nothing written), `Commit`.
+    pub fn tombstone(&mut self, targets: &[Entry<'_>]) -> Result<Vec<Entry<'static>>, Error> {
+        let mut prepared = Vec::with_capacity(targets.len());
+        for (index, t) in targets.iter().enumerate() {
+            prepared.push(
+                self.snapshot
+                    .prepare_tombstone(t)
+                    .map_err(|source| Error::Tombstone { index, source })?,
+            );
+        }
+        Ok(self.writer.tombstone(&prepared)?)
+    }
+
+    /// Offline rebuild (no concurrent writer: `&mut self`): `start`, one `copy_until`, `finish`;
+    /// replaces the writer and the snapshot. Returns the report and the old generation (call
+    /// `remove` on it). On `Err`, if the writer is poisoned the collection must be dropped and
+    /// reopened.
+    ///
+    /// # Errors
+    ///
+    /// As [`Rebuilder::start`], [`Rebuilder::copy_until`] and [`Rebuilder::finish`].
+    pub fn rebuild(
+        &mut self,
+        target: Codec,
+        opts: &Options,
+        ropts: RebuildOptions,
+        resolver: &dyn DictResolver,
+    ) -> Result<(RebuildReport, OldGeneration), Error> {
+        let mut rb = Rebuilder::start(Arc::clone(&self.snapshot), target, opts, ropts, resolver)?;
+        rb.copy_until(self.writer.cdx_len())?;
+        let r = rb.finish(&mut self.writer)?;
+        self.writer = r.writer;
+        self.snapshot = r.snapshot;
+        Ok((r.report, r.old))
+    }
+
     /// Splits for the engine: the writer task takes the `Writer`, readers clone the
     /// `Arc<Snapshot>`.
     #[must_use]
@@ -226,7 +278,7 @@ impl Collection {
 }
 
 /// The first record of a generation: `warcinfo` holding the manifest (spec 02).
-fn warcinfo_record(manifest_json: &[u8]) -> Result<Record, BuildError> {
+pub(crate) fn warcinfo_record(manifest_json: &[u8]) -> Result<Record, BuildError> {
     let mut b = RecordBuilder::new("warcinfo")?;
     b.fill_missing()?;
     b.header("Content-Type", "application/warc-fields")?;

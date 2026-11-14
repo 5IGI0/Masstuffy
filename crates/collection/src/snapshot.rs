@@ -1,6 +1,6 @@
 //! Immutable read view of one generation: positioned reads, digest check, decode.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use masstuffy_cdx::{Entry, Kind, digest};
@@ -10,7 +10,7 @@ use masstuffy_zframe::{CodecError, Decompressor, inspect_frame};
 
 use crate::context::{GenContext, Options};
 use crate::error::{Error, ReadError};
-use crate::layout::segment_naming;
+use crate::layout::{cdx_name, segment_naming};
 use crate::manifest::{Codec, Manifest};
 
 /// A compressed-bytes buffer larger than this is released after a read.
@@ -140,19 +140,7 @@ impl Snapshot {
         ctx: &mut ReadCtx,
         out: &'b mut Vec<u8>,
     ) -> Result<RecordRef<'b>, ReadError> {
-        match self.ctx.codec {
-            Codec::None => self.fetch(entry, out)?,
-            Codec::Zstd { .. } => {
-                let ReadCtx { decompressor, raw } = ctx;
-                let r = self
-                    .fetch(entry, raw)
-                    .and_then(|()| self.decode(raw, decompressor, out));
-                if raw.capacity() > RAW_KEEP {
-                    *raw = Vec::new();
-                }
-                r?;
-            }
-        }
+        self.read_plain(entry, ctx, out)?;
         let out: &'b [u8] = out;
         let rec = RecordRef::parse(out, &self.ctx.warc_limits)?;
         if rec.record_id() != Some(&*entry.record_id) {
@@ -162,6 +150,51 @@ impl Snapshot {
             return Err(ReadError::EntryMismatch("warc_type"));
         }
         Ok(rec)
+    }
+
+    /// Reads, verifies and decodes the record of `entry` into `out`, without parsing it as a WARC
+    /// record (rebuild).
+    pub(crate) fn read_plain(
+        &self,
+        entry: &Entry<'_>,
+        ctx: &mut ReadCtx,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ReadError> {
+        match self.ctx.codec {
+            Codec::None => self.fetch(entry, out),
+            Codec::Zstd { .. } => {
+                let ReadCtx { decompressor, raw } = ctx;
+                let r = self
+                    .fetch(entry, raw)
+                    .and_then(|()| self.decode(raw, decompressor, out));
+                if raw.capacity() > RAW_KEEP {
+                    *raw = Vec::new();
+                }
+                r
+            }
+        }
+    }
+
+    /// Decodes already fetched and verified stored bytes: codec None returns `stored` itself (no
+    /// copy), Zstd decompresses into a new buffer under `max_record_bytes`.
+    pub(crate) fn decode_stored(
+        &self,
+        stored: Vec<u8>,
+        ctx: &mut ReadCtx,
+    ) -> Result<Vec<u8>, ReadError> {
+        match self.ctx.codec {
+            Codec::None => Ok(stored),
+            Codec::Zstd { .. } => {
+                let mut out = Vec::new();
+                self.decode(&stored, &mut ctx.decompressor, &mut out)?;
+                Ok(out)
+            }
+        }
+    }
+
+    /// Path of this generation's CDX.
+    pub(crate) fn cdx_path(&self) -> PathBuf {
+        self.reader.dir().join(cdx_name(self.ctx.generation))
     }
 
     fn decode(

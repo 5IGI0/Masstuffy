@@ -122,6 +122,40 @@ pub enum PrepareError {
     },
 }
 
+/// Why an entry cannot be tombstoned.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TombstoneError {
+    /// The entry is already a tombstone.
+    #[error("entry is a tombstone")]
+    NotAnAdd,
+    /// The entry is the generation's warcinfo record (segment 1, offset 0).
+    #[error("the generation's warcinfo record cannot be deleted")]
+    Warcinfo,
+    /// The entry is invalid or its tombstone line would exceed the line cap.
+    #[error("invalid entry: {0}")]
+    Entry(#[from] masstuffy_cdx::EntryError),
+    /// The segment does not exist in this generation.
+    #[error("segment {segment} is missing")]
+    SegmentMissing {
+        /// The segment number.
+        segment: u32,
+    },
+    /// `offset + raw_size` passes the end of the segment.
+    #[error("segment {segment}: end {end} passes its length {len}")]
+    PastEnd {
+        /// The segment number.
+        segment: u32,
+        /// `offset + raw_size`.
+        end: u64,
+        /// Length of the segment.
+        len: u64,
+    },
+    /// Reading the segment length failed.
+    #[error("segment stat failed: {0}")]
+    Segment(#[source] masstuffy_seglog::Error),
+}
+
 /// Why a batch could not be committed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -140,6 +174,20 @@ pub enum CommitError {
         expected: u32,
         /// The item's generation.
         got: u32,
+    },
+    /// A tombstone targets bytes that no committed (fsynced) CDX line covers.
+    #[error(
+        "tombstone {index}: segment {segment} end {end} is beyond the committed end {committed}"
+    )]
+    TombstoneNotCommitted {
+        /// Index in the request.
+        index: usize,
+        /// The segment.
+        segment: u32,
+        /// `offset + raw_size` of the target.
+        end: u64,
+        /// The committed end of that segment known to the writer (or its file length).
+        committed: u64,
     },
     /// Appending or syncing the data failed.
     #[error("data append failed: {0}")]
@@ -378,6 +426,79 @@ pub enum Error {
         #[source]
         violation: I2Violation,
     },
+    /// A CDX byte range is invalid: bounds below the header, `end` before `from`, or `from` not
+    /// right after a `\n`.
+    #[error("invalid index range [{from}, {end}) of {}", path.display())]
+    CdxRange {
+        /// The index path.
+        path: PathBuf,
+        /// Start of the range.
+        from: u64,
+        /// End of the range.
+        end: u64,
+    },
+    /// A CDX range ends inside a line, or the file is shorter than the range.
+    #[error("index {} is truncated at byte {at} (range end {end})", path.display())]
+    CdxTruncated {
+        /// The index path.
+        path: PathBuf,
+        /// Where the data ran out.
+        at: u64,
+        /// End of the requested range.
+        end: u64,
+    },
+    /// An entry of `Collection::tombstone` cannot be tombstoned.
+    #[error("tombstone target {index}: {source}")]
+    Tombstone {
+        /// Index in the request.
+        index: usize,
+        /// Why.
+        #[source]
+        source: TombstoneError,
+    },
+    /// The rebuild source (the named thing) is no longer the collection's active state.
+    #[error("rebuild source is stale ({0} changed)")]
+    StaleSource(&'static str),
+    /// An earlier error stopped this rebuild; abort it.
+    #[error("rebuild is poisoned by an earlier error")]
+    RebuildPoisoned,
+    /// A tombstone was written after the rebuild copied its first range.
+    #[error("tombstone at index byte {cdx_offset} written during a rebuild")]
+    TombstoneDuringRebuild {
+        /// Offset of the `T` line in the old CDX.
+        cdx_offset: u64,
+    },
+    /// The `Add` lines of the CDX are not in strictly increasing locator order.
+    #[error("index line at byte {cdx_offset} is out of locator order")]
+    LocatorOrder {
+        /// Offset of the offending line in the old CDX.
+        cdx_offset: u64,
+    },
+    /// Reading a record of the old generation failed during a rebuild.
+    #[error("rebuild: reading segment {segment} offset {offset} failed: {source}")]
+    RebuildRead {
+        /// Segment of the record.
+        segment: u32,
+        /// Offset of the record.
+        offset: u64,
+        /// Why.
+        #[source]
+        source: ReadError,
+    },
+    /// Re-encoding a record failed during a rebuild.
+    #[error("rebuild: re-encoding segment {segment} offset {offset} failed: {source}")]
+    RebuildPrepare {
+        /// Segment of the record.
+        segment: u32,
+        /// Offset of the record.
+        offset: u64,
+        /// Why.
+        #[source]
+        source: PrepareError,
+    },
+    /// A rebuild worker thread panicked; the rebuild stopped.
+    #[error("a rebuild worker thread panicked")]
+    WorkerPanicked,
     /// An internal invariant did not hold.
     #[error("internal error: {0}")]
     Internal(&'static str),

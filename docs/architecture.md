@@ -188,8 +188,23 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   I/O error after the append starts poisons the writer.
 - `Snapshot` (`Arc`, immutable: manifest + `seglog::Reader` + `GenContext`): `read(&Entry, &mut ReadCtx,
   &mut Vec<u8>) -> RecordRef` (one pread, digest verified on every read, zstd decode, strict parse),
-  `read_raw -> RawEncoding`. `entries()` (CDX iterator, tombstones applied) moves to M14.
-- `Rebuilder` (M14): writes generation `next_gen_id` beside the active one, then commits by manifest swap.
+  `read_raw -> RawEncoding`. `Snapshot::entries(end)` / `Collection::entries()`: lending iterator over the live
+  `Add` entries of the CDX prefix `[header, end)` (`end` = `Writer::cdx_len()`, the fsynced length), tombstones
+  applied by a two-pass scan (16 B of RAM per distinct tombstone), CDX order = locator order.
+- Tombstones: `Snapshot::prepare_tombstone(&Entry) -> PreparedTombstone` (kind Add, valid, line fits, not the
+  generation's warcinfo at (1,0), within the segment's length: no data read, no index lookup) then
+  `Writer::tombstone(&[PreparedTombstone])` = check that each target is covered by a committed (fsynced) line, so a
+  `T` line never points into orphan bytes a crash could drop, then CDX append + fsync (same poisoning and `WrongGeneration` contract
+  as `commit`); duplicates harmless. No physical zeroing (I1 holds without exception).
+- `Rebuilder` (M14): `Rebuilder::start(Arc<Snapshot>, Codec, &Options, RebuildOptions { recompress,
+  on_unreadable: Fail|Skip, workers, max_inflight_bytes }, &dyn DictResolver)` (deletes non-active generation
+  leftovers, creates generation `next_gen_id`, writes its warcinfo with the target manifest),
+  `copy_until(end)` (concurrent with the old writer; raw copy when same dictionary unless `recompress`, else
+  decode + re-encode; tombstoned records dropped; `T` lines after the first range are an error),
+  `finish(&mut Writer) -> Rebuilt { writer, snapshot, report, old }` (final delta, fsync, checkpoint, manifest
+  `atomic_write` = commit, old writer retired), `OldGeneration::remove()`, `abort()`; `Collection::rebuild` is
+  the offline convenience. Every generation's first record is its own warcinfo; older warcinfos are copied as
+  ordinary records. `Writer::cdx_len()`.
 - `DictResolver` has **two** methods (`decoder`, `encoder`), implemented by the engine on top of `dictstore`
   (keeps this crate usable with any dictionary source).
 - Internal: `warc` (feature `generate`), `zframe` (`codec`), `cdx`, `seglog`, `durable`. External: `thiserror`,
@@ -223,6 +238,14 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
 - `create_collection`, `delete_collection` (trash rename), `rename` (manifest only), `put(records)`,
   `put_raw(envelope stream)`, `get_by_id`, `get_by_url`, `search`, `scan`, `read_raw`.
 - `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`; `rebuild_index()`.
+- Rebuild protocol (M20): hold the admin mutex for the whole rebuild (tombstones, rename, delete, reopen wait);
+  `start` in `spawn_blocking`; the writer task publishes `cdx_len()` after each commit; loop
+  `copy_until(published)` until the delta < 1 MiB or 8 rounds; then the writer task runs `finish` with its
+  writer, swaps writer and snapshot, re-prepares `WrongGeneration` items, and `old.remove()` runs after the
+  publish; on `finish` error with a retired writer -> reopen; if the old writer is poisoned during the rebuild,
+  drop/abort the rebuild before reopening. Index (M18): `ReplaceGeneration` + inserts from the new snapshot's
+  `entries()`. Record deletion = `prepare_tombstone` + `Writer::tombstone` under the admin mutex, then
+  `Op::Tombstone`.
 - Per-collection writer task with a bounded queue and group commit; readers use `Arc<Snapshot>`.
 - Reads `MASSTUFFY_RAW_IMPORT_CHECK` once at `Repository::open` (→ `RawCheck`) and passes it to every
   `prepare_raw` of `put_raw` (M17/M19).
@@ -286,7 +309,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M11 | `dictstore` | name/header mismatch, duplicate id fatal, id probing, atomic install, cache bound |
 | M12 | `collection`: manifest, `create` (warcinfo), `Writer::commit`, `Snapshot::read` (codec None and Zstd) | warcinfo is entry 0; read back equals input; locators contiguous; raw import validation; concurrent readers while committing; manifest rejection |
 | M13 | `collection`: `open` + recovery | crash states after each commit step (segment truncated at many offsets, CDX truncated at every byte, zero-filled tail) → `open` yields a clean CDX satisfying I2/I4, committed entries readable; corrupt mid-CDX → error, repair → cut + report; leftovers removed, unknown kept; aborted create → `ManifestMissing`; open idempotent; reopen after poison; partial scan from checkpoint; fallback reasons; stale checkpoint removed after repair |
-| M14 | `collection`: tombstones, `Rebuilder` | rebuild None→Zstd, Zstd(D1)→Zstd(D1); crash before/after manifest rename; tombstoned records not copied |
+| M14 | `collection`: tombstones, `entries()`, `Rebuilder` (bounded worker pool) | rebuild None→Zstd, Zstd(D1)→Zstd(D1) (raw copy), Zstd(D1)→Zstd(D2), Zstd→None: live records byte-exact, tombstoned records not copied, new warcinfo first; crash before/after the manifest rename; writes during the rebuild carried over; concurrent readers; tombstone durability/idempotence; `entries()` with interleaved tombstones; pool: output identical for 1 and 4 workers, order preserved, error/panic stops and joins, in-flight memory bound |
 | M15 | `index`: trait, `MemIndex`, conformance suite | nearest-date semantics, `request` excluded, ACTIVE only, pattern queries, checkpoint atomic with ops |
 | M16 | `index-redb` | conformance suite; reopen after drop; concurrent readers during `apply` |
 | M17 | `masstuffy`: init/open, registry, writer task, `put`/`get` by locator | many tasks `put` to one collection → all entries present once, no interleaving inside a batch |
@@ -326,6 +349,8 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
    (`seg.<gen>.<N>.warc[.zst]`, `index.<gen>.cdx`) and in the index. Any file of a non-active
    generation (including `scan.<g>.json`) found at `open` is deleted, after the active generation was
    verified and after a dir fsync that makes the manifest durable. Rebuild to the same dictionary is just a new gen.
+   A rebuild allocates `next_gen_id`, bumps it only at its commit, and deletes leftover generations at `start`
+   as `open` does.
 7. **One process per repository**: `DirLock` on `<workdir>/.lock` at `open`. Within the process, a
    `tokio::Mutex` per collection serializes admin operations (rebuild, train, delete) — it replaces the
    buffer-directory lock; training samples are held in memory under a byte cap, not written as files.
@@ -362,6 +387,15 @@ These override the spec where they differ.
   a content size > 1 MiB.
 - **Aborted create**: a collection dir without `manifest.json` is trashed by the engine at open; `create`
   never deletes on error.
+- **Record deletion**: logical only (CDX tombstones); physical zeroing is not implemented (I1 holds without
+  exception); data and space are reclaimed by the next rebuild.
+- **Writes during a rebuild**: allowed — the `Rebuilder` catches up by CDX ranges and commits in a short final
+  step under writer exclusivity. Record deletions are serialised with rebuilds by the per-collection admin
+  mutex (a tombstone after the first copied range fails the rebuild).
+- **Rebuild parallelism**: transcoding runs on a bounded pool of `RebuildOptions::workers` scoped threads
+  (crate default 1; the engine passes `suggested_workers()` = available_parallelism/2, >= 1); reads, ordering
+  and appends stay on one thread, output is byte-identical for any worker count; in-flight work is capped by
+  `workers * 4` records and `max_inflight_bytes` (default 256 MiB).
 
 ## 6. Open questions (recommended answers)
 

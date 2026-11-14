@@ -424,7 +424,7 @@ pub(crate) fn file_len(path: &Path) -> u64 {
     fs::metadata(path).unwrap().len()
 }
 
-type Create = fn(&Path) -> (Collection, Entry<'static>);
+pub(crate) type Create = fn(&Path) -> (Collection, Entry<'static>);
 
 /// Both codecs.
 pub(crate) fn creators() -> [(&'static str, Create); 2] {
@@ -434,4 +434,92 @@ pub(crate) fn creators() -> [(&'static str, Create); 2] {
 pub(crate) fn truncate(path: &Path, len: u64) {
     let f = fs::OpenOptions::new().write(true).open(path).unwrap();
     f.set_len(len).unwrap();
+}
+
+// ---- M14 helpers: entries, rebuild.
+
+use masstuffy_cdx::Kind;
+
+use crate::snapshot::{ReadCtx, Snapshot};
+
+/// Drains `Collection::entries()` into owned entries.
+pub(crate) fn live(c: &Collection) -> Vec<Entry<'static>> {
+    collect(c.entries().unwrap())
+}
+
+fn collect(mut it: crate::entries::Entries) -> Vec<Entry<'static>> {
+    let mut v = Vec::new();
+    while let Some((_, e)) = it.next_entry().unwrap() {
+        v.push(e.into_owned());
+    }
+    v
+}
+
+/// Drains `snapshot.entries(end)` into owned entries.
+pub(crate) fn drain(snap: &Snapshot, end: u64) -> Vec<Entry<'static>> {
+    drain_at(snap, end).into_iter().map(|(_, e)| e).collect()
+}
+
+/// Drains `snapshot.entries(end)` into `(cdx offset, entry)`.
+pub(crate) fn drain_at(snap: &Snapshot, end: u64) -> Vec<(u64, Entry<'static>)> {
+    let mut it = snap.entries(end).unwrap();
+    let mut v = Vec::new();
+    while let Some((at, e)) = it.next_entry().unwrap() {
+        v.push((at, e.into_owned()));
+    }
+    v
+}
+
+/// The serialised record of `e`, read through `snap`.
+pub(crate) fn read_bytes(snap: &Snapshot, e: &Entry<'_>) -> Vec<u8> {
+    let (mut ctx, mut buf) = (ReadCtx::new(), Vec::new());
+    snap.read(e, &mut ctx, &mut buf)
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+pub(crate) fn none_codec() -> Codec {
+    Codec::None
+}
+
+/// Zstd with a dictionary other than [`zstd_codec`]'s.
+pub(crate) fn other_codec() -> Codec {
+    Codec::Zstd {
+        dict_id: NonZeroU32::new(other_id()).unwrap(),
+        level: 1,
+    }
+}
+
+/// The fields of `e` that survive a rebuild (the locator does not).
+pub(crate) fn identity(e: &Entry<'_>) -> (Kind, String, String, String, Option<String>) {
+    (
+        e.kind,
+        e.warc_type.to_string(),
+        e.record_id.to_string(),
+        e.date.to_string(),
+        e.url.as_ref().map(ToString::to_string),
+    )
+}
+
+/// Runs `f` on a thread and fails the test if it does not finish within `secs` seconds (a bug
+/// must not hang the suite). A panic of `f` is propagated.
+pub(crate) fn with_timeout<T: Send + 'static>(
+    secs: u64,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        let r = f();
+        let _ = tx.send(());
+        r
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(()) => h.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match h.join() {
+            Err(p) => std::panic::resume_unwind(p),
+            Ok(_) => panic!("test thread ended without a result"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("test timed out (hang?)"),
+    }
 }

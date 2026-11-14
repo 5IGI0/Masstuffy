@@ -262,18 +262,18 @@ impl RecoveryReport {
     }
 }
 
-struct DirScan {
-    leftovers: Vec<PathBuf>,
-    unknown: Vec<PathBuf>,
-    unknown_count: u64,
+pub(crate) struct DirScan {
+    pub(crate) leftovers: Vec<PathBuf>,
+    pub(crate) unknown: Vec<PathBuf>,
+    pub(crate) unknown_count: u64,
     /// A non-regular entry is named `scan.<active>.json`: the checkpoint can be neither read,
     /// written nor removed; it is reported as unknown and left alone.
-    ck_blocked: bool,
+    pub(crate) ck_blocked: bool,
 }
 
 /// Read-only classification of `dir`. The unknown list is the first
 /// `MAX_REPORTED_UNKNOWN` entries encountered (so it depends on `read_dir` order), then sorted.
-fn scan_dir(dir: &Path, active: Generation) -> Result<DirScan, Error> {
+pub(crate) fn scan_dir(dir: &Path, active: Generation) -> Result<DirScan, Error> {
     let io_err = |op: &'static str, path: &Path| {
         let path = path.to_path_buf();
         move |source| Error::Io { op, path, source }

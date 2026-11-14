@@ -112,6 +112,29 @@ fn meta_of_import(m: &ImportMeta<'_>) -> Meta {
     }
 }
 
+/// Index fields of an existing entry (already validated when it was first prepared).
+fn meta_of_entry(e: &Entry<'_>) -> Meta {
+    Meta {
+        warc_type: e.warc_type.to_string(),
+        record_id: e.record_id.to_string(),
+        date: e.date,
+        url: e.url.as_deref().map(str::to_owned),
+    }
+}
+
+/// Compresses `src` for a Zstd collection: no dictionary above `PLAIN_FRAME_MIN`.
+fn encode(z: &mut ZstdState, src: &[u8]) -> Result<Vec<u8>, PrepareError> {
+    let mut out = Vec::new();
+    if u64::try_from(src.len()).map_or(true, |n| n > PLAIN_FRAME_MIN) {
+        z.compressor.compress_plain(src, z.level, &mut out)?;
+    } else {
+        z.compressor.compress(src, &z.encoder, &mut out)?;
+    }
+    // `compress` reserves the compress bound; a queued record must not keep the slack.
+    out.shrink_to_fit();
+    Ok(out)
+}
+
 /// Second-precision envelope dates (legacy) match a record date with nanoseconds.
 fn same_date(claim: &WarcDate, rec: &WarcDate) -> bool {
     claim.year() == rec.year()
@@ -239,19 +262,63 @@ impl Preparer {
         probe(&mut self.line, &meta)?;
         let bytes = match &mut self.zstd {
             None => record.into_bytes(),
-            Some(z) => {
-                let mut out = Vec::new();
-                if len > PLAIN_FRAME_MIN {
-                    z.compressor
-                        .compress_plain(record.as_bytes(), z.level, &mut out)?;
-                } else {
-                    z.compressor
-                        .compress(record.as_bytes(), &z.encoder, &mut out)?;
-                }
-                // `compress` reserves the compress bound; a queued record must not keep the slack.
-                out.shrink_to_fit();
-                out
+            Some(z) => encode(z, record.as_bytes())?,
+        };
+        Ok(Prepared {
+            ctx: Arc::clone(&self.ctx),
+            digest: digest(&bytes),
+            bytes,
+            meta,
+        })
+    }
+
+    /// Rebuild, raw copy: `stored` are the verified stored bytes of `e` (same codec family and
+    /// dictionary); the digest is `e.digest`. Only the index line is probed.
+    ///
+    /// # Errors
+    ///
+    /// `Entry` (the line would be too long).
+    pub(crate) fn copy_stored(
+        &mut self,
+        stored: Vec<u8>,
+        e: &Entry<'_>,
+    ) -> Result<Prepared, PrepareError> {
+        let meta = meta_of_entry(e);
+        probe(&mut self.line, &meta)?;
+        Ok(Prepared {
+            ctx: Arc::clone(&self.ctx),
+            bytes: stored,
+            digest: e.digest,
+            meta,
+        })
+    }
+
+    /// Rebuild, transcode: `plain` is the decoded record of `e`; index fields are those of `e`.
+    ///
+    /// # Errors
+    ///
+    /// `RecordTooLarge`, `Record` (target None and `plain` is not one WARC record), `Entry`,
+    /// `Codec`.
+    pub(crate) fn transcode(
+        &mut self,
+        plain: Vec<u8>,
+        e: &Entry<'_>,
+    ) -> Result<Prepared, PrepareError> {
+        let len = u64::try_from(plain.len()).unwrap_or(u64::MAX);
+        if len > self.ctx.max_record_bytes {
+            return Err(PrepareError::RecordTooLarge {
+                size: len,
+                cap: self.ctx.max_record_bytes,
+            });
+        }
+        let meta = meta_of_entry(e);
+        probe(&mut self.line, &meta)?;
+        let bytes = match &mut self.zstd {
+            None => {
+                RecordRef::parse(&plain, &self.ctx.warc_limits)?;
+                plain
             }
+            Some(z) => encode(z, &plain)?,
         };
         Ok(Prepared {
             ctx: Arc::clone(&self.ctx),
