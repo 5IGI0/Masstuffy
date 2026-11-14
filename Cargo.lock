@@ -238,6 +238,8 @@ dependencies = [
  "masstuffy-collection",
  "masstuffy-dictstore",
  "masstuffy-durable",
+ "masstuffy-index",
+ "masstuffy-index-redb",
  "masstuffy-warc",
  "masstuffy-zframe",
  "serde",

@@ -20,6 +20,8 @@ pub(crate) struct Shared {
     pub(crate) slug: Arc<str>,
     pub(crate) tx: mpsc::Sender<Msg>,
     pub(crate) published: Arc<Published>,
+    /// What the secondary index tails for this collection.
+    pub(crate) feed: Arc<crate::indexer::IndexFeed>,
     pub(crate) preparers: PreparerPool,
     /// Per-collection admin mutex (architecture 4.7). M17: taken only by shutdown. M20/M21:
     /// rebuild, train, delete, rename, record deletion.

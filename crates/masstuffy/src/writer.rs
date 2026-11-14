@@ -19,6 +19,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use tracing::{debug, error, warn};
 
+use crate::indexer::{IndexFeed, IndexLink};
 use crate::resolver::StoreResolver;
 
 /// What a committed request gets back.
@@ -79,6 +80,15 @@ impl Published {
     pub(crate) fn load(&self) -> Arc<Snapshot> {
         let g = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
         Arc::clone(&g)
+    }
+
+    /// The current snapshot and the fsynced CDX length, read together: the length is loaded while
+    /// the snapshot read lock is held. M20 must store a new-generation snapshot and its length
+    /// under the write lock (`store_with_len`, added by M20).
+    pub(crate) fn tail(&self) -> (Arc<Snapshot>, u64) {
+        let g = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+        let len = self.cdx_len.load(Ordering::Acquire);
+        (Arc::clone(&g), len)
     }
 
     pub(crate) fn store(&self, s: Arc<Snapshot>) {
@@ -173,6 +183,8 @@ pub(crate) struct WriterParams {
     pub(crate) group_requests_cap: usize,
     pub(crate) checkpoint_every: u64,
     pub(crate) lock: Arc<DirLock>,
+    pub(crate) feed: Arc<IndexFeed>,
+    pub(crate) link: IndexLink,
     #[cfg(test)]
     pub(crate) hooks: Arc<TestHooks>,
 }
@@ -193,6 +205,9 @@ pub(crate) struct WriterTask {
     last_checkpoint_len: u64,
     /// Keeps the repository locked until this task has exited.
     _lock: Arc<DirLock>,
+    /// What the secondary index tails, and how to wake it.
+    feed: Arc<IndexFeed>,
+    link: IndexLink,
     #[cfg(test)]
     hooks: Arc<TestHooks>,
 }
@@ -236,6 +251,8 @@ impl WriterTask {
             checkpoint_every: p.checkpoint_every,
             last_checkpoint_len,
             _lock: p.lock,
+            feed: p.feed,
+            link: p.link,
             #[cfg(test)]
             hooks: p.hooks,
         }
@@ -387,7 +404,13 @@ impl WriterTask {
         self.published.commits.fetch_add(commits, Ordering::Release);
         self.published.records.fetch_add(acked, Ordering::Release);
         if let Some(w) = &self.writer {
-            self.published.cdx_len.store(w.cdx_len(), Ordering::Release);
+            let len = w.cdx_len();
+            let before = self.published.cdx_len.swap(len, Ordering::Release);
+            if before != len {
+                // The CDX is fsynced up to `len`: the indexer tails it. This also covers a reopen
+                // that kept lines of a failed attempt.
+                self.link.wake(&self.feed);
+            }
         }
         for ((reply, permit), r) in slots.into_iter().zip(replies) {
             let r = r.unwrap_or(Err(WriteError::Internal("no result for request")));
@@ -398,8 +421,8 @@ impl WriterTask {
         self.maybe_checkpoint().await;
     }
 
-    /// Hook point of the secondary index (M18): called once per successful commit, before the
-    /// replies are sent, with every entry the commit appended.
+    /// Called once per successful commit, before the replies are sent. The secondary index does
+    /// not use it: it tails the CDX (see `indexer.rs`).
     fn on_committed(&self, generation: u32, cdx_len: u64, entries: &[Entry<'static>]) {
         debug!(
             collection = %self.id,

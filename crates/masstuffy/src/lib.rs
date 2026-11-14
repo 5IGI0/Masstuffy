@@ -23,13 +23,28 @@
 //!
 //! # Lock order
 //!
-//! `gate`, then `create_lock`, then per-collection `admin` mutexes (ascending uuid), then the
-//! registry, then snapshot and pool mutexes. No std lock is held across an `.await`.
+//! `gate`, then `create_lock`, then `index_rebuild`, then per-collection `admin` mutexes
+//! (ascending uuid), then the registry, then snapshot and pool mutexes, the indexer hub, the
+//! index handle and the indexer task handle (all leaves). No std lock is held across an
+//! `.await`.
+//!
+//! # Secondary index
+//!
+//! A single indexer task keeps a secondary index (`data/index.redb` with the default cargo
+//! feature `redb`, an in-memory index otherwise) equal to the CDX of every loaded collection. It
+//! tails the fsynced CDX of each collection from its index checkpoint, so `put` replies after the
+//! CDX fsync and never waits for the index: the index is eventually consistent, and
+//! [`Repository::sync_index`] is the barrier that gives read-your-writes.
+//! [`Repository::rebuild_index`] re-indexes everything from the CDX while puts continue.
 #![forbid(unsafe_code)]
 
 mod collection;
 mod config;
 mod error;
+mod index;
+#[cfg(test)]
+mod index_tests;
+mod indexer;
 mod layout;
 mod pool;
 mod repository;

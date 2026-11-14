@@ -176,6 +176,25 @@ pub enum Error {
     /// The shutdown of the repository failed (reported to every caller of `shutdown`).
     #[error("shutdown failed: {0}")]
     ShutdownFailed(Arc<Error>),
+    /// The secondary index could not be opened (not fixed by recreating it).
+    #[error("secondary index {}: {source}", path.display())]
+    IndexOpen {
+        /// The index file.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Indexing failed for these collections (retried at their next commit or the next
+    /// `sync_index`).
+    #[error("secondary index lags for {} collection(s)", collections.len())]
+    IndexLagging {
+        /// The collections whose indexing failed.
+        collections: Vec<CollectionId>,
+    },
+    /// The indexer task is not running.
+    #[error("secondary index unavailable")]
+    IndexUnavailable,
     /// An internal invariant failed.
     #[error("internal error: {0}")]
     Internal(&'static str),
@@ -241,11 +260,16 @@ impl Error {
             | Error::InvalidSlug { .. }
             | Error::Build { .. }
             | Error::Prepare { .. } => ErrorKind::Invalid,
-            Error::Io { .. } | Error::Durable(_) | Error::Commit { .. } => ErrorKind::Io,
+            Error::Io { .. }
+            | Error::Durable(_)
+            | Error::Commit { .. }
+            | Error::IndexOpen { .. } => ErrorKind::Io,
             Error::ShuttingDown
             | Error::CollectionUnavailable(_)
             | Error::Join(_)
             | Error::ShutdownFailed(_)
+            | Error::IndexLagging { .. }
+            | Error::IndexUnavailable
             | Error::Internal(_) => ErrorKind::Unavailable,
         }
     }

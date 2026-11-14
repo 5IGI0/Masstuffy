@@ -57,7 +57,7 @@ use std::num::NonZeroU64;
 pub use checkpoint::{CHECKPOINT_MIN_GROWTH, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_SEGMENTS};
 pub use collection::{Collection, CreateSpec};
 pub use context::{GenContext, Options};
-pub use entries::Entries;
+pub use entries::{CdxLine, CdxLines, Entries};
 pub use error::{
     CommitError, Error, I2Violation, ManifestError, PrepareError, ReadError, TombstoneError,
 };

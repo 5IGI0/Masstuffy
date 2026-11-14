@@ -172,9 +172,13 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   Engine duties: `Repository::open` runs `Collection::open(.., &RecoveryOptions::default(), ..)` per
   collection dir; `ManifestMissing` -> `trash_dir` (aborted create); any other error -> collection skipped
   and reported, startup continues; repair is an explicit operator action; after a poisoned `Writer`, the
-  writer task drops it and runs `Collection::open` again (no admin mutex, see Engine) and re-commits the unacknowledged batch once; M18 resumes the
-  CDX at its checkpoint on `Collection::cdx_path()`, and rebuilds the collection's index entries if
-  `report.repair` is `Some` and the checkpoint offset is above `repair.at`.
+  writer task drops it and runs `Collection::open` again (no admin mutex, see Engine) and re-commits the unacknowledged batch once.
+  `Snapshot::cdx_lines(from, end) -> CdxLines` (M18) streams every line (`A` and `T`, no filtering) of a fsynced CDX
+  range as `CdxLine { at, next, entry }` (`next_line()`, `position()`): the engine's indexer tails the CDX with it. M18
+  resumes it at the index checkpoint and re-indexes a collection when the checkpoint is beyond the CDX length the writer
+  task started with (the floor rule: it holds even if new puts grew the CDX past the stale checkpoint), is not at a line
+  start, or the generation or index state does not match. An offline repair tool must delete `data/index.redb`: a repair
+  followed by offline appends past the old checkpoint cannot be detected.
   `Options { max_record_bytes, max_open_files }`.
 - `Preparer` (one per worker: `Compressor` + `Arc<GenContext>`), run outside any lock:
   `prepare(Record) -> Prepared` (serialize + compress, records over 1 MiB without dictionary) and
@@ -285,7 +289,10 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   every range validated): `max_record_bytes`, `max_open_files`, `dict_cache_bytes`, `dict_max_file_size`,
   `default_split_threshold`, `writer_queue` (64), `max_group_requests` (128), `max_group_bytes` (64 MiB),
   `max_inflight_put_bytes` (256 MiB), `preparers_per_collection` (4), `max_concurrent_prepares` (null = cores),
-  `max_concurrent_reads` (64), `open_concurrency` (4), `checkpoint_every_bytes` (64 MiB). `init` writes all fields.
+  `max_concurrent_reads` (64), `open_concurrency` (4), `checkpoint_every_bytes` (64 MiB), and (M18)
+  `index_sync_every` (1, `1..=65536`), `index_cache_bytes` (64 MiB, `1 MiB..=1 TiB`), `index_batch_ops` (8192,
+  `64..=65536`). `init` writes all fields. The schema stays version 1: an older binary rejects a config written by
+  this one (`deny_unknown_fields`), acceptable before 1.0.
 - `Repository::init(dir)`: the directory must be empty, or hold only the leftovers of an interrupted init (`.lock`,
   `.tmp-*`, the empty layout directories); dirs are created and fsynced, then `config.json` by `atomic_write` is
   the commit point; then the open sequence runs with the lock already held.
@@ -304,7 +311,8 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `StaleLocator`. M19 keeps the envelope-stream import, `scan`, `search`, `get_by_id`, `get_by_url`.
 - Later milestones: `delete_collection` (trash rename), `rename` (manifest only), `get_by_id`, `get_by_url`, `search`,
   `scan`.
-- `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`; `rebuild_index()`.
+- `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`. `Repository::sync_index()` and
+  `rebuild_index()` exist since M18 (see the secondary-index paragraph below).
 - Rebuild protocol (M20): hold the admin mutex for the whole rebuild (tombstones, rename, delete, reopen wait);
   `start` in `spawn_blocking`; the writer task publishes `cdx_len()` after each commit; loop
   `copy_until(published)` until the delta < 1 MiB or 8 rounds; then the writer task runs `finish` with its
@@ -325,7 +333,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   committing each request alone; a poisoned writer is reopened **by the writer task itself** (no admin mutex: M20's
   rebuild holds it while waiting for the writer task, so waiting for it here would deadlock; M20 must abort an
   in-progress `Rebuilder` first) and the group is retried once; a lost writer is reopened at the next group. The
-  task publishes counters and exposes a hook point (`on_committed`) where M18 sends the index batch.
+  task publishes counters and the fsynced CDX length (`Published::cdx_len`, read together with the snapshot by
+  `Published::tail`), then wakes the indexer if the length changed. `on_committed` is only a debug log: the index
+  tails the CDX.
 - Admission: a repository-wide byte budget (`max_inflight_put_bytes`, from admission until the writer answered),
   a prepare semaphore (CPU) and a read semaphore bound the work in flight; a request larger than the budget runs
   alone.
@@ -347,13 +357,67 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `prepare_raw` of `put_raw` (M17/M19: `put_raw` of already split items and `get_raw` arrive in M17).
 - Internal: all crates above. External: `tokio` (`rt`, `sync`), `uuid` (v4), `tracing`,
   `thiserror`. Features: `redb` (default) selects `index-redb`.
-- Index file: `<workdir>/data/index.redb`, opened in `spawn_blocking` at `Repository::open`;
-  `OpenError::needs_rebuild()` -> unlink the file, fsync `data/`, recreate, full catch-up from every
-  collection's CDX (no checkpoints); `AlreadyOpen` -> startup error.
-- One index-writer task drains a bounded queue of op batches from all collections into one `apply`
-  (group commit; redb serialises writers anyway).
-- Purge loop: after a structural op, `purge(4096)` in `spawn_blocking` until it returns 0.
-- Shutdown: stop the writer task, `flush()` then `close()`.
+- **Secondary index (M18)**, `indexer.rs` / `index.rs`:
+  - Backend (D1): cargo feature `redb` (default) opens `RedbIndex` at `<workdir>/data/index.redb` in `spawn_blocking`
+    with a `DirLock` clone (options from `index_cache_bytes` / `index_sync_every`); without the feature a `MemIndex`
+    rebuilt at every open. `OpenError::needs_rebuild()` -> unlink, fsync `data/`, recreate empty (every collection is
+    re-indexed; `OpenReport::index_recreated`); any other error, `AlreadyOpen` included -> `Error::IndexOpen` and the
+    open fails (the directory lock is released). The index is never needed for correctness.
+  - One **indexer task** per repository **tails the fsynced CDX** (D2) instead of receiving ops: a writer task only
+    publishes "the CDX of this collection is durable up to N" and wakes the indexer (`IndexLink::wake`: under the
+    `Hub` mutex, test-and-set of the collection in the `queued` set plus push on the queue, then a `try_send` of
+    `IndexCmd::Wake`, never blocking; the clear happens on pop under the same mutex, a leaf `std` lock with no I/O and
+    no `.await` inside). Ordering rule: the writer stores `cdx_len` before it takes the hub mutex, the indexer reads
+    `Published::tail` after popping under it, so no fence is needed.
+    Wake invariant: whenever the hub is non-empty an `IndexCmd` is in the channel or the indexer is running and looks
+    at the hub before its next `recv`. A full channel or a
+    dropped wake never loses work, memory is bounded by the number of collections plus one batch. One pass reads at most
+    `index_batch_ops` lines (shared by the collections of the pass) and applies **one** `apply` with a
+    `Checkpoint{generation, cdx_offset}` op per collection in the same atomic batch. `T` lines become `Op::Tombstone`.
+    If a multi-collection apply fails, each job is applied alone (one bad collection does not block the others).
+  - `put` replies after the CDX fsync and **never waits for the index** (D3); queries are eventually consistent (D4,
+    Q14). `Repository::sync_index()` is a barrier: it returns once the index covers every record acknowledged before
+    the call and every collection is active (`IndexLagging` per the retry rule below, `IndexUnavailable`
+    if the indexer is gone).
+  - Barrier retry rule: each track has a `failed` flag (last attempt failed, no success since; reset on a successful
+    apply). A barrier or re-index requeues a failed track and marks that target `retried`; a barrier target not yet
+    retried is retried once on its first failure; a second failure fails the barrier with `IndexLagging` listing the
+    collection. A collection that failed earlier but succeeded since gets its retry again.
+  - Resolution (catch-up at open, after a failed apply, after a repair: one mechanism). From the index state of the
+    collection: unknown -> re-index; forced -> re-index; active generation above the snapshot's -> re-index; checkpoint
+    of another generation or missing -> re-index; checkpoint beyond the CDX length (or beyond the length at writer
+    start, first resolution only) -> re-index; otherwise resume at the checkpoint (`ReplaceGeneration` when caught up if
+    the generation is not active yet, which also completes a generation switch interrupted by a crash). A stale staged
+    generation is discarded (`DiscardStaged`) at the first resolution after open. A resume point that is not a line
+    start falls back to re-index.
+  - Re-index (D6): `DropCollection`, then `Insert`/`Tombstone` for every line from the CDX header with no active
+    generation (rows invisible), chunk by chunk with checkpoints, then `ReplaceGeneration` in the batch of the last
+    chunk: readers see the collection empty meanwhile, never half built. A crash resumes at the checkpoint (no active
+    generation + checkpoint of the target generation) and then activates.
+  - `Repository::rebuild_index()` (D7) forces a re-index of every loaded collection through the indexer while puts
+    continue (the tail picks up new lines), drops orphan index collections (neither loaded nor skipped at open: covers a
+    crash between deleting a collection directory and its `DropCollection`), and is exclusive with itself
+    (`index_rebuild` mutex) and with admin operations (every admin mutex, ascending id). It runs as a spawned unit.
+  - Purge (D8) runs inside the indexer as lowest-priority work after any applied structural batch (`purge(4096)` in
+    `spawn_blocking` while no command or dirty collection waits, until it returns 0). No separate task or timer.
+  - A failed apply marks the collection failed and drops its in-memory cursor; it is retried from the durable
+    checkpoint at the next commit of that collection or at the next `sync_index` / `rebuild_index`. No timer. An
+    indexer panic is not restarted: `sync_index` returns `IndexUnavailable` and the next open catches up.
+  - Shutdown order (D10): gate flip, writers drain and exit (joined), `IndexCmd::Shutdown` (the indexer drains every
+    dirty collection fully, skips purge, `flush()`es the index, acknowledges), indexer joined, index handle dropped,
+    `closed`, `DirLock` released. Every blocking job of the indexer holds an `Arc<DirLock>` clone. An in-flight query
+    holding the index handle (M19) keeps the file locked until it ends. Dropping everything without `shutdown` drains
+    the index too (the channel closes when the last writer task and `Core` are gone).
+  - Errors: `IndexOpen` (kind `Io`), `IndexLagging`, `IndexUnavailable` (kind `Unavailable`).
+  - Lock order: `Core::gate`, `create_lock`, `index_rebuild`, per-collection `admin` (ascending uuid), `registry`,
+    then the leaves `Published::snapshot`, pool mutexes, `Hub::dirty`, `Core::index`, `Inner::index_task`.
+  - Contract kept for M20/M21: M20 adds `IndexCmd::Apply { ops, reply }` (applied alone, between passes, setting the
+    purge flag if structural) or lets the indexer tail the new generation's CDX as a staged feed; either way the
+    resolution rule `a < target` + staged checkpoint completes a switch after a crash. M20 must store the new snapshot
+    and its `cdx_len` together (`Published::tail` contract) and must not run while `rebuild_index` holds the admin
+    mutexes. M21 adds `IndexCmd::Forget { key, reply }` (remove the track, `DropCollection` durable before replying).
+  - Deviation from the earlier text of this section ("a bounded queue of op batches", a purge task with a timer):
+    tailing the CDX removes the queue, the loss on overflow and a second code path for catch-up.
 
 ## 2. Dependency graph
 
@@ -537,4 +601,19 @@ These override the spec where they differ.
 11. **Secondary-index durability** (M16): *Recommend* durable commits by default (`sync_every = 1`,
     quick-repair on), structural batches always durable, engine free to raise `sync_every` after
     measurement. Adopted in M16.
-12. **Index file location** (M16): *Recommend* `<workdir>/data/index.redb` (still decided in M18: the index is not wired in M17).
+    **Decided (M18): `index_sync_every = 1`.** The indexer already batches across commits and collections (while one
+    apply runs the next batch accumulates), and `put` never waits for the index, so index fsyncs are amortised.
+    Measured with the ignored `bench_index_sync_every` (release, 13th Gen Intel i7-1360P, 16 threads, ext4 on NVMe,
+    one collection, 8 tasks x 250 puts of a 2 KiB record, `Codec::None`; two runs, ack time of all 2000 puts / lag of
+    `sync_index` after the last ack): `sync_every = 1`: 742 ms / 0.84 ms and 720 ms / 0.99 ms; `16`: 645 ms / 0.22 ms
+    and 615 ms / 0.26 ms; `64`: 634 ms / 0.50 ms and 1724 ms (outlier, noisy disk) / 0.69 ms. Raising `sync_every`
+    improves the ack time by about 13% (below the 25% bar) and the index lags the last ack by under 1 ms in every
+    case: the default stays 1 (durable index commits, nothing to replay after a crash); an operator who needs a
+    little more put throughput can set 16.
+12. **Index file location** (M16): *Recommend* `<workdir>/data/index.redb`. **Decided (M18).**
+13. **Record deletion API** (M18): no milestone provides `delete(locator)`. *Recommend* a later milestone (with M21),
+    under the collection admin mutex (`prepare_tombstone` + `Writer::tombstone` via the writer task); the index then
+    follows through the CDX tail automatically. `T` lines written by other means (offline `Collection::tombstone`) are
+    already indexed.
+14. **Query freshness** (M18): the index is eventually consistent: queries may lag the CDX and, while a collection is
+    re-indexed, answer empty; `Repository::sync_index()` is the read-your-writes barrier. *Recommend* as is.

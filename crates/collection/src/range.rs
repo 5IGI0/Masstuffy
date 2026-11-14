@@ -213,6 +213,11 @@ impl LineReader {
         Ok(Some(at))
     }
 
+    /// Stream offset of the next unread line.
+    pub(crate) fn next_offset(&self) -> u64 {
+        self.next
+    }
+
     /// The line last returned by `advance`, without its `\n` (empty if none).
     pub(crate) fn current(&self) -> &[u8] {
         self.last

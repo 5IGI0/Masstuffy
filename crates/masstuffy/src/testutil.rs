@@ -9,7 +9,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use masstuffy_cdx::Entry;
-use masstuffy_collection::Codec;
+use masstuffy_collection::{Codec, CollectionId};
+use masstuffy_index::{CollectionKey, MAX_LIMIT, SecondaryIndex};
 use masstuffy_warc::{Record, RecordBuilder, WarcDate};
 use masstuffy_zframe::{DictHeader, SampleSet, TrainOptions, train};
 
@@ -210,4 +211,47 @@ pub(crate) fn open_hook(path: &Path) {
             st.1.wait_timeout_while(g, Duration::from_secs(30), |open| !*open)
                 .unwrap();
     }
+}
+
+static MEMORY_INDEX: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Makes every repository opened under `dir` use the in-memory index (rebuilt at every open).
+pub(crate) fn use_memory_index(dir: &Path) {
+    MEMORY_INDEX.lock().unwrap().push(dir.to_path_buf());
+}
+
+/// Called by `open_backend` (test builds): does a registration cover `path`?
+pub(crate) fn memory_index_requested(path: &Path) -> bool {
+    MEMORY_INDEX
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|d| path.starts_with(d))
+}
+
+/// Every visible entry of the collection in `index`, by position (= CDX order).
+pub(crate) fn dump_index(index: &dyn SecondaryIndex, id: CollectionId) -> Vec<Entry<'static>> {
+    let key = CollectionKey::new(id.as_u128());
+    let mut out = Vec::new();
+    let mut after = None;
+    loop {
+        let hits = index.list(key, after, MAX_LIMIT).unwrap();
+        let Some(last) = hits.last() else {
+            return out;
+        };
+        after = Some(last.position());
+        out.extend(hits.into_iter().map(|h| h.entry));
+    }
+}
+
+/// `dump_index` of the repository's own index, in `spawn_blocking`.
+pub(crate) async fn index_dump(repo: &Repository, id: CollectionId) -> Vec<Entry<'static>> {
+    let index = repo.core().index().unwrap();
+    tokio::task::spawn_blocking(move || dump_index(&*index, id))
+        .await
+        .unwrap()
+}
+
+pub(crate) fn index_hooks(repo: &Repository) -> Arc<crate::indexer::IndexHooks> {
+    Arc::clone(&repo.core().index_hooks)
 }

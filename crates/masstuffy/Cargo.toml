@@ -17,8 +17,16 @@ masstuffy-collection.workspace = true
 masstuffy-dictstore.workspace = true
 masstuffy-durable.workspace = true
 masstuffy-cdx.workspace = true
+masstuffy-index.workspace = true
+masstuffy-index-redb = { workspace = true, optional = true }
 masstuffy-warc = { workspace = true, features = ["generate"] }
 masstuffy-zframe = { workspace = true, features = ["codec"] }
+
+[features]
+default = ["redb"]
+# Secondary index backend: redb file `data/index.redb`. Without it the index is in memory and
+# rebuilt at every open.
+redb = ["dep:masstuffy-index-redb"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

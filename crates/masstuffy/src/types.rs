@@ -83,6 +83,9 @@ pub struct OpenReport {
     pub tmp_removed: usize,
     /// `.trash-*` entries removed from `data/repository`.
     pub trash_removed: usize,
+    /// The secondary index file was unreadable or of another schema and was recreated empty:
+    /// every collection is being re-indexed.
+    pub index_recreated: bool,
 }
 
 /// A collection loaded at open.

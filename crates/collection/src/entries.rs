@@ -61,7 +61,60 @@ impl Entries {
     }
 }
 
+/// One line of a CDX range, as read. Lending: `entry` borrows the iterator's buffer.
+#[derive(Debug)]
+pub struct CdxLine<'a> {
+    /// Offset of the line.
+    pub at: u64,
+    /// Offset just after the line (its `\n`): the resume point after applying it.
+    pub next: u64,
+    /// The parsed entry (`Kind::Add` or `Kind::Tombstone`).
+    pub entry: Entry<'a>,
+}
+
+/// Streaming iterator over every line (Add and Tombstone, no filtering) of a fsynced CDX range,
+/// in order.
+pub struct CdxLines {
+    lines: LineReader,
+}
+
+impl CdxLines {
+    /// Next line, or `None` exactly at `end`.
+    ///
+    /// # Errors
+    ///
+    /// `Io`, `CdxTruncated` (the file shrank, or `end` is inside a line), `CdxCorrupt`.
+    pub fn next_line(&mut self) -> Result<Option<CdxLine<'_>>, Error> {
+        let Some(at) = self.lines.advance()? else {
+            return Ok(None);
+        };
+        let next = self.lines.next_offset();
+        let entry = self.lines.parse_current(at)?;
+        Ok(Some(CdxLine { at, next, entry }))
+    }
+
+    /// Offset of the next unread line (= `from` before the first call, = `end` at the end).
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        self.lines.next_offset()
+    }
+}
+
 impl Snapshot {
+    /// Every line of this generation's CDX in `[from, end)`. `from = None` starts right after
+    /// the header. `from` must be a line start (or `end`), and `end` must be fsynced,
+    /// line-aligned data (`Writer::cdx_len()` or an index checkpoint taken from it). One
+    /// sequential pass. RAM: 64 KiB plus one line.
+    ///
+    /// # Errors
+    ///
+    /// `CdxMissing`, `CdxRead`, `CdxGeneration`, `CdxRange` (`from` below the header,
+    /// `from > end`, or `from` not at a line start), `CdxTruncated` (`end` beyond the file), `Io`.
+    pub fn cdx_lines(&self, from: Option<u64>, end: u64) -> Result<CdxLines, Error> {
+        let lines = LineReader::open(&self.cdx_path(), self.generation(), from, end)?;
+        Ok(CdxLines { lines })
+    }
+
     /// Live entries of this generation's CDX prefix `[header, end)`: every `Add` line whose
     /// `(segment, offset)` is not named by a `T` line of the prefix, in CDX order (= locator
     /// order). The warcinfo entry is included. `end` must be a line boundary of fsynced CDX data:
@@ -282,5 +335,76 @@ mod tests {
             });
             assert_eq!(all.lock().unwrap().len(), 50);
         });
+    }
+
+    fn all_lines(
+        snap: &Snapshot,
+        from: Option<u64>,
+        end: u64,
+    ) -> (Vec<(u64, u64, Entry<'static>)>, u64) {
+        let mut it = snap.cdx_lines(from, end).unwrap();
+        let mut v = Vec::new();
+        while let Some(l) = it.next_line().unwrap() {
+            v.push((l.at, l.next, l.entry.into_owned()));
+        }
+        (v, it.position())
+    }
+
+    #[test]
+    fn cdx_lines_all_kinds_in_order() {
+        for (_, create) in creators() {
+            let mut s = scenario(create);
+            let want = cdx_lines(&s.dir, 1);
+            let len = s.c.writer().cdx_len();
+            let (got, pos) = all_lines(s.c.snapshot(), None, len);
+            assert_eq!(got, want);
+            assert_eq!(pos, len);
+            assert!(got.iter().any(|l| l.2.kind == Kind::Tombstone));
+            assert!(got.iter().any(|l| l.2.kind == Kind::Add));
+        }
+    }
+
+    #[test]
+    fn cdx_lines_from_middle() {
+        for (_, create) in creators() {
+            let mut s = scenario(create);
+            let want = cdx_lines(&s.dir, 1);
+            let len = s.c.writer().cdx_len();
+            let (got, _) = all_lines(s.c.snapshot(), Some(want[3].0), len);
+            assert_eq!(got, want[3..]);
+            let (got, pos) = all_lines(s.c.snapshot(), Some(len), len);
+            assert!(got.is_empty());
+            assert_eq!(pos, len);
+        }
+    }
+
+    #[test]
+    fn cdx_lines_bad_bounds() {
+        let mut s = scenario(crate::testutil::create_zstd);
+        let want = cdx_lines(&s.dir, 1);
+        let len = s.c.writer().cdx_len();
+        let snap = s.c.snapshot();
+        let r = |from, end| snap.cdx_lines(from, end).map(|_| ());
+        assert!(matches!(
+            r(Some(want[3].0 + 2), len),
+            Err(Error::CdxRange { .. })
+        ));
+        assert!(matches!(
+            r(Some(want[0].0 - 1), len),
+            Err(Error::CdxRange { .. })
+        ));
+        assert!(matches!(r(Some(len), len - 1), Err(Error::CdxRange { .. })));
+        assert!(matches!(r(None, len + 10), Err(Error::CdxTruncated { .. })));
+        let mut it = snap.cdx_lines(None, want[2].0 + 3).unwrap();
+        it.next_line().unwrap().unwrap();
+        it.next_line().unwrap().unwrap();
+        assert!(matches!(it.next_line(), Err(Error::CdxTruncated { .. })));
+        // Wrong generation: a snapshot of generation 2 pointing at the same file name is not
+        // available here, so check through the header-generation error path of the reader.
+        let path = snap.cdx_path();
+        assert!(matches!(
+            LineReader::open(&path, 7, None, len).map(|_| ()),
+            Err(Error::CdxGeneration { .. })
+        ));
     }
 }

@@ -12,13 +12,16 @@ use masstuffy_collection::{
 };
 use masstuffy_dictstore::DictStore;
 use masstuffy_durable::DirLock;
+use masstuffy_index::{CollectionKey, SecondaryIndex};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
 use crate::collection::{CollectionHandle, Shared};
 use crate::config::{self, Config, Limits, RAW_IMPORT_CHECK_ENV, raw_check_from};
 use crate::error::Error;
+use crate::index::open_backend;
+use crate::indexer::{INDEX_QUEUE, IndexCmd, IndexFeed, IndexLink, IndexerParams, spawn_indexer};
 use crate::layout::{self, CONFIG_NAME};
 use crate::pool::{CtxPool, PreparerPool};
 use crate::resolver::StoreResolver;
@@ -46,6 +49,14 @@ pub(crate) struct Core {
     /// One permit is one KiB of input admitted but not yet committed.
     pub(crate) inflight_sem: Arc<Semaphore>,
     pub(crate) read_ctxs: CtxPool,
+    /// The secondary index, for queries (M19) and tests. Taken (`None`) by shutdown after the
+    /// indexer exited. A handle still held by an in-flight query keeps the index file locked
+    /// until that query ends.
+    index: RwLock<Option<Arc<dyn SecondaryIndex>>>,
+    /// Wakes the indexer and talks to it (barriers, re-index, shutdown).
+    pub(crate) index_link: IndexLink,
+    #[cfg(test)]
+    pub(crate) index_hooks: Arc<crate::indexer::IndexHooks>,
     /// Taken (set to `None`) by shutdown.
     lock: Mutex<Option<Arc<DirLock>>>,
 }
@@ -57,6 +68,21 @@ impl Core {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// The secondary index.
+    ///
+    /// # Errors
+    ///
+    /// `ShuttingDown` once shutdown has taken it.
+    // Consumed by the query API (M19) and by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn index(&self) -> Result<Arc<dyn SecondaryIndex>, Error> {
+        self.index
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or(Error::ShuttingDown)
+    }
 }
 
 struct Registry {
@@ -67,11 +93,13 @@ struct Registry {
     reserved: HashSet<String>,
 }
 
-/// Lock order: `Core::gate`, then `Inner::create_lock`, then the `admin` mutexes of collections
-/// (several only in ascending [`CollectionId`] order), then `registry`, then
-/// `Published::snapshot` and the pool mutexes. Semaphores are acquired after `gate` (inflight
-/// before prepare). A std lock is never held across `.await` and a registry guard is dropped
-/// before anything else is taken.
+/// Lock order: `Core::gate`, then `Inner::create_lock`, then `Inner::index_rebuild`, then the
+/// `admin` mutexes of collections (several only in ascending [`CollectionId`] order), then
+/// `registry`, then `Published::snapshot`, the pool mutexes, `Hub::dirty`, `Core::index` and
+/// `Inner::index_task` (leaves: never held while taking another lock, nor across `.await`).
+/// Semaphores are acquired after `gate` (inflight before prepare). A std lock is never held
+/// across `.await` and a registry guard is dropped before anything else is taken. The indexer
+/// task holds no lock across `.await`; its per-collection state is owned by the task.
 struct Inner {
     core: Arc<Core>,
     registry: RwLock<Registry>,
@@ -85,6 +113,10 @@ struct Inner {
     shutdown_done: tokio::sync::watch::Sender<bool>,
     /// The shutdown task's error, readable by every caller.
     shutdown_err: Mutex<Option<Arc<Error>>>,
+    /// The indexer task; taken by shutdown.
+    index_task: Mutex<Option<JoinHandle<()>>>,
+    /// Makes `rebuild_index` exclusive with itself. Held across awaits on purpose.
+    index_rebuild: tokio::sync::Mutex<()>,
 }
 
 impl Inner {
@@ -207,6 +239,17 @@ impl Repository {
             scan_blocking(&d)
         })
         .await??;
+        // Index open (blocking; recreated empty if unreadable).
+        let (backend, index_recreated) = {
+            let d = dir.clone();
+            let cfg = scanned.config.clone();
+            let job_lock = Arc::clone(&lock);
+            spawn(move || {
+                let _lock = job_lock;
+                open_backend(&d, &cfg)
+            })
+            .await??
+        };
         let Scanned {
             config,
             dicts,
@@ -224,6 +267,11 @@ impl Repository {
         let inflight = usize::try_from(limits.inflight_kib).unwrap_or(usize::MAX >> 4);
         let open_concurrency = usize::try_from(config.open_concurrency).unwrap_or(1);
         let collection_opts = limits.collection_opts;
+        let (tx, rx) = mpsc::channel(INDEX_QUEUE);
+        let (index_link, hub) = IndexLink::new(tx);
+        let batch_ops = usize::try_from(config.index_batch_ops).unwrap_or(1);
+        #[cfg(test)]
+        let index_hooks = Arc::new(crate::indexer::IndexHooks::default());
         let core = Arc::new(Core {
             dir: dir.clone(),
             config,
@@ -236,6 +284,10 @@ impl Repository {
             read_sem: Arc::new(Semaphore::new(read_permits)),
             inflight_sem: Arc::new(Semaphore::new(inflight)),
             read_ctxs: CtxPool::new(read_permits),
+            index: RwLock::new(Some(Arc::clone(&backend.index))),
+            index_link,
+            #[cfg(test)]
+            index_hooks: Arc::clone(&index_hooks),
             lock: Mutex::new(Some(lock)),
         });
 
@@ -276,6 +328,7 @@ impl Repository {
             unknown_count,
             tmp_removed,
             trash_removed,
+            index_recreated,
         };
         let mut reserved: HashSet<String> = HashSet::new();
         let mut loadable = Vec::new();
@@ -302,6 +355,7 @@ impl Repository {
             by_id: HashMap::new(),
             reserved,
         };
+        let mut feeds = Vec::new();
         for (id, coll, rec) in loadable {
             let slug = coll.manifest().slug().to_owned();
             if by_slug.get(&slug).copied().unwrap_or(0) > 1 {
@@ -317,6 +371,7 @@ impl Repository {
             };
             let shared = spawn_writer(&core, id, *coll, lock);
             registry.by_slug.insert(Arc::clone(&shared.slug), id);
+            feeds.push(Arc::clone(&shared.feed));
             info!(
                 collection = %id,
                 slug = %shared.slug,
@@ -344,6 +399,33 @@ impl Repository {
             warn!(path = %u.display(), "unknown entry in data/repository (kept)");
         }
 
+        // Collections skipped at open keep their index rows until the operator fixes them.
+        let keep: HashSet<CollectionKey> = report
+            .skipped
+            .iter()
+            .filter_map(|s| {
+                s.dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.parse::<CollectionId>().ok())
+            })
+            .map(|id| CollectionKey::new(id.as_u128()))
+            .collect();
+        let index_lock = core
+            .lock_arc()
+            .ok_or(Error::Internal("lock released during open"))?;
+        let index_task = spawn_indexer(IndexerParams {
+            rx,
+            hub,
+            backend,
+            initial: feeds,
+            keep,
+            batch_ops,
+            lock: index_lock,
+            #[cfg(test)]
+            hooks: index_hooks,
+        });
+
         let repo = Repository {
             inner: Arc::new(Inner {
                 core,
@@ -352,6 +434,8 @@ impl Repository {
                 shutdown_started: AtomicBool::new(false),
                 shutdown_done: tokio::sync::watch::channel(false).0,
                 shutdown_err: Mutex::new(None),
+                index_task: Mutex::new(Some(index_task)),
+                index_rebuild: tokio::sync::Mutex::new(()),
             }),
         };
         Ok((repo, report))
@@ -359,6 +443,11 @@ impl Repository {
 
     fn registry(&self) -> std::sync::RwLockReadGuard<'_, Registry> {
         self.inner.registry()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> &Arc<Core> {
+        &self.inner.core
     }
 
     fn handle(&self, shared: Arc<Shared>) -> CollectionHandle {
@@ -564,6 +653,37 @@ impl Repository {
         })
     }
 
+    /// Waits until the secondary index reflects every record committed (acknowledged) before this
+    /// call, in every loaded collection, and every collection is active in the index. Does not
+    /// wait for durability of the index itself (`index_sync_every > 1`). Cancellation is
+    /// harmless: the barrier is dropped.
+    ///
+    /// # Errors
+    ///
+    /// `ShuttingDown`, `IndexUnavailable` (indexer stopped), `IndexLagging` (indexing failed for
+    /// these collections; retried at their next commit or the next call).
+    pub async fn sync_index(&self) -> Result<(), Error> {
+        self.check_open()?;
+        index_request(&self.inner.core, IndexCmd::Barrier).await
+    }
+
+    /// Rebuilds the secondary index from the CDX of every loaded collection (spec 04 4.7),
+    /// concurrently with puts. Each collection is dropped from the index and re-indexed
+    /// invisibly, then becomes visible at once. Index collections that are neither loaded nor
+    /// skipped at open are dropped. Exclusive with another `rebuild_index` and with admin
+    /// operations on any collection. Returns when every collection is re-indexed and active.
+    /// Cancellation: the rebuild runs in a spawned unit and continues if this future is dropped.
+    ///
+    /// # Errors
+    ///
+    /// `ShuttingDown`, `IndexUnavailable`, `IndexLagging`, `Join`.
+    pub async fn rebuild_index(&self) -> Result<(), Error> {
+        self.check_open()?;
+        tokio::spawn(rebuild_index_unit(Arc::clone(&self.inner)))
+            .await
+            .map_err(Error::Join)?
+    }
+
     /// The configuration read at open.
     #[must_use]
     pub fn config(&self) -> &Config {
@@ -655,8 +775,34 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
             failure = Some(Error::Join(e));
         }
     }
+    // The writers are gone: nothing can wake the indexer any more. It drains every dirty
+    // collection, flushes the index and exits.
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if core
+        .index_link
+        .tx
+        .send(IndexCmd::Shutdown(ack_tx))
+        .await
+        .is_ok()
+    {
+        let _ = ack_rx.await; // Err: the indexer ended without acknowledging.
+    }
+    let index_task = inner
+        .index_task
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(h) = index_task
+        && let Err(e) = h.await
+    {
+        failure.get_or_insert(Error::Join(e));
+    }
+    core.index
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take(); // drops the query handle
     core.closed.store(true, Ordering::Release);
-    // Every writer task has exited, so this was the last `Arc<DirLock>`.
+    // Every writer task and the indexer have exited, so this was the last `Arc<DirLock>`.
     core.lock
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -664,6 +810,36 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
     drop(admin);
     drop(gate);
     failure.map_or(Ok(()), Err)
+}
+
+/// Sends a command carrying a reply channel to the indexer and waits for the reply.
+async fn index_request(
+    core: &Core,
+    make: fn(oneshot::Sender<Result<(), Error>>) -> IndexCmd,
+) -> Result<(), Error> {
+    let (tx, rx) = oneshot::channel();
+    core.index_link
+        .tx
+        .send(make(tx))
+        .await
+        .map_err(|_| Error::IndexUnavailable)?;
+    rx.await.map_err(|_| Error::IndexUnavailable)?
+}
+
+/// `rebuild_index`, run as a spawned unit so that cancelling the caller cannot leave it half done.
+async fn rebuild_index_unit(inner: Arc<Inner>) -> Result<(), Error> {
+    // Held across the awaits on purpose: exclusivity with another rebuild.
+    let _exclusive = inner.index_rebuild.lock().await;
+    let mut shareds: Vec<Arc<Shared>> = inner.registry().by_id.values().cloned().collect();
+    shareds.sort_by_key(|s| s.id);
+    // Admin mutexes in ascending id order (lock order), held until the re-index is done.
+    let mut admins = Vec::with_capacity(shareds.len());
+    for s in &shareds {
+        admins.push(s.admin.lock().await);
+    }
+    let r = index_request(&inner.core, IndexCmd::Reindex).await;
+    drop(admins);
+    r
 }
 
 /// The create, the writer spawn and the registration of one collection, run in a spawned task
@@ -711,7 +887,7 @@ async fn create_unit(
             &opts,
             &*resolver,
         )
-        .map(|(c, _warcinfo)| c) // M18 will index the warcinfo entry here.
+        .map(|(c, _warcinfo)| c) // The indexer tails the CDX: the wake in `spawn_writer` indexes it.
         .map_err(|source| {
             if path.exists()
                 && let Err(e) = masstuffy_durable::trash_dir(&path)
@@ -759,6 +935,7 @@ fn spawn_writer(
     let split = coll.manifest().split_threshold().get();
     let (writer, snapshot) = coll.into_parts();
     let published = Arc::new(Published::new(snapshot, writer.cdx_len()));
+    let feed = Arc::new(IndexFeed::new(id, Arc::clone(&published), writer.cdx_len()));
     let queue = usize::try_from(core.config.writer_queue)
         .unwrap_or(1)
         .max(1);
@@ -780,15 +957,20 @@ fn spawn_writer(
             .max(1),
         checkpoint_every: core.config.checkpoint_every_bytes,
         lock,
+        feed: Arc::clone(&feed),
+        link: core.index_link.clone(),
         #[cfg(test)]
         hooks: Arc::clone(&hooks),
     });
     let handle = tokio::spawn(task.run());
+    // Initial catch-up of a loaded collection, or the warcinfo entry of a new one.
+    core.index_link.wake(&feed);
     Arc::new(Shared {
         id,
         slug,
         tx,
         published,
+        feed,
         preparers: PreparerPool::new(
             usize::try_from(core.config.preparers_per_collection).unwrap_or(1),
         ),

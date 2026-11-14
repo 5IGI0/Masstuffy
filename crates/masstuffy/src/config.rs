@@ -63,6 +63,15 @@ pub struct Config {
     /// CDX growth (bytes) after which a writer task writes a checkpoint. Default 64 MiB. At least
     /// `CHECKPOINT_MIN_GROWTH`.
     pub checkpoint_every_bytes: u64,
+    /// Every N-th secondary-index commit is fsynced (redb backend); structural batches always
+    /// are. Default 1. `1..=65536`. Added after the first release of schema 1: an older binary
+    /// rejects a config written by this one (`deny_unknown_fields`).
+    pub index_sync_every: u32,
+    /// Page cache of the redb secondary index, in bytes. Default 64 MiB. `1 MiB..=1 TiB`.
+    pub index_cache_bytes: u64,
+    /// CDX lines per secondary-index batch (shared by the collections of one indexer pass).
+    /// Default 8192. `64..=65536`.
+    pub index_batch_ops: u32,
 }
 
 impl Default for Config {
@@ -82,6 +91,9 @@ impl Default for Config {
             max_concurrent_reads: 64,
             open_concurrency: 4,
             checkpoint_every_bytes: 64 * MIB,
+            index_sync_every: 1,
+            index_cache_bytes: 64 * MIB,
+            index_batch_ops: 8192,
         }
     }
 }
@@ -178,6 +190,9 @@ impl Config {
         if self.checkpoint_every_bytes < CHECKPOINT_MIN_GROWTH {
             return Err(ConfigError::Invalid("checkpoint_every_bytes"));
         }
+        in_range(self.index_sync_every.into(), 1, 65536, "index_sync_every")?;
+        in_range(self.index_cache_bytes, MIB, TIB, "index_cache_bytes")?;
+        in_range(self.index_batch_ops.into(), 64, 65536, "index_batch_ops")?;
         Ok(())
     }
 
@@ -385,6 +400,12 @@ mod tests {
             ("max_concurrent_reads", "0"),
             ("max_open_files", "0"),
             ("dict_max_file_size", "4"),
+            ("index_sync_every", "0"),
+            ("index_sync_every", "65537"),
+            ("index_cache_bytes", "1024"),
+            ("index_cache_bytes", "1099511627777"),
+            ("index_batch_ops", "63"),
+            ("index_batch_ops", "65537"),
         ] {
             let json = format!(r#"{{"version":1,"{field}":{v}}}"#);
             assert!(
