@@ -121,6 +121,15 @@ pub enum Error {
         #[source]
         source: masstuffy_warc::BuildError,
     },
+    /// A record cannot be deleted (`CollectionHandle::delete`); nothing was written.
+    #[error("record {index}: {source}")]
+    Tombstone {
+        /// Index in the (deduplicated) request.
+        index: usize,
+        /// The underlying error.
+        #[source]
+        source: masstuffy_collection::TombstoneError,
+    },
     /// A record could not be prepared.
     #[error("record {index}: {source}")]
     Prepare {
@@ -335,7 +344,13 @@ impl Error {
             | Error::Train(_)
             | Error::InvalidOptions(_)
             | Error::Build { .. }
+            | Error::Tombstone { .. }
             | Error::Prepare { .. } => ErrorKind::Invalid,
+            Error::Commit { source, .. }
+                if matches!(**source, CommitError::TombstoneNotCommitted { .. }) =>
+            {
+                ErrorKind::Invalid
+            }
             Error::Io { .. }
             | Error::Durable(_)
             | Error::Commit { .. }

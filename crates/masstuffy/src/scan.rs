@@ -136,11 +136,12 @@ impl CollectionHandle {
     /// # Errors
     ///
     /// `InvalidQuery` (`page_records` outside `1..=MAX_SCAN_PAGE`, `page_bytes` outside
-    /// `1..=1 GiB`), `ShuttingDown`.
+    /// `1..=1 GiB`), `ShuttingDown`, `UnknownCollection` (deleted).
     pub fn scan(&self, opts: ScanOptions) -> Result<Scan, Error> {
         if self.core.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::ShuttingDown);
         }
+        self.shared.check_live()?;
         if opts.page_records == 0 || opts.page_records > MAX_SCAN_PAGE {
             return Err(Error::InvalidQuery("scan page_records"));
         }
@@ -169,7 +170,7 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// `ShuttingDown`; `StaleLocator` (the cursor's generation is no longer active, or a segment
+    /// `ShuttingDown`; `UnknownCollection` (deleted); `StaleLocator` (the cursor's generation is no longer active, or a segment
     /// vanished because the generation changed: restart the scan); `InvalidQuery` (the cursor is
     /// not at a line start, or is beyond the CDX); `Collection` (CDX read error); `Join`.
     pub async fn next_page(&mut self) -> Result<Option<ScanPage>, Error> {
@@ -180,6 +181,7 @@ impl Scan {
         if self.core.closed.load(Ordering::Acquire) {
             return Err(Error::ShuttingDown);
         }
+        self.shared.check_live()?;
         let permit = Arc::clone(&self.core.read_sem)
             .acquire_owned()
             .await

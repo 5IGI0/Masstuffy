@@ -230,6 +230,7 @@ impl CollectionHandle {
             if *gate {
                 return Err(Error::ShuttingDown);
             }
+            self.shared.check_live()?;
             if self.shared.rebuild.active.swap(true, Ordering::SeqCst) {
                 return Err(Error::RebuildInProgress(self.shared.id));
             }
@@ -322,6 +323,8 @@ async fn rebuild_unit(
     // Held across every await until the end, on purpose: exclusivity with `rebuild_index`,
     // shutdown and the other admin operations. The writer task never takes it.
     let _admin = shared.admin.lock().await;
+    // Before the `closing` check: a delete cancels the rebuild and then waits for this mutex.
+    shared.check_live()?;
     if core.is_closing() {
         return Err(Error::ShuttingDown);
     }
@@ -371,6 +374,10 @@ async fn run(
     let mut frontier = info.frontier;
     let mut rounds = 0u32;
     loop {
+        if shared.is_deleted() {
+            let e = Error::UnknownCollection(id.to_string());
+            return abort(core, shared, lock, key, info.generation, e).await;
+        }
         if core.is_closing() {
             return abort(
                 core,
@@ -392,7 +399,9 @@ async fn run(
                 let err = match e {
                     CopyErr::Gone
                     | CopyErr::Failed(masstuffy_collection::Error::RebuildCancelled) => {
-                        if core.is_closing() {
+                        if shared.is_deleted() {
+                            Error::UnknownCollection(id.to_string())
+                        } else if core.is_closing() {
                             Error::ShuttingDown
                         } else {
                             Error::RebuildAborted {
@@ -410,6 +419,10 @@ async fn run(
     }
     point(core, shared, RebuildPoint::Copied).await?;
     // After the hook: a pause is released by shutdown, which must not reach `Finish`.
+    if shared.is_deleted() {
+        let e = Error::UnknownCollection(id.to_string());
+        return abort(core, shared, lock, key, info.generation, e).await;
+    }
     if core.is_closing() {
         return abort(
             core,
@@ -439,6 +452,9 @@ async fn run(
         Ok(Ok(done)) => done,
         Ok(Err(FinishFail::Aborted(reason))) => {
             unstage(core, key, info.generation).await;
+            if shared.is_deleted() {
+                return Err(Error::UnknownCollection(id.to_string()));
+            }
             return Err(Error::RebuildAborted {
                 collection: id,
                 reason,
@@ -447,10 +463,13 @@ async fn run(
         Ok(Err(FinishFail::Failed { source, committed })) => {
             if !committed {
                 unstage(core, key, info.generation).await;
-                if matches!(source, masstuffy_collection::Error::RebuildCancelled)
-                    && core.is_closing()
-                {
-                    return Err(Error::ShuttingDown);
+                if matches!(source, masstuffy_collection::Error::RebuildCancelled) {
+                    if shared.is_deleted() {
+                        return Err(Error::UnknownCollection(id.to_string()));
+                    }
+                    if core.is_closing() {
+                        return Err(Error::ShuttingDown);
+                    }
                 }
             }
             return Err(Error::Rebuild {
@@ -520,6 +539,8 @@ fn start_job(
     // Reset only here, under the lock, then look at `closing`: shutdown sends `closing` before it
     // sets `cancel`, so either this sees `closing` or the flag is set again after the reset.
     slot.cancel.store(false, Ordering::SeqCst);
+    // `delete_collection` sets `deleted` before `cancel`, the same argument as for `closing`.
+    shared.check_live()?;
     if core.is_closing() {
         return Err(Error::ShuttingDown);
     }

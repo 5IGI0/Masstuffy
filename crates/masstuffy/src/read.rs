@@ -131,6 +131,7 @@ pub(crate) async fn read_located(
     if mode == Fetch::None {
         return Err(Error::Internal("fetch mode"));
     }
+    shared.check_live()?;
     let snap = snapshot_for(shared, at.generation)?;
     let permit = Arc::clone(&core.read_sem)
         .acquire_owned()

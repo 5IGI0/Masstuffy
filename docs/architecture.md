@@ -203,6 +203,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `Writer::tombstone(&[PreparedTombstone])` = check that each target is covered by a committed (fsynced) line, so a
   `T` line never points into orphan bytes a crash could drop, then CDX append + fsync (same poisoning and `WrongGeneration` contract
   as `commit`); duplicates harmless. No physical zeroing (I1 holds without exception).
+- `set_slug(&Snapshot, slug) -> Snapshot` (M21): manifest slug rewrite via `atomic_write` (commit point), same
+  generation, reader and context shared (no file reopened); `Collection::set_slug` offline. The warcinfo records are
+  not touched (the next rebuild writes one with the new slug).
 - `Rebuilder` (M14): `Rebuilder::start(Arc<Snapshot>, Codec, &Options, RebuildOptions { recompress,
   on_unreadable: Fail|Skip, workers, max_inflight_bytes }, &dyn DictResolver)` (deletes non-active generation
   leftovers, creates generation `next_gen_id`, writes its warcinfo with the target manifest),
@@ -320,7 +323,32 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `get_raw`); `get_raw` returns the stored bytes and their encoding. A locator of another generation is
   `StaleLocator`. M19 adds `CollectionHandle::put_raw_envelope`, `scan`, `search`, `find_by_url`/`get_by_url` and
   `Repository::find_by_id`/`get_by_id` (see "Queries and bulk import (M19)" below).
-- Later milestones: `delete_collection` (trash rename), `rename` (manifest only), record deletion (Q13).
+- **Admin operations (M21)**, `admin.rs`: `Repository::delete_collection(impl Into<CollectionRef>) ->
+  DeletedCollection`, `rename_collection(which, new_slug) -> CollectionHandle`, `CollectionHandle::delete(Vec<Located>)`
+  and `delete_by_id`. `CollectionRef` is `Slug(&str)` or `Id(CollectionId)`. Each runs its mutation in a spawned unit
+  and none takes `Core::gate`: each takes the collection's `admin` mutex and then checks `is_closing` (shutdown holds
+  every `admin` it took until it ends, so a flow that got `admin` first finishes with the writer task alive).
+  - delete_collection: (1) `Shared::admission` write guard only to set `Shared::deleted` (puts hold `admission` read
+    from admission until queued, so every earlier put has queued its request; later ones and every other handle
+    operation get `UnknownCollection`); (2) set the rebuild cancel flag (after `deleted`: `start_job` resets it, then
+    reads `deleted`); (3) take `admin`; (4) stop the writer task (`Msg::Shutdown`: commits what was queued, final
+    checkpoint); (5) `durable::trash_dir` = commit point (rename to `.trash-*`, parent fsync, removal); (6) registry:
+    id and slug removed (the slug stays reserved if the parent fsync failed); (7) `IndexCmd::Forget`. Crash table:
+    before the rename = loaded normally; rename durable, removal partial = `sweep_trash` at open and the index rows
+    dropped by the orphan GC of the first pass; removal done before `Forget` = orphan GC; after `Forget` = nothing.
+    A failed (not committed) trash rename leaves the collection registered but closed (Q24): call again or reopen.
+  - rename_collection: guards `admin` then `create_lock` taken in the caller (cancellable, nothing mutated), then a unit
+    sends `Msg::SetSlug` to the writer task, which runs `collection::set_slug` (manifest `atomic_write` = commit
+    point; the writer task is the only place that reopens, and `Collection::open` sweeps tmp files, so the two must not
+    overlap) and publishes the new snapshot (same generation: the retired one is kept; the published manifest must
+    equal the disk, or the next rebuild fails with `StaleSource`). The registry and `Shared::slug` follow after; an
+    ambiguous failure reserves the slug a crash could bring back (`SlugApplied`). The index is keyed by uuid and not
+    touched. I7 holds because `create_lock` covers creates and renames.
+  - Record deletion: `delete` takes `admin` (owned) in the caller, then the unit runs `prepare_tombstone` (blocking
+    pool) for every distinct target, queues `Msg::Tombstone`, and holds `admin` until the writer replied (one CDX
+    append + fsync per call), so no rebuild can start between the queuing and the fsync. A target of another
+    generation than the current one is `StaleLocator`. The indexer follows through the CDX tail (`T` lines).
+  - Errors: `Tombstone { index, source }` (kind `Invalid`); `Commit` with `TombstoneNotCommitted` is also `Invalid`.
 - `Repository::sync_index()` and `rebuild_index()` exist since M18 (see the secondary-index paragraph below).
 - `train_dictionary(TrainOptions) -> TrainReport` (M20, `train.rs`): bottom-k deterministic sample of the live
   records (key `xxh3(uuid || segment || offset)`, warcinfo and stored size > 1 MiB excluded, heap of
@@ -390,7 +418,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   clone** (so the directory stays locked while an orphaned job runs). `create_collection` therefore runs
   create + writer spawn + registration as one spawned unit holding owned gate and create-lock guards; `open`'s
   scan and per-collection jobs and `create`'s blocking job carry a lock clone; `shutdown` runs in a spawned task
-  (a second or later call waits for it, the error goes to the first caller that observes completion).
+  (a second or later call waits for it, the error goes to the first caller that observes completion). M21:
+  `delete_collection` runs entirely in a spawned unit; `rename_collection` and record `delete` take their guards in
+  the caller (cancellable waits, nothing mutated) and run the mutation in a spawned unit owning them.
 - tokio features: `rt` and `sync` in the library; `rt-multi-thread`, `macros` and `time` in dev-dependencies
   only (the embedding application picks the runtime).
 - Reads `MASSTUFFY_RAW_IMPORT_CHECK` once at `Repository::open` (→ `RawCheck`) and passes it to every
@@ -468,18 +498,23 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
     holding the index handle (M19) keeps the file locked until it ends. Dropping everything without `shutdown` drains
     the index too (the channel closes when the last writer task and `Core` are gone).
   - Errors: `IndexOpen` (kind `Io`), `IndexLagging`, `IndexUnavailable` (kind `Unavailable`).
-  - Lock order (M20): `Core::gate`, `create_lock`, `index_rebuild`, `rebuild_sem` (a permit, rebuild units only),
-    per-collection `admin` (ascending uuid), `registry`, then the leaves `RebuildSlot::rb` (held during blocking I/O by
-    design, nothing else is taken meanwhile), `Published::snapshot`, pool mutexes, `Hub::dirty`, `Core::index`,
-    `Inner::index_task`. `train_sem` is taken with no other lock held. The writer task never takes the admin mutex or
-    the gate; the indexer takes neither.
+  - Lock order (M21): `Core::gate`, `index_rebuild`, `rebuild_sem` (a permit, rebuild units only),
+    per-collection `admin` (ascending uuid), per-collection `admission`, `create_lock`, `registry`, then the leaves
+    `Shared::slug` (taken only under the registry write lock), `RebuildSlot::rb` (held during blocking I/O by design,
+    nothing else is taken meanwhile), `Published::snapshot`, pool mutexes, `Hub::dirty`, `Core::index`,
+    `Inner::index_task`. **`create_lock` moved after `admin`** (it used to follow the gate): rename holds both, and
+    `create_collection` takes only gate then `create_lock`, never an `admin`. `train_sem` is taken with no other lock
+    held. The writer task never takes the admin mutex or the gate; the indexer takes neither. `delete_collection`
+    releases `admission` before it waits for `admin`.
   - Rebuild commands (M20): `IndexCmd::Stage { key, generation, from, reply }` (if the active generation is below:
     `DiscardStaged` + staged `Checkpoint{generation, from}`; `Ok(false)` otherwise), `Unstage` (`DiscardStaged` under
     the same condition) and `AwaitActive` (a one-collection barrier for the new generation). `Stage`/`Unstage` run
     between passes from `admin_ops` and set the purge flag; the in-memory `Track` is not touched: after the snapshot
     switch the next resolution finds `active < target` + the staged checkpoint and resumes there. The writer task
-    stores the new snapshot and its `cdx_len` together (`Published::switch`). Contract kept for M21:
-    `IndexCmd::Forget { key, reply }` (remove the track, `DropCollection` durable before replying).
+    stores the new snapshot and its `cdx_len` together (`Published::switch`). M21: `IndexCmd::Forget { key, reply }`
+    (`delete_collection`) runs between passes: it removes the hub entry and the track **before** its blocking job, then
+    applies `DropCollection` (durable); on failure `gc_pending` is set and the next pass's orphan GC drops the rows. The
+    caller has joined the collection's writer task first, so nothing can wake the feed again.
   - Deviation from the earlier text of this section ("a bounded queue of op batches", a purge task with a timer):
     tailing the CDX removes the queue, the loss on overflow and a second code path for catch-up.
 
@@ -549,7 +584,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M18 | `masstuffy`: secondary-index wiring, catch-up from checkpoint, `rebuild_index` | kill between CDX fsync and index apply → catch-up; rebuilt index equals incremental one (I8) |
 | M19 | `masstuffy`: `put_raw` from an envelope stream, `scan`, `search`, `get_by_id`, `get_by_url` | delegated frames with wrong dict_id rejected (both RawCheck levels); scan skips orphan bytes |
 | M20 | `masstuffy`: `train_dictionary`, `rebuild` orchestration | deterministic sample; reads keep working during a rebuild (concurrent test) |
-| M21 | `masstuffy`: `delete_collection`, `rename` | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates |
+| M21 | `masstuffy`: `delete_collection`, `rename_collection`, record deletion (`delete`, `delete_by_id`) | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates and renames; deletes wait for rebuilds; I8 after deletes |
 
 M3 and M4 are delivered together (one plan → code → review cycle).
 
@@ -677,10 +712,10 @@ These override the spec where they differ.
     case: the default stays 1 (durable index commits, nothing to replay after a crash); an operator who needs a
     little more put throughput can set 16.
 12. **Index file location** (M16): *Recommend* `<workdir>/data/index.redb`. **Decided (M18).**
-13. **Record deletion API** (M18): no milestone provides `delete(locator)`. *Recommend* a later milestone (with M21),
-    under the collection admin mutex (`prepare_tombstone` + `Writer::tombstone` via the writer task); the index then
-    follows through the CDX tail automatically. `T` lines written by other means (offline `Collection::tombstone`) are
-    already indexed.
+13. **Record deletion API** (M18; **Decided (M21)**): `CollectionHandle::delete(Vec<Located>)` and `delete_by_id`,
+    run under the collection admin mutex (so they wait for a running rebuild): `prepare_tombstone` off the writer, then
+    `Msg::Tombstone` to the writer task, reply after the CDX fsync. The index follows through the CDX tail; `T` lines
+    written by other means (offline `Collection::tombstone`) are indexed the same way. Deletion is logical (Q22).
 14. **Query freshness** (M18): the index is eventually consistent: queries may lag the CDX and, while a collection is
     re-indexed, answer empty; `Repository::sync_index()` is the read-your-writes barrier. *Recommend* as is.
     M19: scan reads the CDX and is not affected; index-backed queries follow Q14.
@@ -701,3 +736,12 @@ These override the spec where they differ.
     memory. *Adopted.*
 21. **`data/buffer/`** (M20): unused ([LEGACY] deviation from spec 4.4/5.2); training takes no admin mutex and runs one
     at a time per repository through a semaphore. *Adopted.*
+22. **`get` by locator and tombstones** (M21): `get`/`get_raw` by explicit locator are not tombstone-aware: a deleted
+    record stays readable through its locator until the next rebuild (then `StaleLocator`); scans and index-backed
+    queries hide it. A tombstone set per collection would need a full CDX scan at open. *Adopted.*
+23. **Record deletes and rebuilds** (M21): `delete` waits for a running rebuild (admin mutex) and is serialised per
+    collection, one fsync per call: callers batch locators. *Adopted* (revisit if delete throughput matters).
+24. **Failed trash rename** (M21): the collection stays registered but closed (`UnknownCollection` on every
+    operation, slug still taken); a second `delete_collection` retries, a reopen loads it normally. *Adopted.*
+25. **Skipped collections** (M21): cannot be deleted or renamed through the API (not loaded: `UnknownCollection`);
+    repairing them is an operator action and their slug stays reserved. *Adopted.*

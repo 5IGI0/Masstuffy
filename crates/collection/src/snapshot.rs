@@ -73,6 +73,16 @@ impl Snapshot {
         })
     }
 
+    /// The same generation, context and segment reader (no file reopened) with another manifest
+    /// (rename).
+    pub(crate) fn with_manifest(&self, manifest: Arc<Manifest>) -> Snapshot {
+        Snapshot {
+            manifest,
+            ctx: Arc::clone(&self.ctx),
+            reader: self.reader.clone(),
+        }
+    }
+
     /// The segment reader (recovery).
     pub(crate) fn reader(&self) -> &Reader {
         &self.reader

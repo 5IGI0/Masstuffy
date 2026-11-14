@@ -18,6 +18,47 @@ pub struct Located {
     pub entry: Entry<'static>,
 }
 
+/// Names a loaded collection (by slug or by uuid).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionRef<'a> {
+    /// The current slug.
+    Slug(&'a str),
+    /// The uuid.
+    Id(CollectionId),
+}
+
+impl<'a> From<&'a str> for CollectionRef<'a> {
+    fn from(s: &'a str) -> Self {
+        CollectionRef::Slug(s)
+    }
+}
+
+impl From<CollectionId> for CollectionRef<'_> {
+    fn from(id: CollectionId) -> Self {
+        CollectionRef::Id(id)
+    }
+}
+
+/// What `Repository::delete_collection` did.
+#[derive(Debug, Clone)]
+pub struct DeletedCollection {
+    /// The collection uuid.
+    pub id: CollectionId,
+    /// The slug it had (now free, unless `slug_reserved`).
+    pub slug: Arc<str>,
+    /// The trash directory was removed (false: the next open sweeps it).
+    pub trash_removed: bool,
+    /// The parent fsync after the trash rename failed: the deletion may be undone by a crash, so
+    /// the slug stays reserved until the repository is reopened.
+    pub slug_reserved: bool,
+    /// The index rows were dropped (false: index failure; dropped by the orphan GC at the next
+    /// pass, `rebuild_index` or open).
+    pub index_dropped: bool,
+}
+
+/// Most locators accepted by one `CollectionHandle::delete` call.
+pub const MAX_DELETE_TARGETS: usize = 65_536;
+
 /// One delegated record for `put_raw`.
 #[derive(Debug)]
 pub struct RawItem {

@@ -100,30 +100,38 @@ impl Core {
     }
 }
 
-struct Registry {
-    by_slug: HashMap<Arc<str>, CollectionId>,
-    by_id: HashMap<CollectionId, Arc<Shared>>,
+pub(crate) struct Registry {
+    pub(crate) by_slug: HashMap<Arc<str>, CollectionId>,
+    pub(crate) by_id: HashMap<CollectionId, Arc<Shared>>,
     /// Slugs of collections skipped at open whose manifest could be read: `create_collection`
     /// refuses them so a later open does not find a duplicate.
-    reserved: HashSet<String>,
+    pub(crate) reserved: HashSet<String>,
 }
 
-/// Lock order: `Core::gate`, then `Inner::create_lock`, then `Inner::index_rebuild`, then
-/// `Core::rebuild_sem` (a permit, rebuild units only), then the `admin` mutexes of collections
-/// (several only in ascending [`CollectionId`] order), then `registry`, then the leaves
-/// `RebuildSlot::rb`, `Published::snapshot`, the pool mutexes, `Hub::dirty`, `Core::index` and
-/// `Inner::index_task` (never held while taking another lock, nor across `.await`;
-/// `RebuildSlot::rb` is held during blocking I/O by design and nothing else is taken meanwhile).
-/// `Core::train_sem` is taken with no other lock held.
+/// Lock order (M21): `Core::gate`, then `Inner::index_rebuild`, then `Core::rebuild_sem` (a
+/// permit, rebuild units only), then the per-collection `admin` mutexes (several only in
+/// ascending [`CollectionId`] order), then the per-collection `Shared::admission`, then
+/// `Inner::create_lock`, then `registry`, then the leaves `Shared::slug` (taken only under the
+/// registry write lock), `RebuildSlot::rb`, `Published::snapshot`, the pool mutexes,
+/// `Hub::dirty`, `Core::index` and `Inner::index_task` (never held while taking another lock, nor
+/// across `.await`; `RebuildSlot::rb` is held during blocking I/O by design and nothing else is
+/// taken meanwhile). `Core::train_sem` is taken with no other lock held.
+///
+/// `create_lock` is taken after `admin` (rename holds both); `create_collection` takes only
+/// `gate` then `create_lock` and never waits for an `admin`. The admin operations
+/// (`delete_collection`, `rename_collection`, `CollectionHandle::delete`) never take `gate`: they
+/// check `Core::is_closing` after acquiring `admin` instead (shutdown holds every `admin` it
+/// took until it ends). `delete_collection` releases `admission` before it waits for `admin`.
 /// Semaphores are acquired after `gate` (inflight before prepare). A std lock is never held
 /// across `.await` and a registry guard is dropped before anything else is taken. The indexer
 /// task holds no lock across `.await`; its per-collection state is owned by the task.
-struct Inner {
-    core: Arc<Core>,
-    registry: RwLock<Registry>,
-    /// Serialises `create_collection` (spec 04 4.1 step 1). Held across the create's
-    /// `spawn_blocking` on purpose: slug check, create and registration are one critical section.
-    create_lock: Arc<tokio::sync::Mutex<()>>,
+pub(crate) struct Inner {
+    pub(crate) core: Arc<Core>,
+    pub(crate) registry: RwLock<Registry>,
+    /// Serialises `create_collection` (spec 04 4.1 step 1) and `rename_collection` (slug
+    /// uniqueness, I7). Held across the create's `spawn_blocking` on purpose: slug check, create
+    /// and registration are one critical section.
+    pub(crate) create_lock: Arc<tokio::sync::Mutex<()>>,
     /// Set by the first `shutdown` call, which runs the shutdown in a spawned task so that
     /// cancelling the caller cannot leave it half done.
     shutdown_started: AtomicBool,
@@ -138,8 +146,14 @@ struct Inner {
 }
 
 impl Inner {
-    fn registry(&self) -> std::sync::RwLockReadGuard<'_, Registry> {
+    pub(crate) fn registry(&self) -> std::sync::RwLockReadGuard<'_, Registry> {
         self.registry.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn registry_mut(&self) -> std::sync::RwLockWriteGuard<'_, Registry> {
+        self.registry
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -152,7 +166,7 @@ impl Inner {
 /// unacknowledged requests are covered by recovery.
 #[derive(Clone)]
 pub struct Repository {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 fn io_err(op: &'static str, path: &Path) -> impl FnOnce(io::Error) -> Error {
@@ -392,11 +406,11 @@ impl Repository {
                 return Err(Error::Internal("lock released during open"));
             };
             let shared = spawn_writer(&core, id, *coll, lock);
-            registry.by_slug.insert(Arc::clone(&shared.slug), id);
+            registry.by_slug.insert(shared.slug(), id);
             feeds.push(Arc::clone(&shared.feed));
             info!(
                 collection = %id,
-                slug = %shared.slug,
+                slug = %shared.slug(),
                 entries = rec.entries,
                 scan = ?rec.scan,
                 "collection loaded"
@@ -406,7 +420,7 @@ impl Repository {
             }
             report.loaded.push(LoadedCollection {
                 id,
-                slug: Arc::clone(&shared.slug),
+                slug: shared.slug(),
                 recovery: *rec,
             });
             registry.by_id.insert(id, shared);
@@ -471,7 +485,7 @@ impl Repository {
         &self.inner.core
     }
 
-    fn handle(&self, shared: Arc<Shared>) -> CollectionHandle {
+    pub(crate) fn handle(&self, shared: Arc<Shared>) -> CollectionHandle {
         CollectionHandle {
             core: Arc::clone(&self.inner.core),
             shared,
@@ -560,6 +574,28 @@ impl Repository {
         }
     }
 
+    /// Resolves a [`CollectionRef`](crate::types::CollectionRef) to a loaded collection.
+    ///
+    /// # Errors
+    ///
+    /// `UnknownCollection`, `ShuttingDown`.
+    pub(crate) fn collection_ref(
+        &self,
+        r: crate::types::CollectionRef<'_>,
+    ) -> Result<Arc<Shared>, Error> {
+        match r {
+            crate::types::CollectionRef::Slug(s) => {
+                self.check_open()?;
+                let shared = {
+                    let reg = self.registry();
+                    reg.by_slug.get(s).and_then(|id| reg.by_id.get(id)).cloned()
+                };
+                shared.ok_or_else(|| Error::UnknownCollection(s.to_owned()))
+            }
+            crate::types::CollectionRef::Id(id) => self.shared(id),
+        }
+    }
+
     pub(crate) fn shared(&self, id: CollectionId) -> Result<Arc<Shared>, Error> {
         self.check_open()?;
         self.registry()
@@ -583,6 +619,9 @@ impl Repository {
     /// WARC bytes: exactly one record, digest verified, `record_id` and `warc_type` cross-checked
     /// with the entry.
     ///
+    /// Deletion is logical: a record deleted with `delete` stays readable by its explicit locator
+    /// until the next rebuild removes its bytes; `scan` and index queries already hide it (Q22).
+    ///
     /// # Errors
     ///
     /// `ShuttingDown`, `UnknownCollection`, `StaleLocator` (generation differs from the active
@@ -596,7 +635,8 @@ impl Repository {
         }
     }
 
-    /// The stored bytes and their encoding, without decoding (spec 04 4.3 "En brut").
+    /// The stored bytes and their encoding, without decoding (spec 04 4.3 "En brut"). Like
+    /// [`get`](Self::get), it still returns a deleted record until the next rebuild (Q22).
     ///
     /// # Errors
     ///
@@ -784,6 +824,14 @@ async fn index_request(
     core: &Core,
     make: fn(oneshot::Sender<Result<(), Error>>) -> IndexCmd,
 ) -> Result<(), Error> {
+    index_request_with(core, make).await
+}
+
+/// [`index_request`] with a closure (a command that carries more than the reply channel).
+pub(crate) async fn index_request_with(
+    core: &Core,
+    make: impl FnOnce(oneshot::Sender<Result<(), Error>>) -> IndexCmd,
+) -> Result<(), Error> {
     let (tx, rx) = oneshot::channel();
     core.index_link
         .tx
@@ -873,12 +921,12 @@ async fn create_unit(
         .registry
         .write()
         .unwrap_or_else(PoisonError::into_inner);
-    reg.by_slug.insert(Arc::clone(&shared.slug), id);
+    reg.by_slug.insert(shared.slug(), id);
     reg.by_id.insert(id, Arc::clone(&shared));
     Ok(shared)
 }
 
-fn collection_dir(dir: &Path, id: CollectionId) -> PathBuf {
+pub(crate) fn collection_dir(dir: &Path, id: CollectionId) -> PathBuf {
     layout::repository_dir(dir).join(id.to_string())
 }
 
@@ -936,14 +984,16 @@ fn spawn_writer(
     core.index_link.wake(&feed);
     Arc::new(Shared {
         id,
-        slug,
+        slug: RwLock::new(slug),
         tx,
         published,
         feed,
         preparers: PreparerPool::new(
             usize::try_from(core.config.preparers_per_collection).unwrap_or(1),
         ),
-        admin: tokio::sync::Mutex::new(()),
+        admin: Arc::new(tokio::sync::Mutex::new(())),
+        admission: tokio::sync::RwLock::new(()),
+        deleted: AtomicBool::new(false),
         rebuild,
         task: Mutex::new(Some(handle)),
         #[cfg(test)]

@@ -12,8 +12,8 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use masstuffy_cdx::Entry;
 use masstuffy_collection::{
-    Collection, CollectionId, CommitError, OldGeneration, Options, Prepared, RebuildReport,
-    Rebuilt, RecoveryOptions, Snapshot, Writer,
+    Collection, CollectionId, CommitError, Manifest, OldGeneration, Options, Prepared,
+    PreparedTombstone, RebuildReport, Rebuilt, RecoveryOptions, Snapshot, Writer, set_slug,
 };
 use masstuffy_durable::DirLock;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -68,6 +68,52 @@ pub(crate) enum Msg {
     /// Rebuild: after the requests queued before this message, take the `Rebuilder` of the slot
     /// and run its `finish` (final delta, manifest swap), then publish the new generation.
     Finish(oneshot::Sender<FinishReply>),
+    /// Record deletion: append the tombstones (one CDX append + fsync), reply after the fsync.
+    Tombstone(TombstoneRequest),
+    /// Rename: rewrite the manifest slug and publish the new snapshot.
+    SetSlug(SlugRequest),
+}
+
+/// Prepared tombstones of one `CollectionHandle::delete` call.
+pub(crate) struct TombstoneRequest {
+    pub(crate) items: Vec<PreparedTombstone>,
+    pub(crate) reply: oneshot::Sender<Result<(), WriteError>>,
+}
+
+/// A rename.
+pub(crate) struct SlugRequest {
+    pub(crate) slug: Arc<str>,
+    pub(crate) reply: oneshot::Sender<Result<(), SlugFail>>,
+}
+
+/// Whether the namespace holds the new slug after a failed rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlugApplied {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// A failed rename.
+pub(crate) struct SlugFail {
+    pub(crate) source: masstuffy_collection::Error,
+    pub(crate) applied: SlugApplied,
+}
+
+/// What the run loop does between groups.
+enum Control {
+    Finish(oneshot::Sender<FinishReply>),
+    Tombstone(TombstoneRequest),
+    SetSlug(SlugRequest),
+}
+
+/// Points of `delete_collection` where tests can "crash" it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeletePoint {
+    /// The writer task is stopped, nothing was renamed.
+    Stopped,
+    /// The directory was moved to the trash (and the parent fsynced), the registry is untouched.
+    Trashed,
 }
 
 /// A committed rebuild: what the rebuild unit needs to finish up.
@@ -207,6 +253,11 @@ pub(crate) struct TestHooks {
     pub(crate) after_prepare_reached: tokio::sync::watch::Sender<u64>,
     /// The next copy round pauses (slot mutex held) until released.
     pub(crate) copy_gate: std::sync::Mutex<Option<Arc<CopyGate>>>,
+    /// `delete_collection` returns `Internal("injected delete crash")` at that point, with no
+    /// cleanup.
+    pub(crate) delete_crash: std::sync::Mutex<Option<DeletePoint>>,
+    /// Last delete point reached.
+    pub(crate) delete_reached: tokio::sync::watch::Sender<Option<DeletePoint>>,
 }
 
 /// `(entered, released)` of a paused copy round.
@@ -255,6 +306,8 @@ impl Default for TestHooks {
             after_prepare: std::sync::Mutex::new(None),
             after_prepare_reached: tokio::sync::watch::channel(0).0,
             copy_gate: std::sync::Mutex::new(None),
+            delete_crash: std::sync::Mutex::new(None),
+            delete_reached: tokio::sync::watch::channel(None).0,
         }
     }
 }
@@ -452,7 +505,15 @@ impl WriterTask {
                 None => match self.rx.recv().await {
                     Some(Msg::Commit(r)) => r,
                     Some(Msg::Finish(r)) => {
-                        self.run_finish(r).await;
+                        self.run_control(Control::Finish(r)).await;
+                        continue;
+                    }
+                    Some(Msg::Tombstone(r)) => {
+                        self.run_control(Control::Tombstone(r)).await;
+                        continue;
+                    }
+                    Some(Msg::SetSlug(r)) => {
+                        self.run_control(Control::SetSlug(r)).await;
                         continue;
                     }
                     Some(Msg::Shutdown(ack)) => {
@@ -469,9 +530,9 @@ impl WriterTask {
             self.hooks.before_drain().await;
             let mut bytes = first.bytes;
             let mut group = vec![first];
-            // A `Finish` read while draining runs right after this group (`pending` and `finish`
-            // are never both set: the loop stops at the first of them).
-            let mut finish: Option<oneshot::Sender<FinishReply>> = None;
+            // A control message read while draining runs right after this group (`pending` and
+            // `control` are never both set: the loop stops at the first of them).
+            let mut control: Option<Control> = None;
             while stop.is_none() && group.len() < self.group_requests_cap {
                 match self.rx.try_recv() {
                     Ok(Msg::Commit(r)) => match bytes.checked_add(r.bytes) {
@@ -485,7 +546,15 @@ impl WriterTask {
                         }
                     },
                     Ok(Msg::Finish(r)) => {
-                        finish = Some(r);
+                        control = Some(Control::Finish(r));
+                        break;
+                    }
+                    Ok(Msg::Tombstone(r)) => {
+                        control = Some(Control::Tombstone(r));
+                        break;
+                    }
+                    Ok(Msg::SetSlug(r)) => {
+                        control = Some(Control::SetSlug(r));
                         break;
                     }
                     Ok(Msg::Shutdown(ack)) => stop = Some(Some(ack)),
@@ -494,8 +563,8 @@ impl WriterTask {
                 }
             }
             self.commit_group(group).await;
-            if let Some(r) = finish.take() {
-                self.run_finish(r).await;
+            if let Some(c) = control.take() {
+                self.run_control(c).await;
             }
         }
         self.final_checkpoint().await;
@@ -506,6 +575,111 @@ impl WriterTask {
         if self.hooks.panic_on_exit.load(Ordering::Acquire) {
             panic!("injected writer task panic");
         }
+    }
+
+    async fn run_control(&mut self, c: Control) {
+        match c {
+            Control::Finish(r) => self.run_finish(r).await,
+            Control::Tombstone(r) => self.run_tombstone(r).await,
+            Control::SetSlug(r) => self.run_set_slug(r).await,
+        }
+    }
+
+    fn target(&self) -> Target {
+        Target {
+            dir: self.dir.clone(),
+            opts: self.opts,
+            resolver: Arc::clone(&self.resolver),
+            slot: Arc::clone(&self.rebuild),
+        }
+    }
+
+    /// Appends the tombstones (one CDX append and fsync) in the blocking pool, publishes the new
+    /// CDX length and replies after the fsync.
+    async fn run_tombstone(&mut self, req: TombstoneRequest) {
+        let TombstoneRequest { items, reply } = req;
+        #[cfg(test)]
+        let drop_first = self
+            .hooks
+            .drop_writer_next
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(not(test))]
+        let drop_first = false;
+        let writer = self.writer.take();
+        let target = self.target();
+        let joined = tokio::task::spawn_blocking(move || {
+            tombstone_blocking(writer, &items, &target, drop_first)
+        })
+        .await;
+        let out = match joined {
+            Ok(o) => o,
+            Err(e) => {
+                error!(collection = %self.id, "tombstone task failed: {e}");
+                self.writer = None;
+                let _ = reply.send(Err(WriteError::Internal("tombstone task panicked")));
+                return;
+            }
+        };
+        self.writer = out.writer;
+        if let Some(s) = out.new_snapshot {
+            self.published.store(s);
+            // A reopened writer starts a fresh checkpoint interval, as in `commit_group`.
+            if let Some(w) = &self.writer {
+                self.last_checkpoint_len = w.cdx_len();
+            }
+        }
+        if let Some(w) = &self.writer {
+            let len = w.cdx_len();
+            if self.published.cdx_len.swap(len, Ordering::Release) != len {
+                self.link.wake(&self.feed);
+            }
+        }
+        // A dropped receiver means the caller cancelled; the write stands.
+        let _ = reply.send(out.result);
+        self.maybe_checkpoint().await;
+    }
+
+    /// Rewrites the manifest slug in the blocking pool and publishes the new snapshot (same
+    /// generation, so the retired snapshot is kept). The writer task is the only place that
+    /// reopens a collection, and `Collection::open` sweeps `.tmp-*` in the directory: it must
+    /// never run concurrently with the `atomic_write` of the manifest.
+    async fn run_set_slug(&mut self, req: SlugRequest) {
+        let SlugRequest { slug, reply } = req;
+        let writer = self.writer.take();
+        let target = self.target();
+        let current = self.published.load();
+        let lock = Arc::clone(&self._lock);
+        let joined = tokio::task::spawn_blocking(move || {
+            let _lock = lock;
+            slug_blocking(writer, &current, &slug, &target)
+        })
+        .await;
+        let out = match joined {
+            Ok(o) => o,
+            Err(e) => {
+                error!(collection = %self.id, "rename task failed: {e}");
+                self.writer = None;
+                let _ = reply.send(Err(SlugFail {
+                    source: masstuffy_collection::Error::Internal("rename task panicked"),
+                    applied: SlugApplied::Unknown,
+                }));
+                return;
+            }
+        };
+        self.writer = out.writer;
+        if let Some(s) = out.publish {
+            self.published.store(s);
+        }
+        if out.reopened
+            && let Some(w) = &self.writer
+        {
+            let len = w.cdx_len();
+            self.last_checkpoint_len = len;
+            if self.published.cdx_len.swap(len, Ordering::Release) != len {
+                self.link.wake(&self.feed);
+            }
+        }
+        let _ = reply.send(out.result);
     }
 
     /// Answers `Stale` to every request prepared for another generation than the writer's, and
@@ -568,12 +742,7 @@ impl WriterTask {
         let drop_first = false;
 
         let writer = self.writer.take();
-        let target = Target {
-            dir: self.dir.clone(),
-            opts: self.opts,
-            resolver: Arc::clone(&self.resolver),
-            slot: Arc::clone(&self.rebuild),
-        };
+        let target = self.target();
         let job_lens = lens.clone();
         #[cfg(test)]
         let faults = Arc::clone(&self.hooks);
@@ -672,12 +841,7 @@ impl WriterTask {
     /// blocking job owns the writer meanwhile (`self.writer` is `None`, no request is drained).
     async fn run_finish(&mut self, reply: oneshot::Sender<FinishReply>) {
         let writer = self.writer.take();
-        let target = Target {
-            dir: self.dir.clone(),
-            opts: self.opts,
-            resolver: Arc::clone(&self.resolver),
-            slot: Arc::clone(&self.rebuild),
-        };
+        let target = self.target();
         let lock = Arc::clone(&self._lock);
         let joined = tokio::task::spawn_blocking(move || {
             let _lock = lock;
@@ -888,6 +1052,124 @@ fn finish_blocking(writer: Option<Writer>, target: &Target) -> FinishOutcome {
                             source,
                             committed: false,
                         }),
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct TombOutcome {
+    writer: Option<Writer>,
+    new_snapshot: Option<Arc<Snapshot>>,
+    result: Result<(), WriteError>,
+}
+
+/// Runs in the blocking pool: reopens a lost, poisoned or test-dropped writer, then appends the
+/// tombstones. After a poisoning error the collection is reopened and the append retried once (a
+/// duplicated `T` line is harmless); any other error keeps the writer.
+fn tombstone_blocking(
+    writer: Option<Writer>,
+    items: &[PreparedTombstone],
+    target: &Target,
+    drop_first: bool,
+) -> TombOutcome {
+    let mut out = TombOutcome {
+        writer: None,
+        new_snapshot: None,
+        result: Ok(()),
+    };
+    let mut w = match writer {
+        Some(w) if !drop_first && !w.is_poisoned() => w,
+        other => {
+            drop(other);
+            match reopen(&target.dir, &target.opts, &target.resolver, &target.slot) {
+                Ok((w, s)) => {
+                    out.new_snapshot = Some(s);
+                    w
+                }
+                Err(e) => {
+                    out.result = Err(WriteError::Reopen(Arc::new(e)));
+                    return out;
+                }
+            }
+        }
+    };
+    match w.tombstone(items) {
+        Ok(_) => out.writer = Some(w),
+        Err(e) if w.is_poisoned() || matches!(e, CommitError::Poisoned) => {
+            warn!(dir = %target.dir.display(), "tombstone failed ({e}), reopening the collection");
+            drop(w);
+            match reopen(&target.dir, &target.opts, &target.resolver, &target.slot) {
+                Ok((mut w2, s)) => {
+                    out.new_snapshot = Some(s);
+                    if let Err(e) = w2.tombstone(items) {
+                        out.result = Err(WriteError::Commit(Arc::new(e)));
+                    }
+                    out.writer = Some(w2);
+                }
+                Err(re) => out.result = Err(WriteError::Reopen(Arc::new(re))),
+            }
+        }
+        Err(e) => {
+            out.result = Err(WriteError::Commit(Arc::new(e)));
+            out.writer = Some(w);
+        }
+    }
+    out
+}
+
+struct SlugOutcome {
+    writer: Option<Writer>,
+    publish: Option<Arc<Snapshot>>,
+    /// The writer was reopened from disk.
+    reopened: bool,
+    result: Result<(), SlugFail>,
+}
+
+/// Runs in the blocking pool: `set_slug`; on failure the writer is dropped and the collection is
+/// reopened, which tells whether the namespace holds the new slug.
+fn slug_blocking(
+    writer: Option<Writer>,
+    current: &Snapshot,
+    slug: &str,
+    target: &Target,
+) -> SlugOutcome {
+    match set_slug(current, slug) {
+        Ok(s) => SlugOutcome {
+            writer,
+            publish: Some(Arc::new(s)),
+            reopened: false,
+            result: Ok(()),
+        },
+        Err(source) => {
+            drop(writer);
+            match reopen(&target.dir, &target.opts, &target.resolver, &target.slot) {
+                Ok((w, s)) => {
+                    let applied = if s.manifest().slug() == slug {
+                        SlugApplied::Yes
+                    } else {
+                        SlugApplied::No
+                    };
+                    SlugOutcome {
+                        writer: Some(w),
+                        publish: Some(s),
+                        reopened: true,
+                        result: Err(SlugFail { source, applied }),
+                    }
+                }
+                Err(re) => {
+                    error!(dir = %target.dir.display(), "reopen after a failed rename failed: {re}");
+                    let applied = match Manifest::load(&target.dir) {
+                        Ok(m) if m.slug() == slug => SlugApplied::Yes,
+                        Ok(_) => SlugApplied::No,
+                        Err(_) => SlugApplied::Unknown,
+                    };
+                    SlugOutcome {
+                        writer: None,
+                        publish: None,
+                        reopened: false,
+                        result: Err(SlugFail { source, applied }),
                     }
                 }
             }

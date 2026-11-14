@@ -102,14 +102,15 @@ impl CollectionHandle {
     ///
     /// # Errors
     ///
-    /// `ShuttingDown`, `InvalidOptions`, `Read`, `StaleLocator` (a rebuild removed the sampled
-    /// generation: retry), `Train`, `Dict`, `Internal`, `Join`.
+    /// `ShuttingDown`, `UnknownCollection` (deleted), `InvalidOptions`, `Read`, `StaleLocator` (a
+    /// rebuild removed the sampled generation: retry), `Train`, `Dict`, `Internal`, `Join`.
     pub async fn train_dictionary(&self, opts: TrainOptions) -> Result<TrainReport, Error> {
         let core = &self.core;
         validate(&opts, core)?;
         if core.closed.load(std::sync::atomic::Ordering::Acquire) || core.is_closing() {
             return Err(Error::ShuttingDown);
         }
+        self.shared.check_live()?;
         tokio::spawn(train_unit(Arc::clone(core), Arc::clone(&self.shared), opts))
             .await
             .map_err(Error::Join)?
@@ -148,7 +149,7 @@ async fn train_unit(
     }
     let lock = core.lock_arc().ok_or(Error::ShuttingDown)?;
     let (snap, end) = shared.published.tail();
-    let slug = Arc::clone(&shared.slug);
+    let slug = shared.slug();
     tokio::task::spawn_blocking(move || {
         let _lock = lock;
         train_blocking(&core, &shared, &snap, end, &slug, &opts)

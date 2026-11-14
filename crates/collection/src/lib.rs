@@ -45,6 +45,7 @@ mod prepare;
 mod range;
 mod rebuild;
 mod recover;
+mod rename;
 mod resolve;
 mod snapshot;
 #[cfg(test)]
@@ -74,6 +75,7 @@ pub use recover::{
     DEFAULT_VERIFY_LAST, FullScanReason, MAX_REPORTED_UNKNOWN, MAX_VERIFY_LAST, RecoveryOptions,
     RecoveryReport, Repair, RepairPolicy, RepairReason, ScanMode, TornTail,
 };
+pub use rename::set_slug;
 pub use resolve::{DictResolver, ResolveError};
 pub use snapshot::{RawEncoding, ReadCtx, Snapshot};
 pub use tombstone::PreparedTombstone;

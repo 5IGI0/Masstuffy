@@ -77,7 +77,7 @@ pub struct SearchPage {
     pub next: Option<SearchCursor>,
 }
 
-fn located_of(hit: Hit) -> Located {
+pub(crate) fn located_of(hit: Hit) -> Located {
     Located {
         collection: CollectionId::from_u128(hit.collection.get()),
         generation: hit.generation,
@@ -93,7 +93,7 @@ fn map_index_err(e: masstuffy_index::Error) -> Error {
     }
 }
 
-fn check_key(s: &str, what: &'static str) -> Result<(), Error> {
+pub(crate) fn check_key(s: &str, what: &'static str) -> Result<(), Error> {
     if s.is_empty() || s.len() > MAX_QUERY_LEN {
         return Err(Error::InvalidQuery(what));
     }
@@ -101,7 +101,7 @@ fn check_key(s: &str, what: &'static str) -> Result<(), Error> {
 }
 
 /// One read permit, taken after the shutdown check.
-async fn read_permit(core: &Core) -> Result<OwnedSemaphorePermit, Error> {
+pub(crate) async fn read_permit(core: &Core) -> Result<OwnedSemaphorePermit, Error> {
     if core.closed.load(Ordering::Acquire) {
         return Err(Error::ShuttingDown);
     }
@@ -187,6 +187,7 @@ impl CollectionHandle {
         if query.limit == 0 || query.limit > MAX_SEARCH_LIMIT {
             return Err(Error::InvalidQuery("search limit"));
         }
+        self.shared.check_live()?;
         let permit = read_permit(&self.core).await?;
         let key = CollectionKey::new(self.shared.id.as_u128());
         let pattern = pattern.clone();
@@ -220,6 +221,7 @@ impl CollectionHandle {
         date: Option<WarcDate>,
     ) -> Result<Option<Located>, Error> {
         check_key(url, "url")?;
+        self.shared.check_live()?;
         let permit = read_permit(&self.core).await?;
         let (hit, _permit) = self.lookup_url(url, date, permit).await?;
         Ok(hit.map(located_of))
@@ -238,6 +240,7 @@ impl CollectionHandle {
         date: Option<WarcDate>,
     ) -> Result<Option<(Located, Vec<u8>)>, Error> {
         check_key(url, "url")?;
+        self.shared.check_live()?;
         let permit = read_permit(&self.core).await?;
         let (hit, permit) = self.lookup_url(url, date, permit).await?;
         let Some(located) = hit.map(located_of) else {
@@ -320,7 +323,7 @@ impl Repository {
     }
 }
 
-async fn lookup_id(
+pub(crate) async fn lookup_id(
     core: &Core,
     record_id: &str,
     collection: Option<CollectionId>,

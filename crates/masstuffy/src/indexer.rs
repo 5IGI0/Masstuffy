@@ -22,7 +22,7 @@
 //! indexer's read sees the new length, or the writer's test-and-set happens after the pop and
 //! queues the feed again. The mutex provides the ordering; no fences are needed.
 //!
-//! # Rebuild commands and the contract kept for M21
+//! # Rebuild and delete commands
 //!
 //! A rebuild (`rebuild.rs`) talks to the indexer with three commands. [`IndexCmd::Stage`] runs at
 //! rebuild start: it clears any staged rows of the new generation and puts
@@ -35,8 +35,14 @@
 //! (`admin_ops`), set `purge_pending`, and never touch the in-memory `Track` (its cursor stays on
 //! the old generation until the snapshot switches). The writer task stores a new-generation
 //! snapshot and its `cdx_len` together (`Published::switch`), and a rebuild never runs while
-//! `rebuild_index` holds the admin mutexes. M21 adds `IndexCmd::Forget { key, reply }`: remove the
-//! `Track` and apply `DropCollection` (durable) before replying.
+//! `rebuild_index` holds the admin mutexes.
+//!
+//! [`IndexCmd::Forget`] (`delete_collection`) runs between passes too. It removes the collection
+//! from the hub and from the tracks **before** its blocking job (so no later pass can recreate
+//! the track), then applies `DropCollection` (durable, structural). If that apply fails, the
+//! orphan GC of the next pass drops the rows: the track is gone and the key is not in `keep`. The
+//! caller guarantees that the collection's writer task has exited, so nothing can wake the feed
+//! again.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -129,6 +135,13 @@ impl Hub {
         self.q().queue.is_empty()
     }
 
+    /// Forgets `key`: removes it from the queue and the membership set.
+    fn remove(&self, key: CollectionKey) {
+        let mut g = self.q();
+        g.queued.remove(&key);
+        g.queue.retain(|f| f.key != key);
+    }
+
     fn queued(&self) -> Vec<Arc<IndexFeed>> {
         self.q().queue.iter().cloned().collect()
     }
@@ -200,12 +213,23 @@ pub(crate) enum IndexCmd {
         generation: u32,
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    /// delete_collection: forget the collection (remove it from the hub and the tracks), then apply
+    /// `DropCollection` (durable: structural). The caller guarantees that no writer task can wake
+    /// the feed any more (its writer task has exited).
+    Forget {
+        key: CollectionKey,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     /// Drain the hub completely, flush, ack, exit.
     Shutdown(oneshot::Sender<()>),
 }
 
-/// A `Stage` or `Unstage` waiting for its turn between passes.
+/// A `Stage`, `Unstage` or `Forget` waiting for its turn between passes.
 enum AdminOp {
+    Forget {
+        key: CollectionKey,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     Stage {
         key: CollectionKey,
         generation: u32,
@@ -978,6 +1002,9 @@ impl Indexer {
                 generation,
                 reply,
             }),
+            IndexCmd::Forget { key, reply } => {
+                self.admin_ops.push_back(AdminOp::Forget { key, reply });
+            }
             IndexCmd::AwaitActive {
                 key,
                 generation,
@@ -1020,10 +1047,49 @@ impl Indexer {
         });
     }
 
-    /// Runs one `Stage` / `Unstage` in the blocking pool and replies.
+    /// `Forget`: drops the hub entry and the track, then `DropCollection` in the blocking pool.
+    async fn forget_step(&mut self, key: CollectionKey, reply: oneshot::Sender<Result<(), Error>>) {
+        // Before the blocking job: no later pass may recreate the track.
+        self.hub.remove(key);
+        self.tracks.remove(&key);
+        let index = Arc::clone(&self.backend.index);
+        let lock = Arc::clone(&self.lock);
+        #[cfg(test)]
+        let hooks = Arc::clone(&self.hooks);
+        #[cfg(not(test))]
+        let hooks = ();
+        let joined = tokio::task::spawn_blocking(move || {
+            let _lock = lock;
+            let index = index; // dropped before the lock
+            apply(&*index, &[Op::DropCollection { collection: key }], &hooks)
+        })
+        .await;
+        let res = match joined {
+            Ok(Ok(())) => {
+                self.purge_pending = true;
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                self.gc_pending = true;
+                Err(Error::IndexQuery(e))
+            }
+            Err(e) => {
+                error!("index forget task failed: {e}");
+                self.gc_pending = true;
+                Err(Error::IndexUnavailable)
+            }
+        };
+        let _ = reply.send(res);
+    }
+
+    /// Runs one `Stage` / `Unstage` / `Forget` in the blocking pool and replies.
     async fn admin_step(&mut self) {
         let Some(op) = self.admin_ops.pop_front() else {
             return;
+        };
+        let op = match op {
+            AdminOp::Forget { key, reply } => return self.forget_step(key, reply).await,
+            op => op,
         };
         let index = Arc::clone(&self.backend.index);
         let lock = Arc::clone(&self.lock);
@@ -1041,6 +1107,7 @@ impl Indexer {
             AdminOp::Unstage {
                 key, generation, ..
             } => (*key, *generation, None),
+            AdminOp::Forget { .. } => return,
         };
         let joined = tokio::task::spawn_blocking(move || {
             let _lock = lock;
@@ -1066,6 +1133,7 @@ impl Indexer {
             AdminOp::Unstage { reply, .. } => {
                 let _ = reply.send(res.map(|_| ()));
             }
+            AdminOp::Forget { .. } => {}
         }
     }
 

@@ -1,7 +1,7 @@
 //! One loaded collection: the shared state, the public handle, and the put paths.
 
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use masstuffy_collection::{CollectionId, PrepareError, Prepared, Preparer, RawCheck};
 use masstuffy_warc::{Record, RecordBuilder};
@@ -17,20 +17,55 @@ use crate::writer::{Committed, Msg, Published, Rejected, Reply, Request, WriteEr
 /// One per collection; holds the only long-lived `mpsc::Sender` of its writer task.
 pub(crate) struct Shared {
     pub(crate) id: CollectionId,
-    pub(crate) slug: Arc<str>,
+    /// Current slug. Std RwLock, leaf: written only by the rename unit while it holds the
+    /// registry write lock; read with a clone of the `Arc`.
+    pub(crate) slug: RwLock<Arc<str>>,
     pub(crate) tx: mpsc::Sender<Msg>,
     pub(crate) published: Arc<Published>,
     /// What the secondary index tails for this collection.
     pub(crate) feed: Arc<crate::indexer::IndexFeed>,
     pub(crate) preparers: PreparerPool,
-    /// Per-collection admin mutex (architecture 4.7): rebuild, delete, rename, record deletion;
-    /// not training. Taken by shutdown and `rebuild_index` too.
-    pub(crate) admin: tokio::sync::Mutex<()>,
+    /// Per-collection admin mutex (architecture 4.7): rebuild, delete_collection, rename, record
+    /// deletion, `rebuild_index`, shutdown; not training. `Arc` so that callers can take an owned
+    /// guard before spawning a unit (`lock_owned`).
+    pub(crate) admin: Arc<tokio::sync::Mutex<()>>,
+    /// Per-collection admission gate. Puts read-hold it (after `Core::gate`) from admission until
+    /// their request is queued; `delete_collection` write-holds it only to set `deleted`.
+    pub(crate) admission: tokio::sync::RwLock<()>,
+    /// Set once (never reset) by `delete_collection` under `admission`'s write guard, before it
+    /// sets the rebuild cancel flag. Every handle operation fails with `UnknownCollection` after.
+    pub(crate) deleted: AtomicBool,
     /// Rebuild state shared with the writer task.
     pub(crate) rebuild: Arc<crate::rebuild::RebuildSlot>,
     pub(crate) task: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     pub(crate) hooks: Arc<crate::writer::TestHooks>,
+}
+
+impl Shared {
+    /// The current slug (read lock, `Arc` clone).
+    pub(crate) fn slug(&self) -> Arc<str> {
+        Arc::clone(&self.slug.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Replaces the slug. Called by the rename unit under the registry write lock (leaf lock).
+    pub(crate) fn set_slug(&self, s: Arc<str>) {
+        *self.slug.write().unwrap_or_else(PoisonError::into_inner) = s;
+    }
+
+    /// True once `delete_collection` has stopped admission.
+    pub(crate) fn is_deleted(&self) -> bool {
+        self.deleted.load(Ordering::Acquire)
+    }
+
+    /// `Err(UnknownCollection)` once the collection is deleted.
+    pub(crate) fn check_live(&self) -> Result<(), Error> {
+        if self.is_deleted() {
+            Err(Error::UnknownCollection(self.id.to_string()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Times a put is prepared again after a rebuild switched generations under it.
@@ -80,7 +115,7 @@ impl CollectionHandle {
     /// The slug.
     #[must_use]
     pub fn slug(&self) -> Arc<str> {
-        Arc::clone(&self.shared.slug)
+        self.shared.slug()
     }
 
     /// Summary of the collection (codec and generation of the current snapshot).
@@ -89,7 +124,7 @@ impl CollectionHandle {
         let snap = self.shared.published.load();
         CollectionInfo {
             id: self.shared.id,
-            slug: Arc::clone(&self.shared.slug),
+            slug: self.shared.slug(),
             codec: snap.manifest().active().codec,
             generation: snap.generation(),
         }
@@ -197,6 +232,11 @@ impl CollectionHandle {
         if *gate {
             return Err(Error::ShuttingDown);
         }
+        // Held with `gate` until the request is queued: `delete_collection` write-holds it to set
+        // `deleted`, so every put admitted before that has queued its request before the writer
+        // is stopped, and every later one fails.
+        let adm = self.shared.admission.read().await;
+        self.shared.check_live()?;
         let kib = admission_permits(input_bytes, core.limits.inflight_kib);
         let permit = Arc::clone(&core.inflight_sem)
             .acquire_many_owned(kib)
@@ -227,6 +267,7 @@ impl CollectionHandle {
         self.shared.hooks.wait_after_prepare().await;
         let bytes = stored_total(&items);
         let rx = self.submit(items, bytes, permit).await?;
+        drop(adm);
         drop(gate);
         let mut outcome = self.await_reply(rx).await?;
         let mut retries = 0;
@@ -252,6 +293,8 @@ impl CollectionHandle {
         if *gate {
             return Err(Error::ShuttingDown);
         }
+        let adm = self.shared.admission.read().await;
+        self.shared.check_live()?;
         let permit = Arc::clone(&core.inflight_sem)
             .acquire_many_owned(kib)
             .await
@@ -283,6 +326,7 @@ impl CollectionHandle {
         .map_err(Error::Join)??;
         let bytes = stored_total(&items);
         let rx = self.submit(items, bytes, permit).await?;
+        drop(adm);
         drop(gate);
         self.await_reply(rx).await
     }

@@ -23,12 +23,26 @@
 //!
 //! # Lock order
 //!
-//! `gate`, then `create_lock`, then `index_rebuild`, then a `rebuild_sem` permit (rebuild units
-//! only), then per-collection `admin` mutexes (ascending uuid), then the registry, then the
-//! leaves: the per-collection rebuild slot mutex (held during blocking I/O by design, nothing
-//! else is taken meanwhile), snapshot and pool mutexes, the indexer hub, the index handle and
-//! the indexer task handle. `train_sem` is taken with no other lock held. No std lock is held
-//! across an `.await`; the writer task never takes the admin mutex or the gate.
+//! `gate`, then `index_rebuild`, then a `rebuild_sem` permit (rebuild units only), then
+//! per-collection `admin` mutexes (ascending uuid), then the per-collection `admission` lock,
+//! then `create_lock` (it moved after `admin` in M21: rename holds both), then the registry, then
+//! the leaves: the slug lock (only under the registry write lock), the per-collection rebuild
+//! slot mutex (held during blocking I/O by design, nothing else is taken meanwhile), snapshot
+//! and pool mutexes, the indexer hub, the index handle and the indexer task handle. `train_sem`
+//! is taken with no other lock held. No std lock is held across an `.await`; the writer task
+//! never takes the admin mutex or the gate. The admin operations never take the gate either:
+//! they check `is_closing` after acquiring `admin`.
+//!
+//! # Admin operations
+//!
+//! [`Repository::delete_collection`] moves the collection directory to the trash (the commit
+//! point), frees the slug and drops the index rows; [`Repository::rename_collection`] rewrites
+//! the manifest slug only; [`CollectionHandle::delete`] and
+//! [`delete_by_id`](CollectionHandle::delete_by_id) delete records logically with tombstones
+//! (the bytes stay until the next rebuild; a read by explicit locator still returns them).
+//! They are serialised per collection (admin mutex) with rebuilds and each other. A deleted
+//! collection answers `UnknownCollection` on every handle operation. See the `admin` module docs
+//! for the protocols and the crash table.
 //!
 //! # Secondary index
 //!
@@ -61,6 +75,9 @@
 //! at any point is repaired by `Repository::open` and the indexer. See the `rebuild` module docs.
 #![forbid(unsafe_code)]
 
+mod admin;
+#[cfg(test)]
+mod admin_tests;
 mod collection;
 mod config;
 mod error;
@@ -113,6 +130,7 @@ pub use repository::Repository;
 pub use scan::{MAX_SCAN_PAGE, Scan, ScanCursor, ScanItem, ScanOptions, ScanPage};
 pub use train::{TrainOptions, TrainReport};
 pub use types::{
-    CollectionInfo, LoadedCollection, Located, MAX_REPORTED_UNKNOWN, OpenReport, RawItem,
-    RawRecord, SkipReason, SkippedCollection, WriterStats,
+    CollectionInfo, CollectionRef, DeletedCollection, LoadedCollection, Located,
+    MAX_DELETE_TARGETS, MAX_REPORTED_UNKNOWN, OpenReport, RawItem, RawRecord, SkipReason,
+    SkippedCollection, WriterStats,
 };

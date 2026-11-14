@@ -246,6 +246,16 @@ impl Collection {
         Ok(self.writer.tombstone(&prepared)?)
     }
 
+    /// Offline rename: [`crate::set_slug`], then replaces the snapshot with the returned one.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::set_slug`].
+    pub fn set_slug(&mut self, slug: &str) -> Result<(), Error> {
+        self.snapshot = Arc::new(crate::rename::set_slug(&self.snapshot, slug)?);
+        Ok(())
+    }
+
     /// Offline rebuild (no concurrent writer: `&mut self`): `start`, one `copy_until`, `finish`;
     /// replaces the writer and the snapshot. Returns the report and the old generation (call
     /// `remove` on it). On `Err`, if the writer is poisoned the collection must be dropped and
