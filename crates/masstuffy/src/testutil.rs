@@ -255,3 +255,197 @@ pub(crate) async fn index_dump(repo: &Repository, id: CollectionId) -> Vec<Entry
 pub(crate) fn index_hooks(repo: &Repository) -> Arc<crate::indexer::IndexHooks> {
     Arc::clone(&repo.core().index_hooks)
 }
+
+// ---- M19 helpers: envelopes, frames, offline tombstones, scans.
+
+use masstuffy_cdx::{DEFAULT_MAX_LINE, ImportMeta, Kind, digest, encode_entry, encode_header};
+use masstuffy_collection::{Collection, RecoveryOptions};
+use masstuffy_zframe::{Compressor, EncoderDict};
+
+use crate::scan::{Scan, ScanItem};
+
+/// One envelope item: the claimed metadata and the stored bytes.
+pub(crate) type Item = (ImportMeta<'static>, Vec<u8>);
+
+/// Metadata matching `rec` (with the claimed digest of `payload` if `with_digest`).
+pub(crate) fn meta_for(rec: &Record, payload: &[u8], with_digest: bool) -> ImportMeta<'static> {
+    let v = rec.view();
+    ImportMeta {
+        warc_type: v.warc_type().to_owned().into(),
+        record_id: v.record_id().unwrap().to_owned().into(),
+        url: v.target_uri().map(|u| u.to_owned().into()),
+        date: v.date().unwrap(),
+        raw_size: u64::try_from(payload.len()).unwrap(),
+        digest: with_digest.then(|| digest(payload)),
+    }
+}
+
+/// `(meta_for(record(i)), payload)` for a Codec None collection, with digests.
+pub(crate) fn plain_item(i: usize, body_len: usize) -> Item {
+    let rec = record(i, body_len);
+    let payload = rec.as_bytes().to_vec();
+    (meta_for(&rec, &payload, true), payload)
+}
+
+/// A `#masstuffy-cdx/1` envelope and the stream offset of each item's line.
+pub(crate) fn envelope_v1(items: &[Item]) -> (Vec<u8>, Vec<u64>) {
+    let mut v = Vec::new();
+    encode_header(0, &mut v);
+    let mut offsets = Vec::new();
+    for (meta, payload) in items {
+        offsets.push(u64::try_from(v.len()).unwrap());
+        let e = Entry {
+            kind: Kind::Add,
+            segment: 0,
+            offset: 0,
+            raw_size: u64::try_from(payload.len()).unwrap(),
+            digest: meta.digest.unwrap_or_else(|| digest(payload)),
+            date: meta.date,
+            warc_type: meta.warc_type.clone(),
+            record_id: meta.record_id.clone(),
+            url: meta.url.clone(),
+        };
+        encode_entry(&e, DEFAULT_MAX_LINE, &mut v).unwrap();
+        v.extend_from_slice(payload);
+    }
+    (v, offsets)
+}
+
+/// A legacy envelope (no header, no digest) and the offset of each item's line.
+pub(crate) fn envelope_legacy(items: &[Item]) -> (Vec<u8>, Vec<u64>) {
+    let date14 = DATE
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    let mut v = Vec::new();
+    let mut offsets = Vec::new();
+    for (meta, payload) in items {
+        offsets.push(u64::try_from(v.len()).unwrap());
+        let line = format!(
+            "{} {} {} {date14} f 0 {}\n",
+            meta.url.as_deref().unwrap_or("-"),
+            meta.warc_type,
+            meta.record_id,
+            payload.len()
+        );
+        v.extend_from_slice(line.as_bytes());
+        v.extend_from_slice(payload);
+    }
+    (v, offsets)
+}
+
+/// A copy of [`base_dict`] under another id.
+pub(crate) fn other_dict() -> Vec<u8> {
+    let mut d = base_dict().to_vec();
+    masstuffy_zframe::set_dict_id(&mut d, other_dict_id()).unwrap();
+    d
+}
+
+pub(crate) fn other_dict_id() -> u32 {
+    if dict_id() == 40_000 { 40_001 } else { 40_000 }
+}
+
+/// One zstd frame of `src` with `dict`.
+pub(crate) fn frame(dict: &[u8], src: &[u8]) -> Vec<u8> {
+    let d = EncoderDict::new(dict, 1).unwrap();
+    let mut out = Vec::new();
+    Compressor::new()
+        .unwrap()
+        .compress(src, &d, &mut out)
+        .unwrap();
+    out
+}
+
+/// One zstd frame of `src` without dictionary.
+pub(crate) fn plain_frame(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    Compressor::new()
+        .unwrap()
+        .compress_plain(src, 1, &mut out)
+        .unwrap();
+    out
+}
+
+/// A blocking `Read` fed from a channel; EOF when the sender is dropped. Sends the number of
+/// bytes consumed so far on `starved` each time it is about to block.
+pub(crate) struct ChanReader {
+    pub(crate) rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(crate) cur: Vec<u8>,
+    pub(crate) pos: usize,
+    /// Bytes handed out so far.
+    pub(crate) consumed: u64,
+    pub(crate) starved: Option<std::sync::mpsc::Sender<u64>>,
+}
+
+impl std::io::Read for ChanReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.pos >= self.cur.len() {
+            if let Some(s) = &self.starved {
+                let _ = s.send(self.consumed);
+            }
+            match self.rx.recv() {
+                Ok(v) => {
+                    self.cur = v;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.cur.len() - self.pos);
+        buf[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+        self.pos += n;
+        self.consumed += u64::try_from(n).unwrap();
+        Ok(n)
+    }
+}
+
+/// What `offline_tombstone` needs, captured while the repository is up.
+pub(crate) struct Offline {
+    opts: masstuffy_collection::Options,
+    resolver: Arc<crate::resolver::StoreResolver>,
+    dir: PathBuf,
+}
+
+pub(crate) fn offline_ctx(repo: &Repository, h: &CollectionHandle) -> Offline {
+    Offline {
+        opts: crate::config::Limits::new(repo.config()).collection_opts,
+        resolver: Arc::clone(&h.core.resolver),
+        dir: repo.path().join("data/repository").join(h.id().to_string()),
+    }
+}
+
+/// Appends tombstones for `targets` to the collection's CDX. Blocking; only while the repository
+/// is shut down.
+pub(crate) fn offline_tombstone(o: &Offline, targets: &[Entry<'static>]) {
+    let (mut c, _) =
+        Collection::open(&o.dir, &o.opts, &RecoveryOptions::default(), &*o.resolver).unwrap();
+    c.tombstone(targets).unwrap();
+}
+
+/// The highest-numbered segment file in the collection directory `dir`.
+pub(crate) fn last_segment(dir: &Path) -> PathBuf {
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("seg."))
+        })
+        .collect();
+    v.sort_by_key(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.split('.').nth(2))
+            .and_then(|n| n.parse::<u32>().ok())
+    });
+    v.pop().unwrap()
+}
+
+pub(crate) async fn drain_scan(scan: &mut Scan) -> Vec<ScanItem> {
+    let mut v = Vec::new();
+    while let Some(p) = scan.next_page().await.unwrap() {
+        v.extend(p.items);
+    }
+    v
+}

@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
-use masstuffy_collection::{
-    Codec, Collection, CollectionId, CreateSpec, ReadError, RecoveryOptions, Snapshot,
-};
+use masstuffy_collection::{Codec, Collection, CollectionId, CreateSpec, RecoveryOptions};
 use masstuffy_dictstore::DictStore;
 use masstuffy_durable::DirLock;
 use masstuffy_index::{CollectionKey, SecondaryIndex};
@@ -24,6 +22,7 @@ use crate::index::open_backend;
 use crate::indexer::{INDEX_QUEUE, IndexCmd, IndexFeed, IndexLink, IndexerParams, spawn_indexer};
 use crate::layout::{self, CONFIG_NAME};
 use crate::pool::{CtxPool, PreparerPool};
+use crate::read::{Fetch, Fetched, read_located};
 use crate::resolver::StoreResolver;
 use crate::types::{
     CollectionInfo, LoadedCollection, Located, MAX_REPORTED_UNKNOWN, OpenReport, RawRecord,
@@ -49,7 +48,7 @@ pub(crate) struct Core {
     /// One permit is one KiB of input admitted but not yet committed.
     pub(crate) inflight_sem: Arc<Semaphore>,
     pub(crate) read_ctxs: CtxPool,
-    /// The secondary index, for queries (M19) and tests. Taken (`None`) by shutdown after the
+    /// The secondary index, for the queries and tests. Taken (`None`) by shutdown after the
     /// indexer exited. A handle still held by an in-flight query keeps the index file locked
     /// until that query ends.
     index: RwLock<Option<Arc<dyn SecondaryIndex>>>,
@@ -69,13 +68,11 @@ impl Core {
             .clone()
     }
 
-    /// The secondary index.
+    /// The secondary index (an `Arc` clone; the lock is released at once).
     ///
     /// # Errors
     ///
     /// `ShuttingDown` once shutdown has taken it.
-    // Consumed by the query API (M19) and by tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn index(&self) -> Result<Arc<dyn SecondaryIndex>, Error> {
         self.index
             .read()
@@ -445,7 +442,6 @@ impl Repository {
         self.inner.registry()
     }
 
-    #[cfg(test)]
     pub(crate) fn core(&self) -> &Arc<Core> {
         &self.inner.core
     }
@@ -531,7 +527,7 @@ impl Repository {
         Ok(self.handle(self.shared(id)?))
     }
 
-    fn check_open(&self) -> Result<(), Error> {
+    pub(crate) fn check_open(&self) -> Result<(), Error> {
         if self.inner.core.closed.load(Ordering::Acquire) {
             Err(Error::ShuttingDown)
         } else {
@@ -539,7 +535,7 @@ impl Repository {
         }
     }
 
-    fn shared(&self, id: CollectionId) -> Result<Arc<Shared>, Error> {
+    pub(crate) fn shared(&self, id: CollectionId) -> Result<Arc<Shared>, Error> {
         self.check_open()?;
         self.registry()
             .by_id
@@ -558,19 +554,6 @@ impl Repository {
         v
     }
 
-    /// Checks a locator and returns the collection and its current snapshot.
-    fn locate(&self, at: &Located) -> Result<(Arc<Shared>, Arc<Snapshot>), Error> {
-        let shared = self.shared(at.collection)?;
-        let snap = shared.published.load();
-        if at.generation != snap.generation() {
-            return Err(Error::StaleLocator {
-                expected: snap.generation(),
-                got: at.generation,
-            });
-        }
-        Ok((shared, snap))
-    }
-
     /// Reads and parses the record (spec 04 4.3 "Par localisateur") and returns its serialized
     /// WARC bytes: exactly one record, digest verified, `record_id` and `warc_type` cross-checked
     /// with the entry.
@@ -581,39 +564,11 @@ impl Repository {
     /// one), `NotDecodable` (a `HeaderOnly` raw import whose payload disagrees with its
     /// metadata: use [`get_raw`](Self::get_raw)), `Read`, `Join`.
     pub async fn get(&self, at: &Located) -> Result<Vec<u8>, Error> {
-        let (shared, snap) = self.locate(at)?;
-        let core = &self.inner.core;
-        let permit = Arc::clone(&core.read_sem)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::ShuttingDown)?;
-        let core2 = Arc::clone(core);
-        let published = Arc::clone(&shared.published);
-        let entry = at.entry.clone();
-        let res = spawn(move || {
-            let _permit = permit;
-            let mut ctx = core2.read_ctxs.take();
-            let mut out = Vec::new();
-            let mut r = snap.read(&entry, &mut ctx, &mut out).map(|_| ());
-            if matches!(r, Err(ReadError::SegmentMissing { .. })) {
-                // A retired snapshot may have lost its files: retry once with the current one.
-                let cur = published.load();
-                if !Arc::ptr_eq(&snap, &cur) && cur.generation() == snap.generation() {
-                    out.clear();
-                    r = cur.read(&entry, &mut ctx, &mut out).map(|_| ());
-                }
-            }
-            core2.read_ctxs.give(ctx);
-            r.map(|()| out)
-        })
-        .await?;
-        res.map_err(|source| match source {
-            ReadError::EntryMismatch(_) | ReadError::Record(_) => Error::NotDecodable { source },
-            source => Error::Read {
-                collection: at.collection,
-                source,
-            },
-        })
+        let shared = self.shared(at.collection)?;
+        match read_located(&self.inner.core, &shared, at, Fetch::Decoded).await? {
+            Fetched::Decoded(v) => Ok(v),
+            Fetched::Raw(_) => Err(Error::Internal("fetch mode")),
+        }
     }
 
     /// The stored bytes and their encoding, without decoding (spec 04 4.3 "En brut").
@@ -622,35 +577,11 @@ impl Repository {
     ///
     /// `ShuttingDown`, `UnknownCollection`, `StaleLocator`, `Read`, `Join`.
     pub async fn get_raw(&self, at: &Located) -> Result<RawRecord, Error> {
-        let (shared, snap) = self.locate(at)?;
-        let core = &self.inner.core;
-        let permit = Arc::clone(&core.read_sem)
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::ShuttingDown)?;
-        let published = Arc::clone(&shared.published);
-        let entry = at.entry.clone();
-        let res = spawn(move || {
-            let _permit = permit;
-            let mut out = Vec::new();
-            let mut r = snap.read_raw(&entry, &mut out);
-            if matches!(r, Err(ReadError::SegmentMissing { .. })) {
-                let cur = published.load();
-                if !Arc::ptr_eq(&snap, &cur) && cur.generation() == snap.generation() {
-                    out.clear();
-                    r = cur.read_raw(&entry, &mut out);
-                }
-            }
-            r.map(|encoding| RawRecord {
-                bytes: out,
-                encoding,
-            })
-        })
-        .await?;
-        res.map_err(|source| Error::Read {
-            collection: at.collection,
-            source,
-        })
+        let shared = self.shared(at.collection)?;
+        match read_located(&self.inner.core, &shared, at, Fetch::Raw).await? {
+            Fetched::Raw(r) => Ok(r),
+            Fetched::Decoded(_) => Err(Error::Internal("fetch mode")),
+        }
     }
 
     /// Waits until the secondary index reflects every record committed (acknowledged) before this

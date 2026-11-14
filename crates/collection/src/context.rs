@@ -80,6 +80,12 @@ impl GenContext {
         self.codec
     }
 
+    /// Largest stored payload accepted for this generation (`max_record_bytes` plus zstd slack).
+    #[must_use]
+    pub fn max_stored_bytes(&self) -> u64 {
+        self.max_stored_bytes
+    }
+
     /// Validates `opts`, resolves the dictionaries (Zstd only) and checks what the resolver
     /// returned.
     pub(crate) fn new(
@@ -156,6 +162,18 @@ mod tests {
             GenContext::new(&m, &opts, &MapResolver::standard()),
             Err(Error::InvalidOptions("max_record_bytes"))
         ));
+    }
+
+    #[test]
+    fn max_stored_bytes_formula() {
+        let m = manifest_zstd();
+        let max = 1_000_000u64;
+        let opts = Options {
+            max_record_bytes: max,
+            ..Options::default()
+        };
+        let c = GenContext::new(&m, &opts, &MapResolver::standard()).unwrap();
+        assert_eq!(c.max_stored_bytes(), max + max / 128 + 128 * 1024);
     }
 
     #[test]

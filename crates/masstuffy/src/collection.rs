@@ -145,6 +145,27 @@ impl CollectionHandle {
         if input.is_empty() {
             return Ok(Vec::new());
         }
+        self.put_stage(input, input_bytes, move |p, v| {
+            prepare(p, v).map(|v| (v, ()))
+        })
+        .await
+        .map(|(v, ())| v)
+    }
+
+    /// Admission (gate read guard, inflight permits, prepare permit), prepare in the blocking
+    /// pool, submit, wait. If `prepare` returns no items, nothing is submitted and
+    /// `Ok((vec![], x))` is returned (the gate and permits are released).
+    pub(crate) async fn put_stage<T, X, F>(
+        &self,
+        input: Vec<T>,
+        input_bytes: u64,
+        prepare: F,
+    ) -> Result<(Vec<Located>, X), Error>
+    where
+        T: Send + 'static,
+        X: Send + 'static,
+        F: FnOnce(&mut Preparer, Vec<T>) -> Result<(Vec<Prepared>, X), Error> + Send + 'static,
+    {
         let core = &self.core;
         // Held until the request is queued, on purpose: shutdown flips the flag under the write
         // guard, so every admitted put has queued its request before the writers are stopped.
@@ -163,7 +184,7 @@ impl CollectionHandle {
             .map_err(|_| Error::ShuttingDown)?;
         let ctx = Arc::clone(self.shared.published.load().context());
         let shared = Arc::clone(&self.shared);
-        let items = tokio::task::spawn_blocking(move || {
+        let (items, extra) = tokio::task::spawn_blocking(move || {
             let _cpu = cpu;
             let mut p = shared
                 .preparers
@@ -175,12 +196,16 @@ impl CollectionHandle {
         })
         .await
         .map_err(Error::Join)??;
+        if items.is_empty() {
+            return Ok((Vec::new(), extra));
+        }
         let bytes = items
             .iter()
             .fold(0u64, |a, p| a.saturating_add(p.stored_len()));
         let rx = self.submit(items, bytes, permit).await?;
         drop(gate);
-        self.finish(rx).await
+        let located = self.finish(rx).await?;
+        Ok((located, extra))
     }
 
     /// Queues a prepared request. Nothing is written if this fails.

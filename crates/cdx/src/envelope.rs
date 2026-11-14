@@ -58,6 +58,21 @@ pub struct ImportMeta<'a> {
     pub digest: Option<u64>,
 }
 
+impl ImportMeta<'_> {
+    /// Owned copy (text fields become `Cow::Owned`).
+    #[must_use]
+    pub fn into_owned(self) -> ImportMeta<'static> {
+        ImportMeta {
+            warc_type: Cow::Owned(self.warc_type.into_owned()),
+            record_id: Cow::Owned(self.record_id.into_owned()),
+            url: self.url.map(|u| Cow::Owned(u.into_owned())),
+            date: self.date,
+            raw_size: self.raw_size,
+            digest: self.digest,
+        }
+    }
+}
+
 /// One record of the envelope.
 #[derive(Debug)]
 pub struct EnvelopeItem<'a> {
@@ -280,6 +295,26 @@ mod tests {
             v.extend_from_slice(p);
         }
         v
+    }
+
+    #[test]
+    fn import_meta_into_owned() {
+        let items = vec![(sample(1), b"payload".to_vec())];
+        let data = v1(&items);
+        let (expected, owned) = {
+            let mut r = EnvelopeReader::new(&data[..], EnvelopeLimits::DEFAULT).unwrap();
+            let it = r.next_item().unwrap().unwrap();
+            let expected = (
+                it.meta.record_id.to_string(),
+                it.meta.url.as_deref().map(str::to_owned),
+                it.meta.date,
+            );
+            (expected, it.meta.into_owned())
+        };
+        assert_eq!(owned.record_id, expected.0);
+        assert_eq!(owned.url.as_deref().map(str::to_owned), expected.1);
+        assert_eq!(owned.date, expected.2);
+        assert_eq!(owned.record_id, items[0].0.record_id);
     }
 
     #[test]

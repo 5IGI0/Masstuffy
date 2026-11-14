@@ -62,7 +62,7 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 **`crates/cdx` — `masstuffy-cdx`**: the versioned collection index format (replaces spec 3.4, per spec 6).
 - `Entry<'a> { kind: Add | Tombstone, segment: u32, offset: u64, raw_size: u64, digest: u64, date:
   WarcDate, warc_type, record_id, url: Option<_> }` (text fields `Cow<'a, str>`: borrowed when read,
-  `into_owned()` to keep); `digest` = xxh3-64 of the stored bytes (`cdx::digest`). No urlkey (the index
+  `into_owned()` to keep; `ImportMeta::into_owned` too); `digest` = xxh3-64 of the stored bytes (`cdx::digest`). No urlkey (the index
   computes it from `url`), no `dict_id` (in the frame header and the generation).
 - Text, header line `#masstuffy-cdx/1 gen=<gen>`, then one line per entry:
   `kind segment offset raw_size digest date warc_type record_id url check`. Only `url` is escaped
@@ -179,6 +179,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   task started with (the floor rule: it holds even if new puts grew the CDX past the stale checkpoint), is not at a line
   start, or the generation or index state does not match. An offline repair tool must delete `data/index.redb`: a repair
   followed by offline appends past the old checkpoint cannot be detected.
+  `Snapshot::entries_from(from, end)` (M19) is `entries(end)` resuming at a line-start cursor: the tombstones of the whole
+  prefix are applied, entries are yielded from `from`; `Entries::position()` is the resume point (used by the engine
+  scan). `GenContext::max_stored_bytes()` exposes the stored-size cap.
   `Options { max_record_bytes, max_open_files }`.
 - `Preparer` (one per worker: `Compressor` + `Arc<GenContext>`), run outside any lock:
   `prepare(Record) -> Prepared` (serialize + compress, records over 1 MiB without dictionary) and
@@ -186,7 +189,7 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   digest; `Full` also decompresses, parses and compares the envelope metadata). These replace the earlier
   "free functions". With `HeaderOnly`, records whose envelope metadata disagrees with the payload, or whose
   payload is not a WARC, can only be read with `read_raw`; `read` returns `EntryMismatch`/`Record`
-  (M17/M19 must handle this on purpose).
+  (handled: `get`/`get_by_*` return `NotDecodable`, scan reports it per item).
 - `Writer` (`&mut self`): `commit(batch: &[Prepared]) -> Vec<Entry<'static>>` = data append → data fsync →
   CDX append → CDX fsync. `WrongGeneration` for an item prepared for another collection or generation; any
   I/O error after the append starts poisons the writer.
@@ -308,9 +311,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `put_raw(Vec<RawItem>)` (M17) return one `Located` per record, contiguous (I9); `get(&Located)` returns the
   serialized WARC bytes (`NotDecodable` for a `HeaderOnly` raw import that disagrees with its payload: use
   `get_raw`); `get_raw` returns the stored bytes and their encoding. A locator of another generation is
-  `StaleLocator`. M19 keeps the envelope-stream import, `scan`, `search`, `get_by_id`, `get_by_url`.
-- Later milestones: `delete_collection` (trash rename), `rename` (manifest only), `get_by_id`, `get_by_url`, `search`,
-  `scan`.
+  `StaleLocator`. M19 adds `CollectionHandle::put_raw_envelope`, `scan`, `search`, `find_by_url`/`get_by_url` and
+  `Repository::find_by_id`/`get_by_id` (see "Queries and bulk import (M19)" below).
+- Later milestones: `delete_collection` (trash rename), `rename` (manifest only), record deletion (Q13).
 - `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`. `Repository::sync_index()` and
   `rebuild_index()` exist since M18 (see the secondary-index paragraph below).
 - Rebuild protocol (M20): hold the admin mutex for the whole rebuild (tombstones, rename, delete, reopen wait);
@@ -354,9 +357,27 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
 - tokio features: `rt` and `sync` in the library; `rt-multi-thread`, `macros` and `time` in dev-dependencies
   only (the embedding application picks the runtime).
 - Reads `MASSTUFFY_RAW_IMPORT_CHECK` once at `Repository::open` (→ `RawCheck`) and passes it to every
-  `prepare_raw` of `put_raw` (M17/M19: `put_raw` of already split items and `get_raw` arrive in M17).
+  `prepare_raw` of `put_raw` and `put_raw_envelope`.
 - Internal: all crates above. External: `tokio` (`rt`, `sync`), `uuid` (v4), `tracing`,
   `thiserror`. Features: `redb` (default) selects `index-redb`.
+- **Queries and bulk import (M19)**, `import.rs` / `scan.rs` / `query.rs` / `read.rs`:
+  - (a) Import: `put_raw_envelope(R: Read + Send + 'static, ImportOptions)` reads on one blocking producer thread
+    (async sources go through `SyncIoBridge`), a capacity-1 channel, batches of at most `batch_records` records and
+    `min(max_group_bytes, split_threshold)` bytes, each batch an ordinary writer request (`put_stage`, shared with
+    `put`), one batch in flight so the committed set is a stream prefix. `OnInvalid::{Abort (default), Skip}`; framing
+    errors are always fatal. `ImportReport.committed_offset` is resumable (V1: resend the header line). Cancellation
+    is at-least-once. The gate is held per batch only; the producer holds no lock or permit, so shutdown is never
+    delayed. Peak memory is about three batches.
+  - (b) Scan: `CollectionHandle::scan` is CDX-driven (spec 4.3: orphan or invalidated zones are skipped), pull pages
+    (`Scan::next_page`), one blocking job and one read permit per page, `ScanCursor` = (generation, CDX line offset),
+    a dropped page is replayed, strongly consistent with the CDX prefix captured at (re)open, a generation change
+    gives `StaleLocator`. `Fetch::{None, Decoded, Raw}`; a record that cannot be read is an error on its item.
+  - (c) `search`, `find_by_*`, `get_by_*` are index-backed and eventually consistent (Q14, `sync_index`).
+    `UrlPattern` is re-exported as the query type; limits `1..=10 000` (default 100); index-cursor tokens; a hit of a
+    non-active generation gives `StaleLocator` (Q16); a hit in a collection that is not loaded gives
+    `UnknownCollection` on `get_by_id`; `HeaderOnly` mismatches give `NotDecodable` (raw path: `find_*` + `get_raw`).
+    `get_by_*` hold one read permit across the lookup and the read.
+  - (d) Errors: `InvalidQuery`, `IndexQuery`, `Envelope`, `Import { report, source }`.
 - **Secondary index (M18)**, `indexer.rs` / `index.rs`:
   - Backend (D1): cargo feature `redb` (default) opens `RedbIndex` at `<workdir>/data/index.redb` in `spawn_blocking`
     with a `DirLock` clone (options from `index_cache_bytes` / `index_sync_every`); without the feature a `MemIndex`
@@ -483,7 +504,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M16 | `index-redb` | conformance suite; reopen after drop (incl. lazy sync); crash in a child process (abort) -> consistent prefix, structural batches durable; concurrent readers during a large `apply`; purge bounded progress; differential vs `MemIndex`; schema mismatch / foreign file / already open |
 | M17 | `masstuffy`: init/open, registry, writer task with group commit, `put`/`put_raw`/`get`/`get_raw` by locator, shutdown | many tasks `put` to one collection → all entries present once, no interleaving inside a batch |
 | M18 | `masstuffy`: secondary-index wiring, catch-up from checkpoint, `rebuild_index` | kill between CDX fsync and index apply → catch-up; rebuilt index equals incremental one (I8) |
-| M19 | `masstuffy`: `put_raw` from an envelope stream, `scan`, `search`, `get_by_id`, `get_by_url` | delegated frames with wrong dict_id rejected; scan skips orphan bytes |
+| M19 | `masstuffy`: `put_raw` from an envelope stream, `scan`, `search`, `get_by_id`, `get_by_url` | delegated frames with wrong dict_id rejected (both RawCheck levels); scan skips orphan bytes |
 | M20 | `masstuffy`: `train_dictionary`, `rebuild` orchestration | deterministic sample; reads keep working during a rebuild (concurrent test) |
 | M21 | `masstuffy`: `delete_collection`, `rename` | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates |
 
@@ -617,3 +638,8 @@ These override the spec where they differ.
     already indexed.
 14. **Query freshness** (M18): the index is eventually consistent: queries may lag the CDX and, while a collection is
     re-indexed, answer empty; `Repository::sync_index()` is the read-your-writes barrier. *Recommend* as is.
+    M19: scan reads the CDX and is not affected; index-backed queries follow Q14.
+15. **Envelope import failure semantics** (M19): `OnInvalid::Abort` by default, `Skip` optional, framing errors always
+    fatal, the committed set is a stream prefix reported by `committed_offset`. *Recommend* as is.
+16. **Index hit of a non-active generation** (M19): `StaleLocator`, no silent retry (the engine keeps no retired
+    snapshot). *Recommend* as is (revisit in M20).

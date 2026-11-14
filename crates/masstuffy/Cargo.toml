@@ -18,6 +18,7 @@ masstuffy-dictstore.workspace = true
 masstuffy-durable.workspace = true
 masstuffy-cdx.workspace = true
 masstuffy-index.workspace = true
+masstuffy-urlkey.workspace = true
 masstuffy-index-redb = { workspace = true, optional = true }
 masstuffy-warc = { workspace = true, features = ["generate"] }
 masstuffy-zframe = { workspace = true, features = ["codec"] }

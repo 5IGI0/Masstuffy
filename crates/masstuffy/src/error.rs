@@ -198,6 +198,24 @@ pub enum Error {
     /// An internal invariant failed.
     #[error("internal error: {0}")]
     Internal(&'static str),
+    /// Invalid query or option (limit, page size, cursor token, empty/oversize key).
+    #[error("invalid query: {0}")]
+    InvalidQuery(&'static str),
+    /// The secondary index failed to answer.
+    #[error("secondary index query failed: {0}")]
+    IndexQuery(#[source] masstuffy_index::Error),
+    /// The raw-import envelope is malformed or unreadable.
+    #[error("raw import envelope: {0}")]
+    Envelope(#[source] masstuffy_cdx::EnvelopeError),
+    /// A stream import stopped; `report` says what is durable.
+    #[error("import stopped after {} records (resume at byte {}): {source}", report.records, report.committed_offset)]
+    Import {
+        /// Progress of the import up to the failure.
+        report: Box<crate::import::ImportReport>,
+        /// Why it stopped.
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 /// Coarse classification of an [`Error`], for API layers.
@@ -255,7 +273,17 @@ impl Error {
                 }
                 _ => ErrorKind::Corrupt,
             },
-            Error::Config { .. }
+            Error::IndexQuery(e) => match e {
+                masstuffy_index::Error::Corrupt(_) => ErrorKind::Corrupt,
+                _ => ErrorKind::Io,
+            },
+            Error::Envelope(e) => match e {
+                masstuffy_cdx::EnvelopeError::Io(_) => ErrorKind::Io,
+                _ => ErrorKind::Invalid,
+            },
+            Error::Import { source, .. } => source.kind(),
+            Error::InvalidQuery(_)
+            | Error::Config { .. }
             | Error::InvalidEnv { .. }
             | Error::InvalidSlug { .. }
             | Error::Build { .. }

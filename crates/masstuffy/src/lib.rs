@@ -36,19 +36,33 @@
 //! CDX fsync and never waits for the index: the index is eventually consistent, and
 //! [`Repository::sync_index`] is the barrier that gives read-your-writes.
 //! [`Repository::rebuild_index`] re-indexes everything from the CDX while puts continue.
+//!
+//! # Queries
+//!
+//! [`CollectionHandle::search`], `find_by_url`/`get_by_url` and [`Repository::find_by_id`] /
+//! `get_by_id` answer from the secondary index and are therefore eventually consistent (call
+//! `sync_index` first for read-your-writes). [`CollectionHandle::scan`] reads the CDX itself and
+//! is consistent with every put acknowledged before the scan (re)opens.
+//! [`CollectionHandle::put_raw_envelope`] bulk-imports an envelope stream.
 #![forbid(unsafe_code)]
 
 mod collection;
 mod config;
 mod error;
+mod import;
 mod index;
 #[cfg(test)]
 mod index_tests;
 mod indexer;
 mod layout;
 mod pool;
+mod query;
+#[cfg(test)]
+mod query_tests;
+mod read;
 mod repository;
 mod resolver;
+mod scan;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -59,11 +73,21 @@ mod writer;
 pub use collection::CollectionHandle;
 pub use config::{Config, ConfigError, MAX_CONFIG_BYTES, RAW_IMPORT_CHECK_ENV};
 pub use error::{Error, ErrorKind};
-pub use masstuffy_cdx::{Entry, ImportMeta};
+pub use import::{
+    ImportOptions, ImportReport, MAX_IMPORT_BATCH_RECORDS, MAX_REPORTED_REJECTIONS, OnInvalid,
+    Rejection,
+};
+pub use masstuffy_cdx::{Entry, EnvelopeFormat, ImportMeta};
 pub use masstuffy_collection::{Codec, CollectionId, RawCheck, RawEncoding, RecoveryReport};
 pub use masstuffy_dictstore::ScanReport;
+pub use masstuffy_urlkey::{HostMatch, PathFilter, PatternError, PortFilter, UrlPattern};
 pub use masstuffy_warc::{Record, RecordBuilder, WarcDate};
+pub use query::{
+    DEFAULT_SEARCH_LIMIT, MAX_QUERY_LEN, MAX_SEARCH_LIMIT, SearchCursor, SearchPage, SearchQuery,
+};
+pub use read::{Fetch, Fetched};
 pub use repository::Repository;
+pub use scan::{MAX_SCAN_PAGE, Scan, ScanCursor, ScanItem, ScanOptions, ScanPage};
 pub use types::{
     CollectionInfo, LoadedCollection, Located, MAX_REPORTED_UNKNOWN, OpenReport, RawItem,
     RawRecord, SkipReason, SkippedCollection, WriterStats,

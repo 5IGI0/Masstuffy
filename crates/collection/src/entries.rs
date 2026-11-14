@@ -54,6 +54,13 @@ impl Entries {
         }
     }
 
+    /// Offset of the next unread line: the resume point after the last returned entry (a valid
+    /// `from` for [`Snapshot::entries_from`]), and `end` once the iterator is exhausted.
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        self.lines.next_offset()
+    }
+
     /// Number of distinct tombstoned locators applied (16 bytes of RAM each).
     #[must_use]
     pub fn tombstones(&self) -> usize {
@@ -127,12 +134,25 @@ impl Snapshot {
     /// `CdxMissing`, `CdxRead`, `CdxGeneration`, `CdxRange` (`end` below the header), `CdxTruncated`
     /// (`end` beyond the file or inside a line), `CdxCorrupt`, `Io`, `Internal`.
     pub fn entries(&self, end: u64) -> Result<Entries, Error> {
+        self.entries_from(None, end)
+    }
+
+    /// Like [`entries`](Self::entries), but yields only the live entries of `[from, end)`.
+    /// The tombstones of the whole prefix `[header, end)` are applied (a `T` line before `from`
+    /// still hides an entry after it). `from = None` starts right after the header; otherwise it
+    /// must be a line start, such as [`Entries::position`].
+    ///
+    /// # Errors
+    ///
+    /// As [`entries`](Self::entries), plus `CdxRange` when `from` is below the header, above
+    /// `end`, or not at a line start.
+    pub fn entries_from(&self, from: Option<u64>, end: u64) -> Result<Entries, Error> {
         let path = self.cdx_path();
         let generation = self.generation();
         let mut p1 = LineReader::open(&path, generation, None, end)?;
         let tombstones = collect_tombstones(&mut p1)?;
         drop(p1);
-        let lines = LineReader::open(&path, generation, None, end)?;
+        let lines = LineReader::open(&path, generation, from, end)?;
         Ok(Entries { lines, tombstones })
     }
 }
@@ -335,6 +355,65 @@ mod tests {
             });
             assert_eq!(all.lock().unwrap().len(), 50);
         });
+    }
+
+    #[test]
+    fn entries_from_matches_suffix_of_entries() {
+        for (_, create) in creators() {
+            let mut s = scenario(create);
+            let end = s.c.writer().cdx_len();
+            let snap = Arc::clone(s.c.snapshot());
+            let mut it = snap.entries(end).unwrap();
+            let mut all = Vec::new();
+            let mut positions = vec![it.position()];
+            while let Some((_, e)) = it.next_entry().unwrap() {
+                all.push(e.into_owned());
+                positions.push(it.position());
+            }
+            // Position is read after the entry is owned; it ends at `end`.
+            assert_eq!(it.position(), end);
+            assert_eq!(all.len(), 10);
+            for (k, pos) in positions.iter().enumerate() {
+                let mut it = snap.entries_from(Some(*pos), end).unwrap();
+                let mut got = Vec::new();
+                while let Some((_, e)) = it.next_entry().unwrap() {
+                    got.push(e.into_owned());
+                }
+                assert_eq!(got, all[k.min(all.len())..], "k = {k}");
+                assert_eq!(it.position(), end);
+            }
+            // `from == end` is empty; tombstones located before `from` still apply.
+            let mut it = snap.entries_from(Some(end), end).unwrap();
+            assert!(it.next_entry().unwrap().is_none());
+            let lines = cdx_lines(&s.dir, 1);
+            let last_t = lines
+                .iter()
+                .rposition(|l| l.2.kind == Kind::Tombstone)
+                .unwrap();
+            let from = lines[last_t].1;
+            let mut it = snap.entries_from(Some(from), end).unwrap();
+            assert!(it.next_entry().unwrap().is_none());
+            // A tombstone before `from` that targets an entry after `from`.
+            let t_first = lines
+                .iter()
+                .position(|l| l.2.kind == Kind::Tombstone)
+                .unwrap();
+            let target = &s.es[4];
+            let target_line = lines.iter().position(|l| l.2 == *target).unwrap();
+            assert!(target_line < t_first);
+            let mut it = snap.entries_from(Some(lines[target_line].0), end).unwrap();
+            while let Some((_, e)) = it.next_entry().unwrap() {
+                assert_ne!(e.into_owned(), *target);
+            }
+            // Bad bounds.
+            let r = |from, end| snap.entries_from(from, end).map(|_| ());
+            assert!(matches!(
+                r(Some(lines[3].0 + 1), end),
+                Err(Error::CdxRange { .. })
+            ));
+            assert!(matches!(r(Some(end + 1), end), Err(Error::CdxRange { .. })));
+            assert!(matches!(r(Some(1), end), Err(Error::CdxRange { .. })));
+        }
     }
 
     fn all_lines(
