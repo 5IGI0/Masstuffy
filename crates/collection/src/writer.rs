@@ -164,6 +164,29 @@ impl Writer {
         &self.cdx_path
     }
 
+    /// Deletes the files of every generation other than this writer's (`seg.<g>.*`,
+    /// `index.<g>.cdx`, `scan.<g>.json`, `g != generation()`), then fsyncs the directory if
+    /// anything was removed. Returns the paths removed. Unknown files are kept; `.tmp-*` are not
+    /// touched (a checkpoint write may be in flight).
+    ///
+    /// Precondition: no `Rebuilder` of this collection is alive (the engine calls it from the
+    /// writer task after `Rebuilder::finish` failed without committing). Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// `Io`, `Durable`.
+    pub fn remove_stale_generations(&self) -> Result<Vec<PathBuf>, Error> {
+        let dir = self
+            .cdx_path
+            .parent()
+            .ok_or(Error::Internal("cdx path has no parent"))?;
+        let active = crate::manifest::Generation {
+            id: self.ctx.generation(),
+            codec: self.ctx.codec(),
+        };
+        crate::rebuild::remove_leftovers(dir, active)
+    }
+
     /// Length of the CDX made durable by successful commits and tombstones (and the recovered
     /// prefix): a line boundary. Pass it to `Snapshot::entries` and `Rebuilder::copy_until`; the
     /// engine publishes it after each commit for the rebuild task.

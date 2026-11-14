@@ -277,6 +277,22 @@ fn remove_file_if_present(path: &Path) -> Result<bool, Error> {
     }
 }
 
+/// Deletes the files of every generation other than `active` (`recover::scan_dir` leftovers),
+/// then fsyncs the directory if anything was removed. Returns the removed paths.
+pub(crate) fn remove_leftovers(dir: &Path, active: Generation) -> Result<Vec<PathBuf>, Error> {
+    let scan = recover::scan_dir(dir, active)?;
+    let mut removed = Vec::new();
+    for path in scan.leftovers {
+        if remove_file_if_present(&path)? {
+            removed.push(path);
+        }
+    }
+    if !removed.is_empty() {
+        masstuffy_durable::sync_dir(dir)?;
+    }
+    Ok(removed)
+}
+
 /// Removes the segments, CDX and checkpoint of `generation`.
 fn remove_generation(dir: &Path, generation: u32, codec: &Codec) -> Result<usize, Error> {
     let mut n = masstuffy_seglog::remove_all(dir, &segment_naming(generation, codec)?)?;
@@ -568,6 +584,10 @@ pub struct Rebuilder {
     /// Last `Add` locator seen (order check).
     last: Option<(u32, u64)>,
     poisoned: bool,
+    /// Cancel flag (`set_cancel`), checked once per CDX line.
+    cancel: Option<Arc<AtomicBool>>,
+    /// Byte offset of the new CDX's first line (the new warcinfo).
+    cdx_start: u64,
     report: RebuildReport,
     #[cfg(test)]
     pub(crate) fail: Option<RebuildFail>,
@@ -644,16 +664,7 @@ impl Rebuilder {
 
         // Leftovers of an interrupted attempt. `sweep_tmp` is not called: the old writer may be
         // running an `atomic_write` of its checkpoint right now.
-        let scan = recover::scan_dir(&dir, on_disk.active())?;
-        let mut removed_leftovers = Vec::new();
-        for path in scan.leftovers {
-            if remove_file_if_present(&path)? {
-                removed_leftovers.push(path);
-            }
-        }
-        if !removed_leftovers.is_empty() {
-            masstuffy_durable::sync_dir(&dir)?;
-        }
+        let removed_leftovers = remove_leftovers(&dir, on_disk.active())?;
 
         let old_cdx = source.cdx_path();
         let frontier = cdx_header_len(&old_cdx, from_gen)?;
@@ -718,6 +729,8 @@ impl Rebuilder {
             first_done: false,
             last: None,
             poisoned: false,
+            cancel: None,
+            cdx_start: header_len,
             report: RebuildReport {
                 from_generation: from_gen,
                 generation,
@@ -751,6 +764,21 @@ impl Rebuilder {
         self.frontier
     }
 
+    /// Byte offset of the first line (the new warcinfo) of the new generation's CDX: the resume
+    /// point from which a secondary index stages the new generation.
+    #[must_use]
+    pub fn cdx_start(&self) -> u64 {
+        self.cdx_start
+    }
+
+    /// Installs a cancel flag. While it is true, `copy_until` and `finish` stop at the next CDX
+    /// line with `Error::RebuildCancelled` (which poisons the `Rebuilder`: abort it). Checked once
+    /// per CDX line; the latency is at most one record (plus the in-flight pool window, which is
+    /// drained and joined).
+    pub fn set_cancel(&mut self, flag: Arc<AtomicBool>) {
+        self.cancel = Some(flag);
+    }
+
     /// Progress so far.
     #[must_use]
     pub fn report(&self) -> &RebuildReport {
@@ -769,7 +797,7 @@ impl Rebuilder {
     ///
     /// # Errors
     ///
-    /// `RebuildPoisoned`, `CdxRange`, `CdxTruncated`, `CdxCorrupt`, `CdxMissing`, `CdxRead`,
+    /// `RebuildPoisoned`, `RebuildCancelled`, `CdxRange`, `CdxTruncated`, `CdxCorrupt`, `CdxMissing`, `CdxRead`,
     /// `CdxGeneration`, `Io`, `TombstoneDuringRebuild`, `LocatorOrder`, `RebuildRead`,
     /// `RebuildPrepare`, `WorkerPanicked`, `Segment`, `CdxWrite`, `Commit`, `Prepare`, `Internal`.
     pub fn copy_until(&mut self, end: u64) -> Result<CopyProgress, Error> {
@@ -827,6 +855,13 @@ impl Rebuilder {
         ts: &[(u32, u64)],
     ) -> Result<Option<u64>, Error> {
         loop {
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::SeqCst))
+            {
+                return Err(Error::RebuildCancelled);
+            }
             let Some(at) = lines.advance()? else {
                 return Ok(None);
             };
@@ -1759,6 +1794,72 @@ mod tests {
         for e in live(&c).iter().skip(2) {
             read_bytes(c.snapshot(), e);
         }
+    }
+
+    #[test]
+    fn rebuild_cancel_stops_copy() {
+        for workers in [1, 4] {
+            let mut fx = build(zstd_codec(), 300, None);
+            let mut rb = start(&fx.c, other_codec(), ro(workers)).unwrap();
+            let flag = Arc::new(AtomicBool::new(true));
+            rb.set_cancel(Arc::clone(&flag));
+            let end = fx.c.writer().cdx_len();
+            assert!(matches!(rb.copy_until(end), Err(Error::RebuildCancelled)));
+            assert!(matches!(rb.copy_until(end), Err(Error::RebuildPoisoned)));
+            assert!(rb.abort().unwrap() >= 2);
+            assert!(gen_files(&fx.dir, 2).is_empty());
+            let Fx { _d, dir, c, .. } = fx;
+            drop(c);
+            let (c, rep) = open_ok(&dir);
+            assert_eq!(rep.generation, 1);
+            assert_eq!(live(&c).len(), 301);
+        }
+    }
+
+    #[test]
+    fn rebuild_cancel_flag_false_is_noop() {
+        let mut fx = build(zstd_codec(), 20, None);
+        let mut rb = start(&fx.c, other_codec(), ro(1)).unwrap();
+        rb.set_cancel(Arc::new(AtomicBool::new(false)));
+        let r = rb.finish(fx.c.writer()).unwrap();
+        assert_eq!(r.report.copied, 21);
+        assert_eq!(r.report.generation, 2);
+    }
+
+    #[test]
+    fn rebuild_cdx_start_is_warcinfo_line() {
+        let mut fx = build(zstd_codec(), 10, None);
+        let rb = start(&fx.c, other_codec(), ro(1)).unwrap();
+        let from = rb.cdx_start();
+        let r = rb.finish(fx.c.writer()).unwrap();
+        let len = r.writer.cdx_len();
+        let mut lines = r.snapshot.cdx_lines(Some(from), len).unwrap();
+        let first = lines.next_line().unwrap().unwrap();
+        let e = first.entry;
+        assert_eq!((e.segment, e.offset), (1, 0));
+        assert_eq!(&*e.warc_type, "warcinfo");
+    }
+
+    #[test]
+    fn remove_stale_generations_removes_only_leftovers() {
+        let fx = build(zstd_codec(), 3, None);
+        let dir = &fx.dir;
+        for n in [
+            "seg.9.1.warc",
+            "index.9.cdx",
+            "scan.9.json",
+            "unknown.txt",
+            ".tmp-x",
+        ] {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        let mut c = fx.c;
+        let removed = c.writer().remove_stale_generations().unwrap();
+        assert_eq!(removed.len(), 3, "{removed:?}");
+        let n = names(dir);
+        assert!(n.contains(&"unknown.txt".to_string()) && n.contains(&".tmp-x".to_string()));
+        assert!(n.iter().all(|f| !f.contains(".9.")));
+        assert!(c.writer().remove_stale_generations().unwrap().is_empty());
     }
 
     #[test]

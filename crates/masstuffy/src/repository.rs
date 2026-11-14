@@ -48,6 +48,13 @@ pub(crate) struct Core {
     /// One permit is one KiB of input admitted but not yet committed.
     pub(crate) inflight_sem: Arc<Semaphore>,
     pub(crate) read_ctxs: CtxPool,
+    /// Set to true by shutdown, right after the gate flips: rebuild and training units stop at
+    /// their next check, and every wait of a unit is raced with it.
+    pub(crate) closing: tokio::sync::watch::Sender<bool>,
+    /// Rebuilds running at once (`Config::max_concurrent_rebuilds`); closed by shutdown.
+    pub(crate) rebuild_sem: Arc<Semaphore>,
+    /// One training at a time per repository; closed by shutdown.
+    pub(crate) train_sem: Arc<Semaphore>,
     /// The secondary index, for the queries and tests. Taken (`None`) by shutdown after the
     /// indexer exited. A handle still held by an in-flight query keeps the index file locked
     /// until that query ends.
@@ -61,7 +68,18 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    fn lock_arc(&self) -> Option<Arc<DirLock>> {
+    /// True once shutdown has started.
+    pub(crate) fn is_closing(&self) -> bool {
+        *self.closing.borrow()
+    }
+
+    /// Completes when shutdown starts (also if the sender is gone).
+    pub(crate) async fn closing_signal(&self) {
+        let mut rx = self.closing.subscribe();
+        let _ = rx.wait_for(|c| *c).await;
+    }
+
+    pub(crate) fn lock_arc(&self) -> Option<Arc<DirLock>> {
         self.lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -90,10 +108,13 @@ struct Registry {
     reserved: HashSet<String>,
 }
 
-/// Lock order: `Core::gate`, then `Inner::create_lock`, then `Inner::index_rebuild`, then the
-/// `admin` mutexes of collections (several only in ascending [`CollectionId`] order), then
-/// `registry`, then `Published::snapshot`, the pool mutexes, `Hub::dirty`, `Core::index` and
-/// `Inner::index_task` (leaves: never held while taking another lock, nor across `.await`).
+/// Lock order: `Core::gate`, then `Inner::create_lock`, then `Inner::index_rebuild`, then
+/// `Core::rebuild_sem` (a permit, rebuild units only), then the `admin` mutexes of collections
+/// (several only in ascending [`CollectionId`] order), then `registry`, then the leaves
+/// `RebuildSlot::rb`, `Published::snapshot`, the pool mutexes, `Hub::dirty`, `Core::index` and
+/// `Inner::index_task` (never held while taking another lock, nor across `.await`;
+/// `RebuildSlot::rb` is held during blocking I/O by design and nothing else is taken meanwhile).
+/// `Core::train_sem` is taken with no other lock held.
 /// Semaphores are acquired after `gate` (inflight before prepare). A std lock is never held
 /// across `.await` and a registry guard is dropped before anything else is taken. The indexer
 /// task holds no lock across `.await`; its per-collection state is owned by the task.
@@ -261,6 +282,7 @@ impl Repository {
         let resolver = Arc::new(StoreResolver(dicts));
         let prepare_permits = limits.prepare_permits;
         let read_permits = limits.read_permits;
+        let rebuild_permits = limits.rebuild_permits;
         let inflight = usize::try_from(limits.inflight_kib).unwrap_or(usize::MAX >> 4);
         let open_concurrency = usize::try_from(config.open_concurrency).unwrap_or(1);
         let collection_opts = limits.collection_opts;
@@ -281,6 +303,9 @@ impl Repository {
             read_sem: Arc::new(Semaphore::new(read_permits)),
             inflight_sem: Arc::new(Semaphore::new(inflight)),
             read_ctxs: CtxPool::new(read_permits),
+            closing: tokio::sync::watch::channel(false).0,
+            rebuild_sem: Arc::new(Semaphore::new(rebuild_permits)),
+            train_sem: Arc::new(Semaphore::new(1)),
             index: RwLock::new(Some(Arc::clone(&backend.index))),
             index_link,
             #[cfg(test)]
@@ -683,8 +708,15 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
     // Every put and create that held a read guard has queued its request (or registered its
     // collection) by now; any later one sees `true`.
     *gate = true;
+    // `closing` is sent before any `cancel` flag is set: a rebuild start job resets `cancel`
+    // and then reads `closing`, so it either sees `closing` or the later `cancel = true`.
+    core.closing.send_replace(true);
     let mut shareds: Vec<Arc<Shared>> = inner.registry().by_id.values().cloned().collect();
     shareds.sort_by_key(|s| s.id);
+    // Before any admin mutex: a running rebuild holds its collection's one until it stops.
+    for s in &shareds {
+        s.rebuild.cancel.store(true, Ordering::SeqCst);
+    }
     let mut admin = Vec::with_capacity(shareds.len());
     let mut acks = Vec::with_capacity(shareds.len());
     for s in &shareds {
@@ -706,6 +738,9 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
             failure = Some(Error::Join(e));
         }
     }
+    // Units still waiting for a permit get `ShuttingDown`.
+    core.rebuild_sem.close();
+    core.train_sem.close();
     // The writers are gone: nothing can wake the indexer any more. It drains every dirty
     // collection, flushes the index and exits.
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -733,7 +768,8 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
         .unwrap_or_else(PoisonError::into_inner)
         .take(); // drops the query handle
     core.closed.store(true, Ordering::Release);
-    // Every writer task and the indexer have exited, so this was the last `Arc<DirLock>`.
+    // Every writer task and the indexer have exited. The directory lock is released when the
+    // last clone drops: a blocking job still running (a training) keeps it until it ends.
     core.lock
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -871,6 +907,7 @@ fn spawn_writer(
         .unwrap_or(1)
         .max(1);
     let (tx, rx) = mpsc::channel(queue);
+    let rebuild = Arc::new(crate::rebuild::RebuildSlot::new());
     let dir = collection_dir(&core.dir, id);
     #[cfg(test)]
     let hooks = Arc::new(crate::writer::TestHooks::default());
@@ -890,6 +927,7 @@ fn spawn_writer(
         lock,
         feed: Arc::clone(&feed),
         link: core.index_link.clone(),
+        rebuild: Arc::clone(&rebuild),
         #[cfg(test)]
         hooks: Arc::clone(&hooks),
     });
@@ -906,6 +944,7 @@ fn spawn_writer(
             usize::try_from(core.config.preparers_per_collection).unwrap_or(1),
         ),
         admin: tokio::sync::Mutex::new(()),
+        rebuild,
         task: Mutex::new(Some(handle)),
         #[cfg(test)]
         hooks,

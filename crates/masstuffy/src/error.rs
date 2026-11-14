@@ -195,6 +195,39 @@ pub enum Error {
     /// The indexer task is not running.
     #[error("secondary index unavailable")]
     IndexUnavailable,
+    /// A rebuild of this collection is already running.
+    #[error("collection {0}: a rebuild is already running")]
+    RebuildInProgress(CollectionId),
+    /// The rebuild was abandoned before its commit (the old generation is still active).
+    #[error("collection {collection}: rebuild aborted: {reason}")]
+    RebuildAborted {
+        /// The collection.
+        collection: CollectionId,
+        /// Why.
+        reason: &'static str,
+    },
+    /// The rebuild failed. `committed`: the new generation is known to be active (the failure
+    /// happened after the manifest swap, seen by a reopen); false means it is not, or unknown if
+    /// the reopen failed too (then the next put or open decides).
+    #[error("collection {collection}: rebuild failed: {source}")]
+    Rebuild {
+        /// The collection.
+        collection: CollectionId,
+        /// The new generation is known to be active.
+        committed: bool,
+        /// The underlying error.
+        #[source]
+        source: Box<masstuffy_collection::Error>,
+    },
+    /// Dictionary training failed.
+    #[error("dictionary training failed: {0}")]
+    Train(#[source] masstuffy_zframe::TrainError),
+    /// An option is out of range (the field).
+    #[error("invalid option: {0}")]
+    InvalidOptions(&'static str),
+    /// The collection changed generation repeatedly while a put was queued; nothing was written.
+    #[error("collection {0}: generation changed while the request was queued; retry")]
+    StaleGeneration(CollectionId),
     /// An internal invariant failed.
     #[error("internal error: {0}")]
     Internal(&'static str),
@@ -249,7 +282,20 @@ impl Error {
             | Error::NotEmpty { .. }
             | Error::AlreadyInitialized { .. }
             | Error::SlugTaken { .. }
-            | Error::StaleLocator { .. } => ErrorKind::Conflict,
+            | Error::StaleLocator { .. }
+            | Error::RebuildInProgress(_)
+            | Error::RebuildAborted { .. }
+            | Error::StaleGeneration(_) => ErrorKind::Conflict,
+            Error::Rebuild { source, .. } => match &**source {
+                C::TombstoneDuringRebuild { .. } | C::StaleSource(_) | C::RebuildCancelled => {
+                    ErrorKind::Conflict
+                }
+                C::RebuildRead { .. } | C::LocatorOrder { .. } | C::CdxCorrupt { .. } => {
+                    ErrorKind::Corrupt
+                }
+                C::Resolve(_) => ErrorKind::NotFound,
+                _ => ErrorKind::Io,
+            },
             Error::Layout { .. } | Error::NotDecodable { .. } | Error::Reopen { .. } => {
                 ErrorKind::Corrupt
             }
@@ -286,6 +332,8 @@ impl Error {
             | Error::Config { .. }
             | Error::InvalidEnv { .. }
             | Error::InvalidSlug { .. }
+            | Error::Train(_)
+            | Error::InvalidOptions(_)
             | Error::Build { .. }
             | Error::Prepare { .. } => ErrorKind::Invalid,
             Error::Io { .. }

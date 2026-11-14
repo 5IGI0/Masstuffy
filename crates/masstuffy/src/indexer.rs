@@ -22,15 +22,21 @@
 //! indexer's read sees the new length, or the writer's test-and-set happens after the pop and
 //! queues the feed again. The mutex provides the ordering; no fences are needed.
 //!
-//! # Contract kept for later milestones
+//! # Rebuild commands and the contract kept for M21
 //!
-//! M20 adds `IndexCmd::Apply { ops, reply }` (applied alone, between passes, setting
-//! `purge_pending` when structural) or lets the indexer tail the new generation's CDX as a staged
-//! feed. In both cases resolution rule 4 (`a < target` with a staged checkpoint: resume, then
-//! `ReplaceGeneration` when caught up) completes a switch after a crash. M20 must store the new
-//! snapshot and its `cdx_len` together (see `Published::tail`) and must not run while
-//! `rebuild_index` holds the admin mutexes. M21 adds `IndexCmd::Forget { key, reply }`: remove
-//! the `Track` and apply `DropCollection` (durable) before replying.
+//! A rebuild (`rebuild.rs`) talks to the indexer with three commands. [`IndexCmd::Stage`] runs at
+//! rebuild start: it clears any staged rows of the new generation and puts
+//! `Checkpoint { new generation, start of the new CDX }` in the staged slot, so that after the
+//! manifest switch resolution rule 4 (`active < target` with a staged checkpoint) resumes there,
+//! indexes the new CDX as staged rows and activates the generation with `ReplaceGeneration` in the
+//! batch of the last chunk: queries never see a half-staged generation. [`IndexCmd::Unstage`]
+//! undoes it for an abandoned rebuild. [`IndexCmd::AwaitActive`] replies once the collection is
+//! indexed with the new generation active. Both `Stage` and `Unstage` run between passes
+//! (`admin_ops`), set `purge_pending`, and never touch the in-memory `Track` (its cursor stays on
+//! the old generation until the snapshot switches). The writer task stores a new-generation
+//! snapshot and its `cdx_len` together (`Published::switch`), and a rebuild never runs while
+//! `rebuild_index` holds the admin mutexes. M21 adds `IndexCmd::Forget { key, reply }`: remove the
+//! `Track` and apply `DropCollection` (durable) before replying.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -167,8 +173,50 @@ pub(crate) enum IndexCmd {
     Barrier(oneshot::Sender<Result<(), Error>>),
     /// Force a re-index of every collection, drop orphans, then reply like `Barrier`.
     Reindex(oneshot::Sender<Result<(), Error>>),
+    /// Rebuild start: clear any staged rows of `generation` and put `Checkpoint{generation, from}`
+    /// in the staged slot, so that after the manifest switch the indexer resumes at `from`
+    /// (resolution rule 4) instead of re-indexing. Applied only if the collection has an active
+    /// generation `< generation` and no staged checkpoint of another generation is pending (an
+    /// earlier rebuild whose index switch has not happened); replies `Ok(false)` without applying
+    /// otherwise (unknown, re-index in progress, index ahead, or that pending staging).
+    Stage {
+        key: CollectionKey,
+        generation: u32,
+        from: u64,
+        reply: oneshot::Sender<Result<bool, Error>>,
+    },
+    /// Abandoned rebuild: `DiscardStaged{generation}` if the active generation is `< generation`,
+    /// else nothing.
+    Unstage {
+        key: CollectionKey,
+        generation: u32,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Reply once the collection is indexed with `generation` active and up to the CDX length
+    /// published when the command is handled (a barrier on one collection, same retry rule as
+    /// `Barrier`).
+    AwaitActive {
+        key: CollectionKey,
+        generation: u32,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     /// Drain the hub completely, flush, ack, exit.
     Shutdown(oneshot::Sender<()>),
+}
+
+/// A `Stage` or `Unstage` waiting for its turn between passes.
+enum AdminOp {
+    Stage {
+        key: CollectionKey,
+        generation: u32,
+        from: u64,
+        reply: oneshot::Sender<Result<bool, Error>>,
+    },
+    Unstage {
+        key: CollectionKey,
+        generation: u32,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 // ---- Resolution (where to resume a collection).
@@ -389,6 +437,50 @@ fn is_structural(op: &Op<'_>) -> bool {
         op,
         Op::DropCollection { .. } | Op::ReplaceGeneration { .. } | Op::DiscardStaged { .. }
     )
+}
+
+/// `Stage` (`from` is `Some`) or `Unstage` (`None`): applied only while the collection's active
+/// generation is below `generation`. Returns whether a batch was applied.
+fn stage_blocking(
+    index: &dyn SecondaryIndex,
+    key: CollectionKey,
+    generation: u32,
+    from: Option<u64>,
+    hooks: &Hooks,
+) -> Result<bool, masstuffy_index::Error> {
+    let state = index.state(key)?;
+    let below = state
+        .and_then(|s| s.active_generation)
+        .is_some_and(|a| a < generation);
+    if !below {
+        return Ok(false);
+    }
+    // A staged checkpoint of another generation belongs to an earlier rebuild whose index switch
+    // is still pending (after an index failure): keep it, or the indexer would have to re-index
+    // the active generation. The new generation then re-indexes after its own switch.
+    if from.is_some()
+        && state
+            .and_then(|s| s.staged_checkpoint)
+            .is_some_and(|c| c.generation != generation)
+    {
+        return Ok(false);
+    }
+    let mut ops = Vec::with_capacity(2);
+    ops.push(Op::DiscardStaged {
+        collection: key,
+        generation,
+    });
+    if let Some(cdx_offset) = from {
+        ops.push(Op::Checkpoint {
+            collection: key,
+            checkpoint: Checkpoint {
+                generation,
+                cdx_offset,
+            },
+        });
+    }
+    apply(index, &ops, hooks)?;
+    Ok(true)
 }
 
 /// Orphan GC: drops every index collection that is neither tracked nor kept. Returns whether a
@@ -684,6 +776,7 @@ pub(crate) fn spawn_indexer(p: IndexerParams) -> JoinHandle<()> {
         #[cfg(test)]
         hooks: p.hooks,
         pending: Vec::new(),
+        admin_ops: VecDeque::new(),
         gc_pending: true,
         purge_pending: true,
         stop: Vec::new(),
@@ -762,6 +855,8 @@ struct Indexer {
     #[cfg(test)]
     hooks: Hooks,
     pending: Vec<Pending>,
+    /// `Stage` / `Unstage` commands, one handled per loop turn.
+    admin_ops: VecDeque<AdminOp>,
     gc_pending: bool,
     purge_pending: bool,
     stop: Vec<oneshot::Sender<()>>,
@@ -787,7 +882,13 @@ impl Indexer {
             if self.hooks.abandon.load(Ordering::Acquire) {
                 return; // Simulated kill: no apply, no flush, no ack.
             }
-            // 2. Work.
+            // 2. Work. Staging commands first: a pass must not index the new generation before
+            // its staged checkpoint is in place.
+            if !self.admin_ops.is_empty() {
+                self.admin_step().await;
+                self.check_pending();
+                continue;
+            }
             if self.gc_pending || !self.hub.is_empty() {
                 if !self.pass().await {
                     return;
@@ -857,9 +958,113 @@ impl Indexer {
                 self.gc_pending = true;
                 self.add_pending(r);
             }
+            IndexCmd::Stage {
+                key,
+                generation,
+                from,
+                reply,
+            } => self.admin_ops.push_back(AdminOp::Stage {
+                key,
+                generation,
+                from,
+                reply,
+            }),
+            IndexCmd::Unstage {
+                key,
+                generation,
+                reply,
+            } => self.admin_ops.push_back(AdminOp::Unstage {
+                key,
+                generation,
+                reply,
+            }),
+            IndexCmd::AwaitActive {
+                key,
+                generation,
+                reply,
+            } => self.add_pending_one(key, generation, reply),
             IndexCmd::Shutdown(ack) => {
                 self.stopping = true;
                 self.stop.push(ack);
+            }
+        }
+    }
+
+    /// A barrier on one collection, for a generation that is (or will be) the snapshot's.
+    fn add_pending_one(
+        &mut self,
+        key: CollectionKey,
+        generation: u32,
+        reply: oneshot::Sender<Result<(), Error>>,
+    ) {
+        self.absorb_hub();
+        let Some(t) = self.tracks.get(&key) else {
+            let _ = reply.send(Err(Error::IndexUnavailable));
+            return;
+        };
+        // A track whose last attempt failed gets its retry now.
+        let failed = t.cursor.is_none() && t.failed;
+        if failed {
+            self.hub.enqueue(&t.feed);
+        }
+        let (snap, len) = t.feed.published.tail();
+        self.pending.push(Pending {
+            targets: vec![Target {
+                key,
+                generation: generation.max(snap.generation()),
+                len,
+                epoch: t.fail_epoch,
+                retried: failed,
+            }],
+            reply,
+        });
+    }
+
+    /// Runs one `Stage` / `Unstage` in the blocking pool and replies.
+    async fn admin_step(&mut self) {
+        let Some(op) = self.admin_ops.pop_front() else {
+            return;
+        };
+        let index = Arc::clone(&self.backend.index);
+        let lock = Arc::clone(&self.lock);
+        #[cfg(test)]
+        let hooks = Arc::clone(&self.hooks);
+        #[cfg(not(test))]
+        let hooks = ();
+        let (key, generation, from) = match &op {
+            AdminOp::Stage {
+                key,
+                generation,
+                from,
+                ..
+            } => (*key, *generation, Some(*from)),
+            AdminOp::Unstage {
+                key, generation, ..
+            } => (*key, *generation, None),
+        };
+        let joined = tokio::task::spawn_blocking(move || {
+            let _lock = lock;
+            let index = index; // dropped before the lock
+            stage_blocking(&*index, key, generation, from, &hooks)
+        })
+        .await;
+        let res = match joined {
+            Ok(Ok(applied)) => Ok(applied),
+            Ok(Err(e)) => Err(Error::IndexQuery(e)),
+            Err(e) => {
+                error!("index staging task failed: {e}");
+                Err(Error::IndexUnavailable)
+            }
+        };
+        if matches!(res, Ok(true)) {
+            self.purge_pending = true;
+        }
+        match op {
+            AdminOp::Stage { reply, .. } => {
+                let _ = reply.send(res);
+            }
+            AdminOp::Unstage { reply, .. } => {
+                let _ = reply.send(res.map(|_| ()));
             }
         }
     }

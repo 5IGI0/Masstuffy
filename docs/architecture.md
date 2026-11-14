@@ -211,7 +211,12 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `finish(&mut Writer) -> Rebuilt { writer, snapshot, report, old }` (final delta, fsync, checkpoint, manifest
   `atomic_write` = commit, old writer retired), `OldGeneration::remove()`, `abort()`; `Collection::rebuild` is
   the offline convenience. Every generation's first record is its own warcinfo; older warcinfos are copied as
-  ordinary records. `Writer::cdx_len()`.
+  ordinary records. `Writer::cdx_len()`. M20 additions: `Rebuilder::set_cancel(Arc<AtomicBool>)` (the copy stops
+  at the next CDX line with `Error::RebuildCancelled`) and `Rebuilder::cdx_start()` (offset of the new CDX's
+  warcinfo line: the index's staged resume point); `Preparer::reprepare(Prepared)` (decode with the record's codec,
+  re-encode for this generation; `PrepareError::ForeignContext`); `Snapshot::read_plain` is public (decode
+  without WARC parse: training, rebuild); `Writer::remove_stale_generations()` (cleanup after a failed,
+  uncommitted `finish`).
 - `DictResolver` has **two** methods (`decoder`, `encoder`), implemented by the engine on top of `dictstore`
   (keeps this crate usable with any dictionary source).
 - Internal: `warc` (feature `generate`), `zframe` (`codec`), `cdx`, `seglog`, `durable`. External: `thiserror`,
@@ -294,7 +299,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `max_inflight_put_bytes` (256 MiB), `preparers_per_collection` (4), `max_concurrent_prepares` (null = cores),
   `max_concurrent_reads` (64), `open_concurrency` (4), `checkpoint_every_bytes` (64 MiB), and (M18)
   `index_sync_every` (1, `1..=65536`), `index_cache_bytes` (64 MiB, `1 MiB..=1 TiB`), `index_batch_ops` (8192,
-  `64..=65536`). `init` writes all fields. The schema stays version 1: an older binary rejects a config written by
+  `64..=65536`), (M20) `rebuild_workers` (null = `RebuildOptions::suggested_workers()`, `Some(1..=256)`),
+  `rebuild_inflight_bytes` (256 MiB, `1 MiB..=1 TiB`), `max_concurrent_rebuilds` (1, `1..=64`), `max_train_bytes`
+  (512 MiB, `1 MiB..=1 TiB`). `init` writes all fields. The schema stays version 1: an older binary rejects a config written by
   this one (`deny_unknown_fields`), acceptable before 1.0.
 - `Repository::init(dir)`: the directory must be empty, or hold only the leftovers of an interrupted init (`.lock`,
   `.tmp-*`, the empty layout directories); dirs are created and fsynced, then `config.json` by `atomic_write` is
@@ -314,28 +321,58 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `StaleLocator`. M19 adds `CollectionHandle::put_raw_envelope`, `scan`, `search`, `find_by_url`/`get_by_url` and
   `Repository::find_by_id`/`get_by_id` (see "Queries and bulk import (M19)" below).
 - Later milestones: `delete_collection` (trash rename), `rename` (manifest only), record deletion (Q13).
-- `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`. `Repository::sync_index()` and
-  `rebuild_index()` exist since M18 (see the secondary-index paragraph below).
-- Rebuild protocol (M20): hold the admin mutex for the whole rebuild (tombstones, rename, delete, reopen wait);
-  `start` in `spawn_blocking`; the writer task publishes `cdx_len()` after each commit; loop
-  `copy_until(published)` until the delta < 1 MiB or 8 rounds; then the writer task runs `finish` with its
-  writer, swaps writer and snapshot, re-prepares `WrongGeneration` items, and `old.remove()` runs after the
-  publish; on `finish` error with a retired writer -> reopen; if the old writer is poisoned during the rebuild,
-  drop/abort the rebuild before reopening. Index (M18/M20): `DiscardStaged{new gen}` first (retry safety), staging chunks carry `Checkpoint{new gen}` (staged slot; the old generation's checkpoint keeps advancing with its appends); stage the new generation's entries (`Insert` with the new generation, chunked, each chunk
-  with `Checkpoint{new gen, offset}`), then `ReplaceGeneration` in the last batch; keep the old generation's
-  files readable until that switch is applied; then the purge loop. `delete_collection` → `DropCollection`;
-  per-collection index rebuild → `DropCollection` + `ReplaceGeneration` + reinserts (the collection is
-  unsearchable meanwhile). Record deletion = `prepare_tombstone` + `Writer::tombstone` under the admin mutex, then
-  `Op::Tombstone`.
+- `Repository::sync_index()` and `rebuild_index()` exist since M18 (see the secondary-index paragraph below).
+- `train_dictionary(TrainOptions) -> TrainReport` (M20, `train.rs`): bottom-k deterministic sample of the live
+  records (key `xxh3(uuid || segment || offset)`, warcinfo and stored size > 1 MiB excluded, heap of
+  `max_samples` entries), read in locator order with `Snapshot::read_plain`, `zframe::train`, then
+  `DictStore::install` with the label `<slug>_<YYYYmmddHHMMSS>` (sanitised). Same CDX prefix + options = same
+  dictionary and id; `install` is atomic and idempotent on content. Read-only for the collection: no admin mutex
+  (it delays neither shutdown nor a rebuild; a rebuild removing the sampled generation gives `StaleLocator`), one
+  training at a time per repository (`train_sem`). `data/buffer/` stays in the layout, unused ([LEGACY] deviation
+  from spec 4.4 steps 1/3/6 and 5.2: the directory lock replaces the cross-process lock, samples are in memory under
+  `max_total_bytes`). No combined "train then rebuild" option: callers compose the two calls.
+- Rebuild protocol (M20, `rebuild.rs`): `CollectionHandle::rebuild(Codec, RebuildOptions) -> RebuildReport` registers
+  under the gate read guard (`RebuildSlot::active`, one per collection: `RebuildInProgress`), then runs as a spawned
+  unit: `rebuild_sem` permit, the collection's admin mutex (held to the end; the writer task never takes it),
+  **start** job (`Rebuilder::start` with `RebuildSlot::rb` locked; the same mutex is held by the writer task during
+  every reopen, so `Collection::open` can never delete the files of a live `Rebuilder`), `IndexCmd::Stage`
+  (`DiscardStaged` + staged `Checkpoint{new gen, Rebuilder::cdx_start()}`, best effort), copy rounds
+  (`copy_until(published cdx_len)` until the delta < 1 MiB or 8 rounds), `Msg::Finish` (the writer task stops
+  draining, takes the `Rebuilder`, runs `finish`: final delta, fsyncs, checkpoint, **manifest swap = commit point**,
+  then `Published::switch(snapshot, cdx_len)` and wakes the indexer), `IndexCmd::AwaitActive` (the indexer resumes
+  at the staged checkpoint after the switch, indexes the new CDX as staged rows and `ReplaceGeneration`s in the
+  last batch), `Published::clear_retired`, `OldGeneration::remove`. Failure before the commit: abort the
+  `Rebuilder` (files deleted) + `IndexCmd::Unstage`, the old generation stays active; a `finish` failure that
+  poisoned the writer is resolved by a reopen (`Error::Rebuild { committed }`). A writer reopen during the rebuild
+  sets the slot's cancel flag, drops the `Rebuilder` and the unit ends with `RebuildAborted`. Requests prepared for
+  the old generation that reach the writer after the switch get `Rejected::Stale` (one generation comparison per
+  item) and their caller prepares them again with `Preparer::reprepare` (at most 3 times, then `StaleGeneration`).
+  Crash table: before the swap, `open` deletes the `N+1` files and the first index resolution discards the staged
+  rows; after the swap, `open` deletes generation `N` and the indexer resumes at the staged checkpoint (or
+  re-indexes if `Stage` never applied); crash before `old.remove`: `open` deletes the old files.
+- Retired snapshot (M20): `Published` holds `{ current, retired }` under one `RwLock`; `retired` is the snapshot of
+  the generation the last committed rebuild replaced, kept until the index has switched, so `get`/`get_raw`/`get_by_*`
+  of old-generation locators keep working through the switch window (then `StaleLocator`; a retired read whose
+  files were removed also gives `StaleLocator`). `scan` pages still give `StaleLocator` after a switch. If the index wait
+  after a rebuild fails (`RebuildReport::index_switched == false`: index failure, shutdown), the old files are removed
+  anyway and index hits of the old generation return `StaleLocator` until the index catches up.
+- Shutdown is the cancel for rebuild and training: it sends `closing` (a `watch`) and sets every slot's cancel flag
+  before taking any admin mutex; the units check them at each phase and race their waits (index replies, test
+  pauses) with the signal. After `Msg::Finish` was sent the final step is bounded (what 8 rounds left) and the
+  cancel flag may still fail it (its final `copy_until` checks it): nothing is committed, the writer task removes the
+  new files, the index is unstaged and the unit returns `ShuttingDown`. `Stage` is skipped (`Ok(false)`) while a
+  staged checkpoint of another generation is pending (an earlier rebuild whose index switch failed): that one is kept
+  and the new generation re-indexes after its own switch. There is no user cancel API.
+  Index staging contract: `IndexCmd::{Stage, Unstage, AwaitActive}` are described in `indexer.rs`.
 - Per-collection writer task with a bounded queue and group commit; readers use `Arc<Snapshot>`. The writer
   task is a tokio task that runs each commit in one `spawn_blocking` (not a dedicated thread: a commit is
   two fsyncs, and a thread per collection would idle). Callers prepare in the blocking pool, then queue a
   request; the task drains the queued requests without waiting (at most `max_group_requests` and
   `min(max_group_bytes, split_threshold)` stored bytes, a single larger request goes alone) into one
   `Writer::commit`, then answers each request. A non-poisoning commit error (nothing was written) falls back to
-  committing each request alone; a poisoned writer is reopened **by the writer task itself** (no admin mutex: M20's
-  rebuild holds it while waiting for the writer task, so waiting for it here would deadlock; M20 must abort an
-  in-progress `Rebuilder` first) and the group is retried once; a lost writer is reopened at the next group. The
+  committing each request alone; a poisoned writer is reopened **by the writer task itself** (no admin mutex: the
+  rebuild holds it while waiting for the writer task, so waiting for it here would deadlock; the reopen cancels and
+  drops an in-progress `Rebuilder` under the slot mutex first) and the group is retried once; a lost writer is reopened at the next group. The
   task publishes counters and the fsynced CDX length (`Published::cdx_len`, read together with the snapshot by
   `Published::tail`), then wakes the indexer if the length changed. `on_committed` is only a debug log: the index
   tails the CDX.
@@ -374,7 +411,8 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
     gives `StaleLocator`. `Fetch::{None, Decoded, Raw}`; a record that cannot be read is an error on its item.
   - (c) `search`, `find_by_*`, `get_by_*` are index-backed and eventually consistent (Q14, `sync_index`).
     `UrlPattern` is re-exported as the query type; limits `1..=10 000` (default 100); index-cursor tokens; a hit of a
-    non-active generation gives `StaleLocator` (Q16); a hit in a collection that is not loaded gives
+    non-active generation gives `StaleLocator` (Q16: the generation a rebuild just replaced stays readable until the
+    index has switched); a hit in a collection that is not loaded gives
     `UnknownCollection` on `get_by_id`; `HeaderOnly` mismatches give `NotDecodable` (raw path: `find_*` + `get_raw`).
     `get_by_*` hold one read permit across the lookup and the read.
   - (d) Errors: `InvalidQuery`, `IndexQuery`, `Envelope`, `Import { report, source }`.
@@ -430,13 +468,18 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
     holding the index handle (M19) keeps the file locked until it ends. Dropping everything without `shutdown` drains
     the index too (the channel closes when the last writer task and `Core` are gone).
   - Errors: `IndexOpen` (kind `Io`), `IndexLagging`, `IndexUnavailable` (kind `Unavailable`).
-  - Lock order: `Core::gate`, `create_lock`, `index_rebuild`, per-collection `admin` (ascending uuid), `registry`,
-    then the leaves `Published::snapshot`, pool mutexes, `Hub::dirty`, `Core::index`, `Inner::index_task`.
-  - Contract kept for M20/M21: M20 adds `IndexCmd::Apply { ops, reply }` (applied alone, between passes, setting the
-    purge flag if structural) or lets the indexer tail the new generation's CDX as a staged feed; either way the
-    resolution rule `a < target` + staged checkpoint completes a switch after a crash. M20 must store the new snapshot
-    and its `cdx_len` together (`Published::tail` contract) and must not run while `rebuild_index` holds the admin
-    mutexes. M21 adds `IndexCmd::Forget { key, reply }` (remove the track, `DropCollection` durable before replying).
+  - Lock order (M20): `Core::gate`, `create_lock`, `index_rebuild`, `rebuild_sem` (a permit, rebuild units only),
+    per-collection `admin` (ascending uuid), `registry`, then the leaves `RebuildSlot::rb` (held during blocking I/O by
+    design, nothing else is taken meanwhile), `Published::snapshot`, pool mutexes, `Hub::dirty`, `Core::index`,
+    `Inner::index_task`. `train_sem` is taken with no other lock held. The writer task never takes the admin mutex or
+    the gate; the indexer takes neither.
+  - Rebuild commands (M20): `IndexCmd::Stage { key, generation, from, reply }` (if the active generation is below:
+    `DiscardStaged` + staged `Checkpoint{generation, from}`; `Ok(false)` otherwise), `Unstage` (`DiscardStaged` under
+    the same condition) and `AwaitActive` (a one-collection barrier for the new generation). `Stage`/`Unstage` run
+    between passes from `admin_ops` and set the purge flag; the in-memory `Track` is not touched: after the snapshot
+    switch the next resolution finds `active < target` + the staged checkpoint and resumes there. The writer task
+    stores the new snapshot and its `cdx_len` together (`Published::switch`). Contract kept for M21:
+    `IndexCmd::Forget { key, reply }` (remove the track, `DropCollection` durable before replying).
   - Deviation from the earlier text of this section ("a bounded queue of op batches", a purge task with a timer):
     tailing the CDX removes the queue, the loss on overflow and a second code path for catch-up.
 
@@ -473,7 +516,7 @@ Edge list (authoritative):
 | collection | warc, zframe, cdx, seglog, durable |
 | index | warc, cdx, urlkey |
 | index-redb | index, cdx |
-| masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe, cdx, durable |
+| masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe (`codec`, `train`), cdx, durable |
 
 `index` also depends on `warc` (for `WarcDate`); `index-redb` uses `WarcDate`/`UrlPattern` through `index`'s re-exports.
 
@@ -530,8 +573,9 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
    queuing, so the writer only appends. The engine keeps a bounded per-worker `Preparer` pool for this.
 4. **Lock-free readers**: readers clone an `Arc<Snapshot>` (published under a `std::sync::RwLock<Arc<_>>`
    held only for the clone) and use `pread` on shared file handles. Appends never invalidate a snapshot;
-   a rebuild publishes a new one. A read through a retired snapshot that finds its file gone returns
-   `Stale` and the engine retries once with the current snapshot.
+   a rebuild publishes a new one and keeps the previous one as the *retired* snapshot until the secondary index has
+   switched. A read through a snapshot that finds a segment gone (`SegmentMissing`) is retried once with the current
+   snapshot of the same generation; if the generation changed meanwhile it is `StaleLocator`.
 5. **Durability lives in `collection` (per-collection data) and `durable` (primitives)**: data → fsync →
    CDX → fsync → (index apply). Manifests, dictionaries and config only via `atomic_write`. The secondary
    index is never needed for correctness: its checkpoint `(gen, cdx_offset)` lets the engine replay the CDX
@@ -543,8 +587,9 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
    A rebuild allocates `next_gen_id`, bumps it only at its commit, and deletes leftover generations at `start`
    as `open` does.
 7. **One process per repository**: `DirLock` on `<workdir>/.lock` at `open`. Within the process, a
-   `tokio::Mutex` per collection serializes admin operations (rebuild, train, delete) — it replaces the
-   buffer-directory lock; training samples are held in memory under a byte cap, not written as files.
+   `tokio::Mutex` per collection serializes admin operations (rebuild, delete, rename, record deletion);
+   dictionary training is read-only and bounded by a repository-wide semaphore; samples are held in memory under a
+   byte cap, not written as files (the buffer-directory lock is replaced by the directory lock).
 8. **Bounded resources**: open-file LRU in `seglog::Reader`, dictionary cache in `dictstore`, bounded writer
    queues, caps on header bytes, record size, envelope size and decompressed size, all configurable.
 9. **Libraries do not log**: recovery and load problems are returned as data (`RecoveryReport`, skipped
@@ -641,5 +686,18 @@ These override the spec where they differ.
     M19: scan reads the CDX and is not affected; index-backed queries follow Q14.
 15. **Envelope import failure semantics** (M19): `OnInvalid::Abort` by default, `Skip` optional, framing errors always
     fatal, the committed set is a stream prefix reported by `committed_offset`. *Recommend* as is.
-16. **Index hit of a non-active generation** (M19): `StaleLocator`, no silent retry (the engine keeps no retired
-    snapshot). *Recommend* as is (revisit in M20).
+16. **Index hit of a non-active generation** (M19): `StaleLocator`, no silent retry. **Revisited (M20)**: the
+    generation a rebuild just replaced stays readable through the retired snapshot until the index has switched;
+    `StaleLocator` afterwards (and for `scan` pages after a switch).
+17. **Index staging timing** (M20): the new generation is staged *after* the manifest commit, through the tail and
+    resolution rule 4, from a staged checkpoint placed by `IndexCmd::Stage` at rebuild start; no reader ever touches
+    an uncommitted CDX and the retired snapshot covers the window. *Adopted.*
+18. **"Train then rebuild" option** (spec 4.4 step 8, M20): not provided; callers compose `train_dictionary` and
+    `rebuild`. *Adopted.*
+19. **Rebuild cancel API** (M20): none; shutdown cancels a rebuild before its final step and a dropped caller future
+    does not. A `cancel_rebuild` can be added if operators need it. *Adopted.*
+20. **Training sample** (M20): bottom-k by `xxh3(uuid || segment || offset)` over the live, non-warcinfo entries with
+    stored size <= 1 MiB, read in locator order: deterministic for a CDX prefix, independent of CDX order, `O(k)`
+    memory. *Adopted.*
+21. **`data/buffer/`** (M20): unused ([LEGACY] deviation from spec 4.4/5.2); training takes no admin mutex and runs one
+    at a time per repository through a semaphore. *Adopted.*

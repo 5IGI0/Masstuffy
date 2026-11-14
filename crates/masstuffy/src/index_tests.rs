@@ -664,3 +664,158 @@ async fn bench_index_sync_every() {
         repo.shutdown().await.unwrap();
     }
 }
+
+// ---- Rebuild commands (M20).
+
+async fn stage(
+    repo: &Repository,
+    key: CollectionKey,
+    generation: u32,
+    from: u64,
+) -> Result<bool, Error> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    repo.core()
+        .index_link
+        .tx
+        .send(crate::indexer::IndexCmd::Stage {
+            key,
+            generation,
+            from,
+            reply,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
+async fn unstage(repo: &Repository, key: CollectionKey, generation: u32) -> Result<(), Error> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    repo.core()
+        .index_link
+        .tx
+        .send(crate::indexer::IndexCmd::Unstage {
+            key,
+            generation,
+            reply,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
+async fn await_active(repo: &Repository, key: CollectionKey, generation: u32) -> Result<(), Error> {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    repo.core()
+        .index_link
+        .tx
+        .send(crate::indexer::IndexCmd::AwaitActive {
+            key,
+            generation,
+            reply,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
+rt_test! {
+async fn stage_applies_when_active_below() {
+    let td = TestDir::new();
+    let repo = Repository::init(td.repo()).await.unwrap();
+    let h = repo.create_collection("a", Codec::None).await.unwrap();
+    put_n(&h, 1, 5).await;
+    repo.sync_index().await.unwrap();
+    let before = index_state(&repo, &h);
+    assert_eq!(before.staged_checkpoint, None);
+    assert!(stage(&repo, key(&h), 2, 123).await.unwrap());
+    let st = index_state(&repo, &h);
+    assert_eq!(st.staged_checkpoint, Some(Checkpoint { generation: 2, cdx_offset: 123 }));
+    assert_eq!(st.checkpoint, before.checkpoint);
+    assert_eq!(st.active_generation, Some(1));
+    // A new stage replaces the staged checkpoint.
+    assert!(stage(&repo, key(&h), 2, 456).await.unwrap());
+    assert_eq!(
+        index_state(&repo, &h).staged_checkpoint,
+        Some(Checkpoint { generation: 2, cdx_offset: 456 })
+    );
+    // The visible rows are untouched.
+    assert_i8(&repo, &h).await;
+    repo.shutdown().await.unwrap();
+}
+}
+
+rt_test! {
+async fn stage_skipped_when_not_below() {
+    let td = TestDir::new();
+    let repo = Repository::init(td.repo()).await.unwrap();
+    let h = repo.create_collection("a", Codec::None).await.unwrap();
+    repo.sync_index().await.unwrap();
+    let before = index_state(&repo, &h);
+    // Not above the active generation, and unknown to the index: nothing is applied.
+    assert!(!stage(&repo, key(&h), 1, 99).await.unwrap());
+    assert!(!stage(&repo, CollectionKey::new(0xdead), 2, 99).await.unwrap());
+    assert_eq!(index_state(&repo, &h), before);
+    unstage(&repo, key(&h), 1).await.unwrap();
+    unstage(&repo, CollectionKey::new(0xdead), 2).await.unwrap();
+    assert_eq!(index_state(&repo, &h), before);
+    repo.shutdown().await.unwrap();
+}
+}
+
+rt_test! {
+async fn unstage_clears() {
+    let td = TestDir::new();
+    let repo = Repository::init(td.repo()).await.unwrap();
+    let h = repo.create_collection("a", Codec::None).await.unwrap();
+    repo.sync_index().await.unwrap();
+    assert!(stage(&repo, key(&h), 2, 50).await.unwrap());
+    assert!(index_state(&repo, &h).staged_checkpoint.is_some());
+    unstage(&repo, key(&h), 2).await.unwrap();
+    assert_eq!(index_state(&repo, &h).staged_checkpoint, None);
+    repo.shutdown().await.unwrap();
+}
+}
+
+rt_test! {
+async fn await_active_completes_after_switch() {
+    let td = TestDir::new();
+    let repo = Repository::init(td.repo()).await.unwrap();
+    let h = repo.create_collection("a", Codec::None).await.unwrap();
+    put_n(&h, 1, 20).await;
+    // Active generation 1 and every committed line indexed.
+    await_active(&repo, key(&h), 1).await.unwrap();
+    assert_i8(&repo, &h).await;
+    // Unknown collection.
+    let e = await_active(&repo, CollectionKey::new(0xdead), 1).await.err().unwrap();
+    assert!(matches!(e, Error::IndexUnavailable), "{e:?}");
+    // A generation switch: the command waits until the new generation is active.
+    let rep = h.rebuild(Codec::None, Default::default()).await.unwrap();
+    assert!(rep.index_switched);
+    assert_eq!(index_state(&repo, &h).active_generation, Some(2));
+    assert_i8(&repo, &h).await;
+    repo.shutdown().await.unwrap();
+}
+}
+
+rt_test! {
+async fn stage_keeps_pending_staging_of_another_generation() {
+    let td = TestDir::new();
+    let repo = Repository::init(td.repo()).await.unwrap();
+    let h = repo.create_collection("a", Codec::None).await.unwrap();
+    repo.sync_index().await.unwrap();
+    assert!(stage(&repo, key(&h), 2, 50).await.unwrap());
+    // Another generation while generation 2's switch is pending: skipped, nothing overwritten.
+    assert!(!stage(&repo, key(&h), 3, 80).await.unwrap());
+    assert_eq!(
+        index_state(&repo, &h).staged_checkpoint,
+        Some(Checkpoint { generation: 2, cdx_offset: 50 })
+    );
+    // The same generation (a retry) restages.
+    assert!(stage(&repo, key(&h), 2, 60).await.unwrap());
+    assert_eq!(
+        index_state(&repo, &h).staged_checkpoint,
+        Some(Checkpoint { generation: 2, cdx_offset: 60 })
+    );
+    repo.shutdown().await.unwrap();
+}
+}

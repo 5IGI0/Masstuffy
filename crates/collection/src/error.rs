@@ -90,6 +90,9 @@ pub enum PrepareError {
         /// The declared content size, if any.
         content_size: Option<u64>,
     },
+    /// `reprepare` was given a record of another collection.
+    #[error("record was prepared for another collection")]
+    ForeignContext,
     /// The payload is empty.
     #[error("empty payload")]
     EmptyPayload,
@@ -462,6 +465,9 @@ pub enum Error {
     /// An earlier error stopped this rebuild; abort it.
     #[error("rebuild is poisoned by an earlier error")]
     RebuildPoisoned,
+    /// The rebuild's cancel flag was set (`Rebuilder::set_cancel`); abort it.
+    #[error("rebuild cancelled")]
+    RebuildCancelled,
     /// A tombstone was written after the rebuild copied its first range.
     #[error("tombstone at index byte {cdx_offset} written during a rebuild")]
     TombstoneDuringRebuild {

@@ -7,7 +7,10 @@ use std::io::Read;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
-use masstuffy_collection::{CHECKPOINT_MIN_GROWTH, DEFAULT_SPLIT_THRESHOLD, Options, RawCheck};
+use masstuffy_collection::{
+    CHECKPOINT_MIN_GROWTH, DEFAULT_SPLIT_THRESHOLD, MAX_REBUILD_WORKERS, Options, RawCheck,
+    RebuildOptions,
+};
 use masstuffy_dictstore::{DEFAULT_CACHE_BYTES, DEFAULT_MAX_FILE_SIZE};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +75,18 @@ pub struct Config {
     /// CDX lines per secondary-index batch (shared by the collections of one indexer pass).
     /// Default 8192. `64..=65536`.
     pub index_batch_ops: u32,
+    /// Transcoding threads of one rebuild. `None`: `RebuildOptions::suggested_workers()` of the
+    /// collection crate. `Some(1..=256)`. Added after the first release of schema 1 (same
+    /// compatibility note as `index_sync_every`).
+    pub rebuild_workers: Option<u32>,
+    /// Default in-flight byte budget of a rebuild's transcoding pool. Default 256 MiB.
+    /// `1 MiB..=1 TiB`.
+    pub rebuild_inflight_bytes: u64,
+    /// Rebuilds running at once, repository-wide. Default 1. `1..=64`.
+    pub max_concurrent_rebuilds: u32,
+    /// Upper bound of `TrainOptions::max_total_bytes` (dictionary training sample bytes).
+    /// Default 512 MiB. `1 MiB..=1 TiB`.
+    pub max_train_bytes: u64,
 }
 
 impl Default for Config {
@@ -94,6 +109,10 @@ impl Default for Config {
             index_sync_every: 1,
             index_cache_bytes: 64 * MIB,
             index_batch_ops: 8192,
+            rebuild_workers: None,
+            rebuild_inflight_bytes: 256 * MIB,
+            max_concurrent_rebuilds: 1,
+            max_train_bytes: 512 * MIB,
         }
     }
 }
@@ -193,6 +212,23 @@ impl Config {
         in_range(self.index_sync_every.into(), 1, 65536, "index_sync_every")?;
         in_range(self.index_cache_bytes, MIB, TIB, "index_cache_bytes")?;
         in_range(self.index_batch_ops.into(), 64, 65536, "index_batch_ops")?;
+        if let Some(n) = self.rebuild_workers {
+            let max = u64::try_from(MAX_REBUILD_WORKERS).unwrap_or(256);
+            in_range(n.into(), 1, max, "rebuild_workers")?;
+        }
+        in_range(
+            self.rebuild_inflight_bytes,
+            MIB,
+            TIB,
+            "rebuild_inflight_bytes",
+        )?;
+        in_range(
+            self.max_concurrent_rebuilds.into(),
+            1,
+            64,
+            "max_concurrent_rebuilds",
+        )?;
+        in_range(self.max_train_bytes, MIB, TIB, "max_train_bytes")?;
         Ok(())
     }
 
@@ -283,6 +319,10 @@ pub(crate) struct Limits {
     pub(crate) read_permits: usize,
     /// `ceil(max_inflight_put_bytes / 1024)`; one permit is one KiB.
     pub(crate) inflight_kib: u32,
+    /// Transcoding threads of a rebuild (resolved once).
+    pub(crate) rebuild_workers: NonZeroUsize,
+    /// Rebuilds running at once.
+    pub(crate) rebuild_permits: usize,
     pub(crate) collection_opts: Options,
     pub(crate) dict_opts: masstuffy_dictstore::Options,
 }
@@ -299,6 +339,15 @@ impl Limits {
             read_permits: usize::try_from(c.max_concurrent_reads).unwrap_or(1).max(1),
             // validate() caps max_inflight_put_bytes at 1 TiB, so kib <= 2^30.
             inflight_kib: u32::try_from(kib).unwrap_or(u32::MAX),
+            rebuild_workers: match c.rebuild_workers {
+                Some(n) => {
+                    NonZeroUsize::new(usize::try_from(n).unwrap_or(1)).unwrap_or(NonZeroUsize::MIN)
+                }
+                None => RebuildOptions::suggested_workers(),
+            },
+            rebuild_permits: usize::try_from(c.max_concurrent_rebuilds)
+                .unwrap_or(1)
+                .max(1),
             collection_opts: Options {
                 max_record_bytes: c.max_record_bytes,
                 max_open_files: NonZeroUsize::new(usize::try_from(c.max_open_files).unwrap_or(1))
@@ -342,6 +391,30 @@ mod tests {
                 .contains("\"version\": 1")
         );
         assert_eq!(Config::from_json(&json).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn config_rebuild_defaults_and_limits() {
+        let c = Config::default();
+        assert_eq!(
+            (
+                c.rebuild_workers,
+                c.rebuild_inflight_bytes,
+                c.max_concurrent_rebuilds,
+                c.max_train_bytes
+            ),
+            (None, 256 * MIB, 1, 512 * MIB)
+        );
+        let l = Limits::new(&c);
+        assert_eq!(l.rebuild_permits, 1);
+        assert!(l.rebuild_workers.get() >= 1);
+        let c = Config {
+            rebuild_workers: Some(7),
+            ..Config::default()
+        };
+        assert_eq!(Limits::new(&c).rebuild_workers.get(), 7);
+        let json = c.to_json().unwrap();
+        assert_eq!(Config::from_json(&json).unwrap(), c);
     }
 
     #[test]
@@ -406,6 +479,12 @@ mod tests {
             ("index_cache_bytes", "1099511627777"),
             ("index_batch_ops", "63"),
             ("index_batch_ops", "65537"),
+            ("rebuild_workers", "0"),
+            ("rebuild_workers", "257"),
+            ("rebuild_inflight_bytes", "1024"),
+            ("max_concurrent_rebuilds", "0"),
+            ("max_concurrent_rebuilds", "65"),
+            ("max_train_bytes", "0"),
         ] {
             let json = format!(r#"{{"version":1,"{field}":{v}}}"#);
             assert!(

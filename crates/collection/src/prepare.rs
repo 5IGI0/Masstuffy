@@ -7,7 +7,8 @@ use std::sync::Arc;
 use masstuffy_cdx::{DEFAULT_MAX_LINE, Entry, ImportMeta, Kind, digest, encode_entry};
 use masstuffy_warc::{Record, RecordRef, WarcDate};
 use masstuffy_zframe::{
-    CodecError, Compressor, DecoderDict, Decompressor, EncoderDict, inspect_single_frame,
+    CodecError, Compressor, DecoderDict, Decompressor, EncoderDict, inspect_frame,
+    inspect_single_frame,
 };
 
 use crate::PLAIN_FRAME_MIN;
@@ -203,6 +204,8 @@ pub struct Preparer {
     scratch: Vec<u8>,
     /// CDX probe line.
     line: Vec<u8>,
+    /// Decompression context of `reprepare`, created on first use.
+    redecode: Option<Decompressor>,
 }
 
 impl Preparer {
@@ -230,6 +233,7 @@ impl Preparer {
             zstd,
             scratch: Vec::new(),
             line: Vec::new(),
+            redecode: None,
         })
     }
 
@@ -304,6 +308,11 @@ impl Preparer {
         plain: Vec<u8>,
         e: &Entry<'_>,
     ) -> Result<Prepared, PrepareError> {
+        self.encode_plain(plain, meta_of_entry(e))
+    }
+
+    /// Size check, probe and encoding of the decoded record `plain` for this generation.
+    fn encode_plain(&mut self, plain: Vec<u8>, meta: Meta) -> Result<Prepared, PrepareError> {
         let len = u64::try_from(plain.len()).unwrap_or(u64::MAX);
         if len > self.ctx.max_record_bytes {
             return Err(PrepareError::RecordTooLarge {
@@ -311,7 +320,6 @@ impl Preparer {
                 cap: self.ctx.max_record_bytes,
             });
         }
-        let meta = meta_of_entry(e);
         probe(&mut self.line, &meta)?;
         let bytes = match &mut self.zstd {
             None => {
@@ -326,6 +334,53 @@ impl Preparer {
             bytes,
             meta,
         })
+    }
+
+    /// Re-targets `p` (prepared for an earlier generation of the same collection) to this
+    /// preparer's generation: same index fields, stored bytes decoded with `p`'s codec and
+    /// re-encoded with this one (records over `PLAIN_FRAME_MIN` without dictionary, as `prepare`).
+    /// Returns `p` unchanged if it already has this preparer's collection and generation.
+    /// Target codec None requires the decoded bytes to be one WARC record (`Record` otherwise:
+    /// a `HeaderOnly` raw import whose payload is not a WARC cannot move to a None generation,
+    /// the same rule as the rebuild).
+    ///
+    /// # Errors
+    ///
+    /// `ForeignContext` (other collection), `Frame`, `Codec` (decoding), `RecordTooLarge`,
+    /// `Record`, `Entry`, `Codec` (encoding).
+    pub fn reprepare(&mut self, p: Prepared) -> Result<Prepared, PrepareError> {
+        if p.ctx.collection != self.ctx.collection {
+            return Err(PrepareError::ForeignContext);
+        }
+        if p.ctx.generation == self.ctx.generation {
+            return Ok(p);
+        }
+        let Prepared {
+            ctx, bytes, meta, ..
+        } = p;
+        let plain = match ctx.codec {
+            Codec::None => bytes,
+            Codec::Zstd { .. } => {
+                let info = inspect_frame(&bytes)?;
+                let dict = if info.dict_id == 0 {
+                    None
+                } else {
+                    Some(
+                        ctx.decoder
+                            .as_deref()
+                            .ok_or(CodecError::InvalidDictionary)?,
+                    )
+                };
+                let d = match &mut self.redecode {
+                    Some(d) => d,
+                    slot @ None => slot.insert(Decompressor::new()?),
+                };
+                let mut out = Vec::new();
+                d.decompress(&bytes, dict, ctx.max_record_bytes, &mut out)?;
+                out
+            }
+        };
+        self.encode_plain(plain, meta)
     }
 
     /// Validates a delegated raw record (spec 04 4.2b, 06 "Validation de l'import brut") and
@@ -463,6 +518,7 @@ fn decode_full(
 mod tests {
     use super::*;
     use crate::context::Options;
+    use crate::manifest::Manifest;
     use crate::testutil::{
         MapResolver, id_str, manifest_none, manifest_zstd, other_dict, other_id, record,
         record_of_size, trained_id,
@@ -524,6 +580,115 @@ mod tests {
 
     fn dict_frame(src: &[u8]) -> Vec<u8> {
         frame_with(crate::testutil::base_dict(), src)
+    }
+
+    /// A preparer for generation `generation` of collection `n` with `codec`.
+    fn gen_preparer(n: u128, generation: u32, codec: Codec) -> Preparer {
+        let m = Manifest::new(
+            crate::testutil::uuid(n),
+            "test",
+            crate::DEFAULT_SPLIT_THRESHOLD,
+            crate::manifest::Generation {
+                id: generation,
+                codec,
+            },
+            generation + 1,
+        )
+        .unwrap();
+        let ctx = GenContext::new(&m, &Options::default(), &MapResolver::standard()).unwrap();
+        Preparer::new(Arc::new(ctx)).unwrap()
+    }
+
+    /// Decodes the stored bytes of `p` back to the WARC record bytes.
+    fn plain_of(p: &Prepared) -> Vec<u8> {
+        match p.ctx.codec {
+            Codec::None => p.bytes.clone(),
+            Codec::Zstd { .. } => {
+                let info = inspect_frame(&p.bytes).unwrap();
+                let dict = (info.dict_id != 0).then(|| p.ctx.decoder.clone().unwrap());
+                let mut out = Vec::new();
+                Decompressor::new()
+                    .unwrap()
+                    .decompress(&p.bytes, dict.as_deref(), u64::MAX, &mut out)
+                    .unwrap();
+                out
+            }
+        }
+    }
+
+    #[test]
+    fn reprepare_round_trips() {
+        let none = Codec::None;
+        let d1 = crate::testutil::zstd_codec();
+        let d2 = crate::testutil::other_codec();
+        for (from, to) in [(none, d1), (d1, d2), (d1, none), (none, none), (d1, d1)] {
+            let mut src = gen_preparer(0, 1, from);
+            let mut dst = gen_preparer(0, 2, to);
+            let r = record(7, 400);
+            let want = r.as_bytes().to_vec();
+            let p = src.prepare(r).unwrap();
+            let q = dst.reprepare(p).unwrap();
+            assert_eq!(q.ctx.generation, 2);
+            assert_eq!(plain_of(&q), want);
+            assert_eq!(q.digest, digest(&q.bytes));
+            assert_eq!(q.record_id(), id_str(7));
+            if let Codec::Zstd { dict_id, .. } = to {
+                assert_eq!(inspect_frame(&q.bytes).unwrap().dict_id, dict_id.get());
+            }
+        }
+    }
+
+    #[test]
+    fn reprepare_same_generation_unchanged() {
+        let mut src = gen_preparer(0, 1, crate::testutil::zstd_codec());
+        let p = src.prepare(record(1, 100)).unwrap();
+        let (bytes, d) = (p.bytes.clone(), p.digest);
+        let q = src.reprepare(p).unwrap();
+        assert_eq!((q.bytes, q.digest), (bytes, d));
+    }
+
+    #[test]
+    fn reprepare_foreign_collection() {
+        let mut a = gen_preparer(0, 1, Codec::None);
+        let mut b = gen_preparer(1, 2, Codec::None);
+        let p = a.prepare(record(1, 100)).unwrap();
+        assert!(matches!(b.reprepare(p), Err(PrepareError::ForeignContext)));
+    }
+
+    #[test]
+    fn reprepare_header_only_non_warc() {
+        let d1 = crate::testutil::zstd_codec();
+        let d2 = crate::testutil::other_codec();
+        let mut src = gen_preparer(0, 1, d1);
+        let rec = record(3, 50);
+        let payload = b"not a warc record at all, just bytes".to_vec();
+        let stored = dict_frame(&payload);
+        let meta = meta_for(&rec, &stored);
+        let p = src
+            .prepare_raw(&meta, stored, RawCheck::HeaderOnly)
+            .unwrap();
+        let mut to_zstd = gen_preparer(0, 2, d2);
+        let q = to_zstd.reprepare(p).unwrap();
+        assert_eq!(plain_of(&q), payload);
+        assert_eq!(q.record_id(), id_str(3));
+
+        let stored = dict_frame(&payload);
+        let p = src
+            .prepare_raw(&meta_for(&rec, &stored), stored, RawCheck::HeaderOnly)
+            .unwrap();
+        let mut to_none = gen_preparer(0, 3, Codec::None);
+        assert!(matches!(to_none.reprepare(p), Err(PrepareError::Record(_))));
+    }
+
+    #[test]
+    fn reprepare_large_record_is_plain_frame() {
+        let mut src = gen_preparer(0, 1, Codec::None);
+        let mut dst = gen_preparer(0, 2, crate::testutil::zstd_codec());
+        let r = record_of_size(1, 3 << 19);
+        let want = r.as_bytes().to_vec();
+        let q = dst.reprepare(src.prepare(r).unwrap()).unwrap();
+        assert_eq!(inspect_frame(&q.bytes).unwrap().dict_id, 0);
+        assert_eq!(plain_of(&q), want);
     }
 
     #[test]

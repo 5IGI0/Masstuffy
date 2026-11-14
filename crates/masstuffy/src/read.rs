@@ -43,21 +43,37 @@ impl Fetched {
     }
 }
 
-/// Snapshot of `shared` if `generation` is the active one, else `StaleLocator`.
+/// Snapshot of `shared` for `generation`: the active one, or the one a rebuild just replaced as
+/// long as the secondary index has not switched; else `StaleLocator`.
 pub(crate) fn snapshot_for(shared: &Shared, generation: u32) -> Result<Arc<Snapshot>, Error> {
-    let snap = shared.published.load();
-    if generation != snap.generation() {
-        return Err(Error::StaleLocator {
-            expected: snap.generation(),
+    shared
+        .published
+        .load_for(generation)
+        .map_err(|expected| Error::StaleLocator {
+            expected,
             got: generation,
+        })
+}
+
+/// After a `SegmentMissing` on `snap`: the snapshot to retry with (same generation, other `Arc`),
+/// or the `StaleLocator` of a retired snapshot whose files were removed.
+fn retry_snapshot(
+    snap: &Arc<Snapshot>,
+    published: &Published,
+) -> Result<Option<Arc<Snapshot>>, Error> {
+    let cur = published.load();
+    if cur.generation() != snap.generation() {
+        return Err(Error::StaleLocator {
+            expected: cur.generation(),
+            got: snap.generation(),
         });
     }
-    Ok(snap)
+    Ok((!Arc::ptr_eq(snap, &cur)).then_some(cur))
 }
 
 /// Blocking: reads one record (`mode` must not be `Fetch::None`). Retries once with the current
-/// snapshot on `SegmentMissing` (same generation, different `Arc`: a retired snapshot may have
-/// lost its files). Errors are mapped: `EntryMismatch | Record` with `Decoded` give
+/// snapshot on `SegmentMissing` (same generation, different `Arc`); if the generation changed
+/// meanwhile (a retired snapshot whose files were removed) the result is `StaleLocator`. Errors are mapped: `EntryMismatch | Record` with `Decoded` give
 /// `NotDecodable`, the others `Read { collection }`.
 pub(crate) fn read_blocking(
     snap: &Arc<Snapshot>,
@@ -72,23 +88,21 @@ pub(crate) fn read_blocking(
         Fetch::None => return Err(Error::Internal("fetch mode")),
         Fetch::Decoded => {
             let mut r = snap.read(entry, ctx, &mut out).map(|_| ());
-            if matches!(r, Err(ReadError::SegmentMissing { .. })) {
-                let cur = published.load();
-                if !Arc::ptr_eq(snap, &cur) && cur.generation() == snap.generation() {
-                    out.clear();
-                    r = cur.read(entry, ctx, &mut out).map(|_| ());
-                }
+            if matches!(r, Err(ReadError::SegmentMissing { .. }))
+                && let Some(cur) = retry_snapshot(snap, published)?
+            {
+                out.clear();
+                r = cur.read(entry, ctx, &mut out).map(|_| ());
             }
             r.map(|()| Fetched::Decoded(out))
         }
         Fetch::Raw => {
             let mut r = snap.read_raw(entry, &mut out);
-            if matches!(r, Err(ReadError::SegmentMissing { .. })) {
-                let cur = published.load();
-                if !Arc::ptr_eq(snap, &cur) && cur.generation() == snap.generation() {
-                    out.clear();
-                    r = cur.read_raw(entry, &mut out);
-                }
+            if matches!(r, Err(ReadError::SegmentMissing { .. }))
+                && let Some(cur) = retry_snapshot(snap, published)?
+            {
+                out.clear();
+                r = cur.read_raw(entry, &mut out);
             }
             r.map(|encoding| {
                 Fetched::Raw(RawRecord {

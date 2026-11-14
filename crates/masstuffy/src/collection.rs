@@ -12,7 +12,7 @@ use crate::error::Error;
 use crate::pool::PreparerPool;
 use crate::repository::Core;
 use crate::types::{CollectionInfo, Located, RawItem, WriterStats};
-use crate::writer::{Committed, Msg, Published, Reply, Request, WriteError};
+use crate::writer::{Committed, Msg, Published, Rejected, Reply, Request, WriteError};
 
 /// One per collection; holds the only long-lived `mpsc::Sender` of its writer task.
 pub(crate) struct Shared {
@@ -23,12 +23,24 @@ pub(crate) struct Shared {
     /// What the secondary index tails for this collection.
     pub(crate) feed: Arc<crate::indexer::IndexFeed>,
     pub(crate) preparers: PreparerPool,
-    /// Per-collection admin mutex (architecture 4.7). M17: taken only by shutdown. M20/M21:
-    /// rebuild, train, delete, rename, record deletion.
+    /// Per-collection admin mutex (architecture 4.7): rebuild, delete, rename, record deletion;
+    /// not training. Taken by shutdown and `rebuild_index` too.
     pub(crate) admin: tokio::sync::Mutex<()>,
+    /// Rebuild state shared with the writer task.
+    pub(crate) rebuild: Arc<crate::rebuild::RebuildSlot>,
     pub(crate) task: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     pub(crate) hooks: Arc<crate::writer::TestHooks>,
+}
+
+/// Times a put is prepared again after a rebuild switched generations under it.
+const MAX_STALE_RETRIES: u32 = 3;
+
+/// The result of a queued request.
+pub(crate) enum Outcome {
+    Done(Vec<Located>),
+    /// Prepared for a generation that is no longer the writer's: nothing was written.
+    Stale(Vec<Prepared>),
 }
 
 /// A handle on one collection. Cheap to clone; usable from any task.
@@ -46,6 +58,12 @@ pub struct CollectionHandle {
 fn admission_permits(total: u64, max: u32) -> u32 {
     let kib = total.div_ceil(1024).max(1);
     u32::try_from(kib.min(u64::from(max))).unwrap_or(max)
+}
+
+fn stored_total(items: &[Prepared]) -> u64 {
+    items
+        .iter()
+        .fold(0u64, |a, p| a.saturating_add(p.stored_len()))
 }
 
 fn len_u64(n: usize) -> u64 {
@@ -93,6 +111,10 @@ impl CollectionHandle {
     /// contiguous in one segment and consecutive in the index (I9). Empty input returns an empty
     /// vector without any I/O.
     ///
+    /// A request prepared for the generation that a rebuild replaces is re-encoded for the new
+    /// generation (raw frames are decoded and re-encoded with the new dictionary, as the rebuild
+    /// does) and committed there.
+    ///
     /// Concurrent puts to one collection are merged into group commits (one fsync pair per group);
     /// the call returns only after its records are durable.
     ///
@@ -104,8 +126,8 @@ impl CollectionHandle {
     ///
     /// # Errors
     ///
-    /// `ShuttingDown`, `Build` / `Prepare` (nothing written), `Commit`, `Reopen`,
-    /// `CollectionUnavailable` (the writer stopped before replying: the request may or may not be
+    /// `ShuttingDown`, `Build` / `Prepare` (nothing written), `StaleGeneration` (nothing written),
+    /// `Commit`, `Reopen`, `CollectionUnavailable` (the writer stopped before replying: the request may or may not be
     /// durable), `Join`.
     pub async fn put(&self, records: Vec<Record>) -> Result<Vec<Located>, Error> {
         let sizes = records
@@ -120,7 +142,9 @@ impl CollectionHandle {
     ///
     /// # Errors
     ///
-    /// As [`put`](Self::put), with `Prepare` for any rejected item.
+    /// As [`put`](Self::put), with `Prepare` for any rejected item. A raw frame prepared for the
+    /// generation that a rebuild replaces is decoded and re-encoded for the new one (as the
+    /// rebuild does) and committed there.
     pub async fn put_raw(&self, items: Vec<RawItem>) -> Result<Vec<Located>, Error> {
         let sizes = items
             .iter()
@@ -199,13 +223,68 @@ impl CollectionHandle {
         if items.is_empty() {
             return Ok((Vec::new(), extra));
         }
-        let bytes = items
-            .iter()
-            .fold(0u64, |a, p| a.saturating_add(p.stored_len()));
+        #[cfg(test)]
+        self.shared.hooks.wait_after_prepare().await;
+        let bytes = stored_total(&items);
         let rx = self.submit(items, bytes, permit).await?;
         drop(gate);
-        let located = self.finish(rx).await?;
-        Ok((located, extra))
+        let mut outcome = self.await_reply(rx).await?;
+        let mut retries = 0;
+        loop {
+            match outcome {
+                Outcome::Done(located) => return Ok((located, extra)),
+                Outcome::Stale(items) => {
+                    if retries >= MAX_STALE_RETRIES {
+                        return Err(Error::StaleGeneration(self.shared.id));
+                    }
+                    retries += 1;
+                    outcome = self.resubmit(items, kib).await?;
+                }
+            }
+        }
+    }
+
+    /// Prepares `items` again for the current generation (a rebuild switched while they were
+    /// queued) and queues them. Nothing of them was written.
+    async fn resubmit(&self, items: Vec<Prepared>, kib: u32) -> Result<Outcome, Error> {
+        let core = &self.core;
+        let gate = core.gate.read().await;
+        if *gate {
+            return Err(Error::ShuttingDown);
+        }
+        let permit = Arc::clone(&core.inflight_sem)
+            .acquire_many_owned(kib)
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        let cpu = Arc::clone(&core.prepare_sem)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::ShuttingDown)?;
+        let shared = Arc::clone(&self.shared);
+        let items = tokio::task::spawn_blocking(move || {
+            let _cpu = cpu;
+            let ctx = Arc::clone(shared.published.load().context());
+            let mut p = shared
+                .preparers
+                .take(&ctx)
+                .map_err(|source| Error::Prepare { index: 0, source })?;
+            let r = items
+                .into_iter()
+                .enumerate()
+                .map(|(index, x)| {
+                    p.reprepare(x)
+                        .map_err(|source| Error::Prepare { index, source })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            shared.preparers.give(p);
+            r
+        })
+        .await
+        .map_err(Error::Join)??;
+        let bytes = stored_total(&items);
+        let rx = self.submit(items, bytes, permit).await?;
+        drop(gate);
+        self.await_reply(rx).await
     }
 
     /// Queues a prepared request. Nothing is written if this fails.
@@ -230,11 +309,12 @@ impl CollectionHandle {
     }
 
     /// Waits for the reply of a queued request and maps it.
-    pub(crate) async fn finish(&self, rx: oneshot::Receiver<Reply>) -> Result<Vec<Located>, Error> {
+    pub(crate) async fn await_reply(&self, rx: oneshot::Receiver<Reply>) -> Result<Outcome, Error> {
         let id = self.shared.id;
         match rx.await {
             Err(_) => Err(Error::CollectionUnavailable(id)),
-            Ok(Err(w)) => Err(match w {
+            Ok(Err(Rejected::Stale(items))) => Ok(Outcome::Stale(items)),
+            Ok(Err(Rejected::Error(w))) => Err(match w {
                 WriteError::Commit(source) => Error::Commit {
                     collection: id,
                     source,
@@ -248,14 +328,25 @@ impl CollectionHandle {
             Ok(Ok(Committed {
                 generation,
                 entries,
-            })) => Ok(entries
-                .into_iter()
-                .map(|entry| Located {
-                    collection: id,
-                    generation,
-                    entry,
-                })
-                .collect()),
+            })) => Ok(Outcome::Done(
+                entries
+                    .into_iter()
+                    .map(|entry| Located {
+                        collection: id,
+                        generation,
+                        entry,
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    /// Test helper: `await_reply` with `Stale` mapped to `StaleGeneration`.
+    #[cfg(test)]
+    pub(crate) async fn finish(&self, rx: oneshot::Receiver<Reply>) -> Result<Vec<Located>, Error> {
+        match self.await_reply(rx).await? {
+            Outcome::Done(l) => Ok(l),
+            Outcome::Stale(_) => Err(Error::StaleGeneration(self.shared.id)),
         }
     }
 

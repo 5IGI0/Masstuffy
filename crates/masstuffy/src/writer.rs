@@ -12,7 +12,8 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use masstuffy_cdx::Entry;
 use masstuffy_collection::{
-    Collection, CollectionId, CommitError, Options, Prepared, RecoveryOptions, Snapshot, Writer,
+    Collection, CollectionId, CommitError, OldGeneration, Options, Prepared, RebuildReport,
+    Rebuilt, RecoveryOptions, Snapshot, Writer,
 };
 use masstuffy_durable::DirLock;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -20,6 +21,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use tracing::{debug, error, warn};
 
 use crate::indexer::{IndexFeed, IndexLink};
+use crate::rebuild::RebuildSlot;
 use crate::resolver::StoreResolver;
 
 /// What a committed request gets back.
@@ -37,7 +39,16 @@ pub(crate) enum WriteError {
     Internal(&'static str),
 }
 
-pub(crate) type Reply = Result<Committed, WriteError>;
+/// Why a request got no `Committed`.
+pub(crate) enum Rejected {
+    /// The commit failed.
+    Error(WriteError),
+    /// A request prepared for another generation than the writer's (a rebuild switched while it
+    /// was queued): nothing was written; the items are handed back to be prepared again.
+    Stale(Vec<Prepared>),
+}
+
+pub(crate) type Reply = Result<Committed, Rejected>;
 
 /// One caller's prepared records.
 pub(crate) struct Request {
@@ -54,12 +65,43 @@ pub(crate) enum Msg {
     Commit(Request),
     /// Finish everything queued before this message, write a final checkpoint, reply, exit.
     Shutdown(oneshot::Sender<()>),
+    /// Rebuild: after the requests queued before this message, take the `Rebuilder` of the slot
+    /// and run its `finish` (final delta, manifest swap), then publish the new generation.
+    Finish(oneshot::Sender<FinishReply>),
+}
+
+/// A committed rebuild: what the rebuild unit needs to finish up.
+pub(crate) struct FinishDone {
+    pub(crate) report: RebuildReport,
+    pub(crate) old: OldGeneration,
+}
+
+/// Why a `Msg::Finish` did not commit a rebuild.
+pub(crate) enum FinishFail {
+    /// No `Rebuilder` in the slot (a reopen took it), or the writer was unavailable (lost or
+    /// poisoned: the `Rebuilder` was aborted by the writer task).
+    Aborted(&'static str),
+    /// `finish` failed. `committed` as `Error::Rebuild::committed`.
+    Failed {
+        source: masstuffy_collection::Error,
+        committed: bool,
+    },
+}
+
+pub(crate) type FinishReply = Result<FinishDone, FinishFail>;
+
+/// The snapshots readers can use. Invariant: `retired`, when `Some`, is the snapshot of the
+/// generation that the last committed rebuild replaced, its files are still on disk, and
+/// `retired.generation() < current.generation()`.
+struct Snaps {
+    current: Arc<Snapshot>,
+    retired: Option<Arc<Snapshot>>,
 }
 
 /// What readers and `stats()` see of a collection. It holds no `Sender`, so the writer task
 /// holding it does not keep its own channel open.
 pub(crate) struct Published {
-    snapshot: RwLock<Arc<Snapshot>>,
+    snapshot: RwLock<Snaps>,
     pub(crate) commits: AtomicU64,
     pub(crate) records: AtomicU64,
     pub(crate) cdx_len: AtomicU64,
@@ -68,41 +110,82 @@ pub(crate) struct Published {
 impl Published {
     pub(crate) fn new(snapshot: Arc<Snapshot>, cdx_len: u64) -> Published {
         Published {
-            snapshot: RwLock::new(snapshot),
+            snapshot: RwLock::new(Snaps {
+                current: snapshot,
+                retired: None,
+            }),
             commits: AtomicU64::new(0),
             records: AtomicU64::new(0),
             cdx_len: AtomicU64::new(cdx_len),
         }
     }
 
-    /// The current snapshot: one read lock and an `Arc` clone. A poisoned lock is recovered: the
-    /// guarded value is a plain `Arc`, always consistent.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Snaps> {
+        // A poisoned lock is recovered: the guarded value is two `Arc`s, always consistent.
+        self.snapshot.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Snaps> {
+        self.snapshot
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The current snapshot: one read lock and an `Arc` clone.
     pub(crate) fn load(&self) -> Arc<Snapshot> {
-        let g = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(&g)
+        Arc::clone(&self.read().current)
     }
 
     /// The current snapshot and the fsynced CDX length, read together: the length is loaded while
-    /// the snapshot read lock is held. M20 must store a new-generation snapshot and its length
-    /// under the write lock (`store_with_len`, added by M20).
+    /// the snapshot read lock is held, and `switch` stores a new-generation snapshot and its length
+    /// under the write lock.
     pub(crate) fn tail(&self) -> (Arc<Snapshot>, u64) {
-        let g = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+        let g = self.read();
         let len = self.cdx_len.load(Ordering::Acquire);
-        (Arc::clone(&g), len)
+        (Arc::clone(&g.current), len)
     }
 
+    /// Replaces the current snapshot after a reopen. A different generation means the reopen
+    /// crossed a switch (`Collection::open` deleted the other generation's files): the retired
+    /// snapshot is dropped.
     pub(crate) fn store(&self, s: Arc<Snapshot>) {
-        let mut g = self
-            .snapshot
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        *g = s;
+        let mut g = self.write();
+        if s.generation() != g.current.generation() {
+            g.retired = None;
+        }
+        g.current = s;
+    }
+
+    /// A committed rebuild: `s` becomes current with its CDX length (both under one write guard),
+    /// the previous snapshot becomes the retired one.
+    pub(crate) fn switch(&self, s: Arc<Snapshot>, cdx_len: u64) {
+        let mut g = self.write();
+        self.cdx_len.store(cdx_len, Ordering::Release);
+        let old = std::mem::replace(&mut g.current, s);
+        g.retired = Some(old);
+    }
+
+    /// Forgets the retired snapshot (the index has switched; its files are about to be removed).
+    pub(crate) fn clear_retired(&self) {
+        self.write().retired = None;
+    }
+
+    /// The snapshot of `generation`: the current one, or the retired one. `Err` holds the current
+    /// generation.
+    pub(crate) fn load_for(&self, generation: u32) -> Result<Arc<Snapshot>, u32> {
+        let g = self.read();
+        if g.current.generation() == generation {
+            return Ok(Arc::clone(&g.current));
+        }
+        match &g.retired {
+            Some(r) if r.generation() == generation => Ok(Arc::clone(r)),
+            _ => Err(g.current.generation()),
+        }
     }
 }
 
 /// Hooks that let tests hold the writer task back or make it lose its writer.
 #[cfg(test)]
-#[derive(Default)]
 pub(crate) struct TestHooks {
     /// When `Some`, the task acquires and forgets one permit before draining each group.
     pub(crate) hold: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -112,6 +195,68 @@ pub(crate) struct TestHooks {
     /// is then skipped): the injected failure.
     pub(crate) panic_on_exit: std::sync::atomic::AtomicBool,
     pub(crate) script: std::sync::Mutex<std::collections::VecDeque<Fault>>,
+    /// Last rebuild point reached by a rebuild unit.
+    pub(crate) rebuild_reached: tokio::sync::watch::Sender<Option<RebuildPoint>>,
+    /// The unit waits for one permit when it reaches that point.
+    pub(crate) rebuild_pause: std::sync::Mutex<Option<(RebuildPoint, Arc<tokio::sync::Semaphore>)>>,
+    /// The unit returns `Internal("injected rebuild crash")` at that point, with no cleanup.
+    pub(crate) rebuild_crash: std::sync::Mutex<Option<RebuildPoint>>,
+    /// `put_stage` waits for one permit after prepare, before submit.
+    pub(crate) after_prepare: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Number of `put_stage` calls that reached the `after_prepare` point.
+    pub(crate) after_prepare_reached: tokio::sync::watch::Sender<u64>,
+    /// The next copy round pauses (slot mutex held) until released.
+    pub(crate) copy_gate: std::sync::Mutex<Option<Arc<CopyGate>>>,
+}
+
+/// `(entered, released)` of a paused copy round.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct CopyGate {
+    pub(crate) state: std::sync::Mutex<(bool, bool)>,
+    pub(crate) cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl CopyGate {
+    pub(crate) fn wait_entered(&self) {
+        let mut g = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while !g.0 {
+            g = self.cv.wait(g).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.cv.notify_all();
+    }
+}
+
+/// Points of a rebuild unit where tests can pause it or make it "crash".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RebuildPoint {
+    Started,
+    Copied,
+    Finished,
+    Switched,
+}
+
+#[cfg(test)]
+impl Default for TestHooks {
+    fn default() -> Self {
+        TestHooks {
+            hold: std::sync::Mutex::new(None),
+            drop_writer_next: std::sync::atomic::AtomicBool::new(false),
+            panic_on_exit: std::sync::atomic::AtomicBool::new(false),
+            script: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            rebuild_reached: tokio::sync::watch::channel(None).0,
+            rebuild_pause: std::sync::Mutex::new(None),
+            rebuild_crash: std::sync::Mutex::new(None),
+            after_prepare: std::sync::Mutex::new(None),
+            after_prepare_reached: tokio::sync::watch::channel(0).0,
+            copy_gate: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 /// An injected commit failure; nothing is written.
@@ -156,6 +301,37 @@ fn injected(faults: &Faults) -> Option<CommitError> {
 
 #[cfg(test)]
 impl TestHooks {
+    /// Blocking: called by a copy round with the slot mutex held; pauses once if a gate is set.
+    pub(crate) fn pause_in_copy(&self) {
+        let gate = self
+            .copy_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(g) = gate {
+            let mut st = g.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.0 = true;
+            g.cv.notify_all();
+            while !st.1 {
+                st = g.cv.wait(st).unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+    }
+
+    pub(crate) async fn wait_after_prepare(&self) {
+        self.after_prepare_reached.send_modify(|n| *n += 1);
+        let sem = self
+            .after_prepare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(s) = sem
+            && let Ok(p) = s.acquire().await
+        {
+            p.forget();
+        }
+    }
+
     async fn before_drain(&self) {
         let sem = self
             .hold
@@ -185,6 +361,7 @@ pub(crate) struct WriterParams {
     pub(crate) lock: Arc<DirLock>,
     pub(crate) feed: Arc<IndexFeed>,
     pub(crate) link: IndexLink,
+    pub(crate) rebuild: Arc<RebuildSlot>,
     #[cfg(test)]
     pub(crate) hooks: Arc<TestHooks>,
 }
@@ -208,6 +385,8 @@ pub(crate) struct WriterTask {
     /// What the secondary index tails, and how to wake it.
     feed: Arc<IndexFeed>,
     link: IndexLink,
+    /// The rebuild state shared with the rebuild unit.
+    rebuild: Arc<RebuildSlot>,
     #[cfg(test)]
     hooks: Arc<TestHooks>,
 }
@@ -226,6 +405,7 @@ struct Target {
     dir: PathBuf,
     opts: Options,
     resolver: Arc<StoreResolver>,
+    slot: Arc<RebuildSlot>,
 }
 
 struct BlockingOutcome {
@@ -253,6 +433,7 @@ impl WriterTask {
             _lock: p.lock,
             feed: p.feed,
             link: p.link,
+            rebuild: p.rebuild,
             #[cfg(test)]
             hooks: p.hooks,
         }
@@ -270,6 +451,10 @@ impl WriterTask {
                 None if stop.is_some() => break,
                 None => match self.rx.recv().await {
                     Some(Msg::Commit(r)) => r,
+                    Some(Msg::Finish(r)) => {
+                        self.run_finish(r).await;
+                        continue;
+                    }
                     Some(Msg::Shutdown(ack)) => {
                         stop = Some(Some(ack));
                         break;
@@ -284,6 +469,9 @@ impl WriterTask {
             self.hooks.before_drain().await;
             let mut bytes = first.bytes;
             let mut group = vec![first];
+            // A `Finish` read while draining runs right after this group (`pending` and `finish`
+            // are never both set: the loop stops at the first of them).
+            let mut finish: Option<oneshot::Sender<FinishReply>> = None;
             while stop.is_none() && group.len() < self.group_requests_cap {
                 match self.rx.try_recv() {
                     Ok(Msg::Commit(r)) => match bytes.checked_add(r.bytes) {
@@ -296,12 +484,19 @@ impl WriterTask {
                             break;
                         }
                     },
+                    Ok(Msg::Finish(r)) => {
+                        finish = Some(r);
+                        break;
+                    }
                     Ok(Msg::Shutdown(ack)) => stop = Some(Some(ack)),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => stop = Some(None),
                 }
             }
             self.commit_group(group).await;
+            if let Some(r) = finish.take() {
+                self.run_finish(r).await;
+            }
         }
         self.final_checkpoint().await;
         if let Some(Some(ack)) = stop {
@@ -313,7 +508,41 @@ impl WriterTask {
         }
     }
 
+    /// Answers `Stale` to every request prepared for another generation than the writer's, and
+    /// returns the others. Without a writer (lost) nothing is filtered.
+    fn reject_stale(&self, group: Vec<Request>) -> Vec<Request> {
+        let Some(w) = &self.writer else {
+            return group;
+        };
+        let generation = w.generation();
+        let id = self.id;
+        let mut keep = Vec::with_capacity(group.len());
+        for r in group {
+            let stale = r.items.iter().any(|p| {
+                let c = p.context();
+                c.generation() != generation || c.collection() != id
+            });
+            if stale {
+                let Request {
+                    items,
+                    reply,
+                    permit,
+                    ..
+                } = r;
+                let _ = reply.send(Err(Rejected::Stale(items)));
+                drop(permit);
+            } else {
+                keep.push(r);
+            }
+        }
+        keep
+    }
+
     async fn commit_group(&mut self, group: Vec<Request>) {
+        let group = self.reject_stale(group);
+        if group.is_empty() {
+            return;
+        }
         let n = group.len();
         let total: usize = group.iter().map(|r| r.items.len()).sum();
         let mut items = Vec::with_capacity(total);
@@ -343,6 +572,7 @@ impl WriterTask {
             dir: self.dir.clone(),
             opts: self.opts,
             resolver: Arc::clone(&self.resolver),
+            slot: Arc::clone(&self.rebuild),
         };
         let job_lens = lens.clone();
         #[cfg(test)]
@@ -359,7 +589,9 @@ impl WriterTask {
                 error!(collection = %self.id, "writer commit task failed: {e}");
                 self.writer = None;
                 for (reply, permit) in slots {
-                    let _ = reply.send(Err(WriteError::Internal("writer commit panicked")));
+                    let _ = reply.send(Err(Rejected::Error(WriteError::Internal(
+                        "writer commit panicked",
+                    ))));
                     drop(permit);
                 }
                 return;
@@ -370,7 +602,8 @@ impl WriterTask {
         if let Some(s) = outcome.new_snapshot {
             self.published.store(s);
         }
-        let mut replies: Vec<Option<Reply>> = (0..n).map(|_| None).collect();
+        let mut replies: Vec<Option<Result<Committed, WriteError>>> =
+            (0..n).map(|_| None).collect();
         let mut commits = 0u64;
         let mut acked = 0u64;
         for done in outcome.done {
@@ -413,7 +646,9 @@ impl WriterTask {
             }
         }
         for ((reply, permit), r) in slots.into_iter().zip(replies) {
-            let r = r.unwrap_or(Err(WriteError::Internal("no result for request")));
+            let r = r
+                .unwrap_or(Err(WriteError::Internal("no result for request")))
+                .map_err(Rejected::Error);
             // A dropped receiver means the caller cancelled; the write stands.
             let _ = reply.send(r);
             drop(permit);
@@ -431,6 +666,59 @@ impl WriterTask {
             records = entries.len(),
             "committed"
         );
+    }
+
+    /// Runs the final step of a rebuild in the blocking pool, then publishes the result. The
+    /// blocking job owns the writer meanwhile (`self.writer` is `None`, no request is drained).
+    async fn run_finish(&mut self, reply: oneshot::Sender<FinishReply>) {
+        let writer = self.writer.take();
+        let target = Target {
+            dir: self.dir.clone(),
+            opts: self.opts,
+            resolver: Arc::clone(&self.resolver),
+            slot: Arc::clone(&self.rebuild),
+        };
+        let lock = Arc::clone(&self._lock);
+        let joined = tokio::task::spawn_blocking(move || {
+            let _lock = lock;
+            finish_blocking(writer, &target)
+        })
+        .await;
+        let out = match joined {
+            Ok(o) => o,
+            Err(e) => {
+                error!(collection = %self.id, "rebuild finish task failed: {e}");
+                self.writer = None;
+                let _ = reply.send(Err(FinishFail::Aborted("finish task panicked")));
+                return;
+            }
+        };
+        self.writer = out.writer;
+        match out.publish {
+            Some(Publish::Switch(snapshot)) => {
+                if let Some(w) = &self.writer {
+                    let len = w.cdx_len();
+                    self.published.switch(snapshot, len);
+                    self.last_checkpoint_len = len;
+                    // The indexer resolves the switch (resume at the staged checkpoint).
+                    self.link.wake(&self.feed);
+                }
+            }
+            Some(Publish::Reopened(snapshot)) => {
+                self.published.store(snapshot);
+                if let Some(w) = &self.writer {
+                    let len = w.cdx_len();
+                    self.last_checkpoint_len = len;
+                    if self.published.cdx_len.swap(len, Ordering::Release) != len {
+                        self.link.wake(&self.feed);
+                    }
+                }
+            }
+            None => {}
+        }
+        // A dropped receiver can only mean the unit task died: the old files are then removed by
+        // the next open.
+        let _ = reply.send(out.result);
     }
 
     async fn maybe_checkpoint(&mut self) {
@@ -487,20 +775,124 @@ impl WriterTask {
 /// Opens the collection again, from disk.
 ///
 /// Exclusivity (precondition of `Collection::open`): the writer task is the only owner of the
-/// collection's `Writer` and the only code path that mutates the collection directory in M17, and
-/// the old writer was dropped before this call. The admin mutex is deliberately not taken: M20's
-/// rebuild holds it while waiting for the writer task, so the task waiting for it would deadlock.
-/// M20 must abort or drop an in-progress `Rebuilder` before the writer task reopens.
+/// collection's `Writer`, the old writer was dropped before this call, and the slot mutex is
+/// held for the whole open, so no `Rebuilder::start` or `copy_until` runs meanwhile. A running
+/// `Rebuilder` is cancelled (its copy stops at the next CDX line), then dropped here: its files
+/// are deleted by the open below. The admin mutex is deliberately not taken: a rebuild holds it
+/// while waiting for this task, so the task waiting for it would deadlock.
 fn reopen(
     dir: &Path,
     opts: &Options,
     resolver: &StoreResolver,
+    slot: &RebuildSlot,
 ) -> Result<(Writer, Arc<Snapshot>), masstuffy_collection::Error> {
-    let (coll, report) = Collection::open(dir, opts, &RecoveryOptions::default(), resolver)?;
+    slot.cancel.store(true, Ordering::SeqCst);
+    let mut g = slot.rb.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(g.take());
+    let r = Collection::open(dir, opts, &RecoveryOptions::default(), resolver);
+    drop(g);
+    let (coll, report) = r?;
     if !report.is_clean() {
         warn!(dir = %dir.display(), ?report, "collection reopened with repairs");
     }
     Ok(coll.into_parts())
+}
+
+/// What the writer task publishes after a finish job.
+enum Publish {
+    /// The rebuild committed: the new generation's snapshot.
+    Switch(Arc<Snapshot>),
+    /// The writer was reopened from disk.
+    Reopened(Arc<Snapshot>),
+}
+
+struct FinishOutcome {
+    writer: Option<Writer>,
+    publish: Option<Publish>,
+    result: FinishReply,
+}
+
+/// Runs in the blocking pool: takes the `Rebuilder` from the slot and runs its `finish`.
+fn finish_blocking(writer: Option<Writer>, target: &Target) -> FinishOutcome {
+    let aborted = |writer, why| FinishOutcome {
+        writer,
+        publish: None,
+        result: Err(FinishFail::Aborted(why)),
+    };
+    let rb = target
+        .slot
+        .rb
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let Some(rb) = rb else {
+        return aborted(writer, "rebuild was cancelled");
+    };
+    let mut w = match writer {
+        Some(w) if !w.is_poisoned() => w,
+        other => {
+            if let Err(e) = rb.abort() {
+                warn!(dir = %target.dir.display(), "cannot remove the files of an aborted rebuild: {e}");
+            }
+            return aborted(other, "writer unavailable");
+        }
+    };
+    let new_gen = rb.report().generation;
+    match rb.finish(&mut w) {
+        Ok(Rebuilt {
+            writer: nw,
+            snapshot,
+            report,
+            old,
+            ..
+        }) => {
+            drop(w); // retired
+            FinishOutcome {
+                writer: Some(nw),
+                publish: Some(Publish::Switch(snapshot)),
+                result: Ok(FinishDone { report, old }),
+            }
+        }
+        Err(source) if !w.is_poisoned() => {
+            // Nothing committed: the new generation's files are leftovers (only disk space).
+            if let Err(e) = w.remove_stale_generations() {
+                warn!(dir = %target.dir.display(), "cannot remove the files of a failed rebuild: {e}");
+            }
+            FinishOutcome {
+                writer: Some(w),
+                publish: None,
+                result: Err(FinishFail::Failed {
+                    source,
+                    committed: false,
+                }),
+            }
+        }
+        Err(source) => {
+            // The manifest swap may or may not have happened: only a reopen can tell.
+            drop(w);
+            match reopen(&target.dir, &target.opts, &target.resolver, &target.slot) {
+                Ok((w2, s)) => {
+                    let committed = s.generation() == new_gen;
+                    FinishOutcome {
+                        writer: Some(w2),
+                        publish: Some(Publish::Reopened(s)),
+                        result: Err(FinishFail::Failed { source, committed }),
+                    }
+                }
+                Err(re) => {
+                    error!(dir = %target.dir.display(), "reopen after a failed rebuild failed: {re}");
+                    FinishOutcome {
+                        writer: None,
+                        publish: None,
+                        result: Err(FinishFail::Failed {
+                            source,
+                            committed: false,
+                        }),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The item range of requests `r`, from the prefix sums `offsets`.
@@ -576,7 +968,7 @@ fn commit_blocking(
         Some(w) if !drop_first && !w.is_poisoned() => w,
         other => {
             drop(other);
-            match reopen(&target.dir, &target.opts, &target.resolver) {
+            match reopen(&target.dir, &target.opts, &target.resolver, &target.slot) {
                 Ok((w, s)) => {
                     out.new_snapshot = Some(s);
                     w
@@ -603,7 +995,7 @@ fn commit_blocking(
             warn!(dir = %dir.display(), "commit failed, reopening the collection");
             drop(f);
             drop(w);
-            match reopen(&target.dir, &target.opts, &target.resolver) {
+            match reopen(&target.dir, &target.opts, &target.resolver, &target.slot) {
                 Ok((mut w2, s)) => {
                     out.new_snapshot = Some(s);
                     // Retry the unacknowledged batch once (at-least-once: a prefix may be
@@ -659,4 +1051,81 @@ fn commit_blocking(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use masstuffy_collection::{
+        Codec, CollectionId, CreateSpec, DEFAULT_SPLIT_THRESHOLD, DictResolver, RebuildOptions,
+        ResolveError,
+    };
+    use masstuffy_zframe::{DecoderDict, EncoderDict};
+
+    use super::*;
+    use crate::testutil::TestDir;
+
+    /// No dictionaries: enough for Codec::None collections.
+    struct NoDicts;
+
+    impl DictResolver for NoDicts {
+        fn decoder(&self, id: NonZeroU32) -> Result<Arc<DecoderDict>, ResolveError> {
+            Err(ResolveError::NotFound(id.get()))
+        }
+
+        fn encoder(&self, id: NonZeroU32, _level: i32) -> Result<Arc<EncoderDict>, ResolveError> {
+            Err(ResolveError::NotFound(id.get()))
+        }
+    }
+
+    #[test]
+    fn published_switch_and_retired() {
+        let td = TestDir::new();
+        let opts = Options::default();
+        let (mut c, _) = Collection::create(
+            &td.path().join("c"),
+            CreateSpec {
+                uuid: CollectionId::from_u128(7),
+                slug: "p",
+                codec: Codec::None,
+                split_threshold: DEFAULT_SPLIT_THRESHOLD,
+            },
+            &opts,
+            &NoDicts,
+        )
+        .unwrap();
+        let old = Arc::clone(c.snapshot());
+        let p = Published::new(Arc::clone(&old), c.writer().cdx_len());
+        let (_, gone) = c
+            .rebuild(Codec::None, &opts, RebuildOptions::default(), &NoDicts)
+            .unwrap();
+        let new = Arc::clone(c.snapshot());
+        let new_len = c.writer().cdx_len();
+        assert_eq!((old.generation(), new.generation()), (1, 2));
+        assert_ne!(p.tail().1, new_len);
+
+        p.switch(Arc::clone(&new), new_len);
+        let (cur, len) = p.tail();
+        assert!(Arc::ptr_eq(&cur, &new));
+        assert_eq!(len, new_len);
+        assert!(Arc::ptr_eq(&p.load_for(1).unwrap(), &old));
+        assert!(Arc::ptr_eq(&p.load_for(2).unwrap(), &new));
+        assert_eq!(p.load_for(3).err(), Some(2));
+
+        p.clear_retired();
+        assert_eq!(p.load_for(1).err(), Some(2));
+        assert!(Arc::ptr_eq(&p.load(), &new));
+
+        // `store` of the same generation keeps the retired snapshot; another one drops it.
+        let p1 = Published::new(Arc::clone(&old), 0);
+        p1.switch(Arc::clone(&new), new_len);
+        p1.store(Arc::clone(&new));
+        assert!(p1.load_for(1).is_ok());
+        let p2 = Published::new(Arc::clone(&old), 0);
+        p2.switch(Arc::clone(&new), new_len);
+        p2.store(Arc::clone(&old));
+        assert_eq!(p2.load_for(2).err(), Some(1));
+        drop(gone);
+    }
 }

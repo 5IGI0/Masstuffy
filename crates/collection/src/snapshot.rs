@@ -152,9 +152,13 @@ impl Snapshot {
         Ok(rec)
     }
 
-    /// Reads, verifies and decodes the record of `entry` into `out`, without parsing it as a WARC
-    /// record (rebuild).
-    pub(crate) fn read_plain(
+    /// Reads, verifies the digest of and decodes the record of `entry` into `out`, without parsing
+    /// it as a WARC record (rebuild, dictionary training).
+    ///
+    /// # Errors
+    ///
+    /// `Tombstone`, `SegmentMissing`, `Segment`, `DigestMismatch`, `Frame`, `Codec`.
+    pub fn read_plain(
         &self,
         entry: &Entry<'_>,
         ctx: &mut ReadCtx,
@@ -175,13 +179,13 @@ impl Snapshot {
         }
     }
 
-    /// Decodes already fetched and verified stored bytes: codec None returns `stored` itself (no
-    /// copy), Zstd decompresses into a new buffer under `max_record_bytes`.
-    pub(crate) fn decode_stored(
-        &self,
-        stored: Vec<u8>,
-        ctx: &mut ReadCtx,
-    ) -> Result<Vec<u8>, ReadError> {
+    /// Decodes already fetched and verified stored bytes (`read_raw`): codec None returns `stored`
+    /// itself (no copy), Zstd decompresses into a new buffer under `max_record_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// `Frame`, `Codec`.
+    pub fn decode_stored(&self, stored: Vec<u8>, ctx: &mut ReadCtx) -> Result<Vec<u8>, ReadError> {
         match self.ctx.codec {
             Codec::None => Ok(stored),
             Codec::Zstd { .. } => {
