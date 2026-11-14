@@ -13,6 +13,8 @@ masstuffy-durable = { path = "crates/durable", version = "0.1.0" }
 masstuffy-zframe = { path = "crates/zframe", version = "0.1.0", default-features = false }
 masstuffy-cdx = { path = "crates/cdx", version = "0.1.0" }
 masstuffy-seglog = { path = "crates/seglog", version = "0.1.0" }
+masstuffy-urlkey = { path = "crates/urlkey", version = "0.1.0" }
+masstuffy-index = { path = "crates/index", version = "0.1.0" }
 masstuffy-warc = { path = "crates/warc", version = "0.1.0", default-features = false }
 xxhash-rust = { version = "0.8.16", default-features = false, features = ["xxh3"] }
 zstd = { version = "0.14.4", default-features = false }

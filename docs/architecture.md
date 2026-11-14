@@ -20,7 +20,7 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
   (insertion-ordered headers; `Content-Length` is always computed and written last).
 - `WarcReader<R: BufRead>`: lending sequential reader (fsck, import) with one reusable buffer, caps on
   header bytes, header count and body length; poisoned after the first error.
-- `WarcDate`: strict W3C-ISO8601 parse/format, std only (no date crate).
+- `WarcDate`: strict W3C-ISO8601 parse/format, std only (no date crate); `unix_nanos() -> i128` (absolute instant used by the secondary index for nearest-date and ordering).
 - `Limits`: caps on header bytes, header count and body length.
 - Errors: `ParseError`, `BuildError`, `ReadError` (`thiserror`).
 - Feature `generate` (default on): `RecordBuilder::fill_missing` generates `WARC-Record-ID`
@@ -212,23 +212,47 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
 
 ### Index layer
 
-**`crates/index` — `masstuffy-index`**: the secondary-index contract (spec 1 "Index secondaire", 3.5, 4.3, 4.7).
-- `trait SecondaryIndex: Send + Sync` (sync methods): `apply(&[Op])` atomically, where `Op` is
-  `Insert{collection, gen, entry}`, `Tombstone`, `ReplaceGeneration{collection, gen}`, `DropCollection`;
-  `by_id`, `by_url_nearest(url, date)` (excludes `request`), `by_pattern(&UrlPattern, limit)`;
-  `checkpoint(collection) -> Option<(gen, cdx_offset)>` stored in the same transaction as the ops.
-- `MemIndex`: `BTreeMap` implementation (reference + test double).
-- `conformance` module (feature `conformance`): a test suite any implementation runs against itself.
-- Internal: `cdx`, `urlkey`. External: `thiserror`.
+**`crates/index` — `masstuffy-index`**: the secondary-index contract (spec 1 "Index secondaire", 3.5, 4.3, 4.7, I8).
+- `trait SecondaryIndex: Send + Sync`, object-safe, sync (engine: `spawn_blocking`), linearizable with
+  snapshot isolation (a query never sees part of a batch). `CollectionKey(u128)` (the collection uuid
+  value; `index` does not depend on `collection`), generations are `u32`, `Position { segment, offset }`.
+- `apply(&[Op])`: one atomic, ordered batch of `Insert{collection, generation, entry}` (identity =
+  (collection, generation, position); duplicate identity = no-op), `Tombstone{collection, generation,
+  position}`, `DiscardStaged{collection, generation}` (clears an abandoned staged generation; `NotStaged` if not staged), `ReplaceGeneration{collection, generation}` (O(1) switch; older generations retired, newer stay
+  staged and invisible; lower than active = `StaleGeneration`), `DropCollection` (O(1); a recreated
+  collection never sees old rows), `Checkpoint{collection, (generation, cdx_offset)}` (an op, so it commits
+  with the others; `cdx_offset` = fsynced byte offset after the last applied CDX line); two checkpoint slots (active, staged): a checkpoint of a generation above the active one goes to the staged slot, and `ReplaceGeneration` carries it over.
+- Visible (ACTIVE) = generation == active generation and not tombstoned/dropped. Retired/dropped rows are
+  reclaimed by `purge(max_entries)` in bounded steps (engine background loop), `stored_entries()` for checks.
+- Queries return owned `Hit { collection, generation, entry: cdx::Entry<'static> }`:
+  `by_id(Option<collection>, record_id)` (most recently committed copy = greatest position in a collection;
+  across collections latest WARC-Date then collection key); `by_url_nearest(collection, url, Option<date>)`
+  (URL key = massaged key for http(s), else raw URL exact; `request` excluded; min |Δt|, ties -> later date
+  then later position; no date -> latest); `by_pattern(collection, &UrlPattern, PatternQuery{limit ≤ 10 000,
+  after: Cursor})` -> `Page{hits, next}` in (massaged key, date, position) order, all types, exact `next`,
+  text cursor tokens; `list(collection, after, limit)` in position order (I8 dumps); `state`, `collections`.
+  Shared semantics in `index::rank` (both backends use it).
+- `MemIndex`: `RwLock<State>` over `BTreeMap`s, eager deletes, linear queries (reference + test double).
+- `conformance` module (feature `conformance`, also under `cfg(test)`) + `conformance_tests!(factory)` macro:
+  the suite every implementation runs against itself (incl. drop/recreate, staging, pagination, I8
+  rebuilt == incremental, concurrent readers).
+- Internal: `warc` (`WarcDate`), `cdx`, `urlkey`. External: `thiserror`. Features: `conformance`.
 
 **`crates/index-redb` — `masstuffy-index-redb`**: default embedded `SecondaryIndex` on `redb`.
-- Tables: entries by `(collection, gen, seq)`, `record_id → keys`, `(uri, date) → key`,
-  `massaged_url → key` (ordered: `UrlPattern::key_ranges` become range scans), checkpoints.
+- Tables (suggested; M16 decides): `collections: u128 → (incarnation, active, checkpoint, staged_checkpoint,
+  slot ids)`. Each (collection incarnation, generation, staging attempt) gets a fresh `slot: u64` from a global
+  counter (new slot on first use after `DropCollection` or `DiscardStaged`). Every row key starts with the slot:
+  entries `(slot, segment, offset)`; `(record_id, slot, segment, offset)`; `(slot, massaged_key, date_nanos,
+  segment, offset)` (`UrlPattern::key_ranges` become range scans, cursor = seek); `(slot, raw_uri, date_nanos,
+  segment, offset)` only for URLs `massage` rejects. Visible = slot is the collection's active slot, so
+  pattern, nearest and list scans touch only active rows (O(log n + page) even during a rebuild). Dead slots
+  (retired, dropped, discarded) go to a list that `purge` deletes in bounded transactions. `DropCollection`,
+  `DiscardStaged` and `ReplaceGeneration` stay O(1), and old rows can never come back.
 - Why redb: pure Rust, ACID with fsync on commit, ordered range scans, single file in the workdir; keeps
   the "standalone" goal (spec 6). PostgreSQL would add a server, a network round-trip per lookup and an
   async driver for what is a rebuildable cache; SQLite/LMDB pull C code. A PostgreSQL backend can still be
   written against the trait later.
-- Internal: `index`, `cdx`, `urlkey`. External: `redb`, `thiserror`.
+- Internal: `index`, `warc`, `cdx`, `urlkey`. External: `redb`, `thiserror`.
 
 ### Engine
 
@@ -243,8 +267,11 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `copy_until(published)` until the delta < 1 MiB or 8 rounds; then the writer task runs `finish` with its
   writer, swaps writer and snapshot, re-prepares `WrongGeneration` items, and `old.remove()` runs after the
   publish; on `finish` error with a retired writer -> reopen; if the old writer is poisoned during the rebuild,
-  drop/abort the rebuild before reopening. Index (M18): `ReplaceGeneration` + inserts from the new snapshot's
-  `entries()`. Record deletion = `prepare_tombstone` + `Writer::tombstone` under the admin mutex, then
+  drop/abort the rebuild before reopening. Index (M18/M20): `DiscardStaged{new gen}` first (retry safety), staging chunks carry `Checkpoint{new gen}` (staged slot; the old generation's checkpoint keeps advancing with its appends); stage the new generation's entries (`Insert` with the new generation, chunked, each chunk
+  with `Checkpoint{new gen, offset}`), then `ReplaceGeneration` in the last batch; keep the old generation's
+  files readable until that switch is applied; then the purge loop. `delete_collection` → `DropCollection`;
+  per-collection index rebuild → `DropCollection` + `ReplaceGeneration` + reinserts (the collection is
+  unsearchable meanwhile). Record deletion = `prepare_tombstone` + `Writer::tombstone` under the admin mutex, then
   `Op::Tombstone`.
 - Per-collection writer task with a bounded queue and group commit; readers use `Arc<Snapshot>`.
 - Reads `MASSTUFFY_RAW_IMPORT_CHECK` once at `Repository::open` (→ `RawCheck`) and passes it to every
@@ -283,9 +310,11 @@ Edge list (authoritative):
 | seglog | durable |
 | dictstore | zframe, durable |
 | collection | warc, zframe, cdx, seglog, durable |
-| index | cdx, urlkey |
-| index-redb | index, cdx, urlkey |
+| index | warc, cdx, urlkey |
+| index-redb | index, warc, cdx, urlkey |
 | masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe, cdx, durable |
+
+`index` and `index-redb` also depend on `warc` (for `WarcDate`).
 
 `collection` and `index` do not know each other; only the engine connects data to the secondary index.
 
@@ -310,7 +339,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M12 | `collection`: manifest, `create` (warcinfo), `Writer::commit`, `Snapshot::read` (codec None and Zstd) | warcinfo is entry 0; read back equals input; locators contiguous; raw import validation; concurrent readers while committing; manifest rejection |
 | M13 | `collection`: `open` + recovery | crash states after each commit step (segment truncated at many offsets, CDX truncated at every byte, zero-filled tail) → `open` yields a clean CDX satisfying I2/I4, committed entries readable; corrupt mid-CDX → error, repair → cut + report; leftovers removed, unknown kept; aborted create → `ManifestMissing`; open idempotent; reopen after poison; partial scan from checkpoint; fallback reasons; stale checkpoint removed after repair |
 | M14 | `collection`: tombstones, `entries()`, `Rebuilder` (bounded worker pool) | rebuild None→Zstd, Zstd(D1)→Zstd(D1) (raw copy), Zstd(D1)→Zstd(D2), Zstd→None: live records byte-exact, tombstoned records not copied, new warcinfo first; crash before/after the manifest rename; writes during the rebuild carried over; concurrent readers; tombstone durability/idempotence; `entries()` with interleaved tombstones; pool: output identical for 1 and 4 workers, order preserved, error/panic stops and joins, in-flight memory bound |
-| M15 | `index`: trait, `MemIndex`, conformance suite | nearest-date semantics, `request` excluded, ACTIVE only, pattern queries, checkpoint atomic with ops |
+| M15 | `index`: trait, `MemIndex`, conformance suite | conformance suite on `MemIndex`: nearest-date semantics and ties, `request` excluded, ACTIVE only (tombstones, staged/retired generations, drop/recreate), pattern queries and cursor pagination, checkpoint atomic with ops, idempotent replay, I8 rebuilt == incremental, concurrent readers |
 | M16 | `index-redb` | conformance suite; reopen after drop; concurrent readers during `apply` |
 | M17 | `masstuffy`: init/open, registry, writer task, `put`/`get` by locator | many tasks `put` to one collection → all entries present once, no interleaving inside a batch |
 | M18 | `masstuffy`: secondary-index wiring, catch-up from checkpoint, `rebuild_index` | kill between CDX fsync and index apply → catch-up; rebuilt index equals incremental one (I8) |
@@ -397,6 +426,13 @@ These override the spec where they differ.
   and appends stay on one thread, output is byte-identical for any worker count; in-flight work is capped by
   `workers * 4` records and `max_inflight_bytes` (default 256 MiB).
 
+- **Secondary-index lookups (M15, 2026-11-14)**: URL lookup uses the massaged key for http(s) URLs and exact
+  raw equality for the others; URL and pattern queries are per collection, `by_id` is global with an optional
+  collection filter; `by_id` returns the most recently committed copy within a collection (greatest position),
+  and across collections the copy with the latest WARC-Date, ties broken by the greater collection key.
+- **Conformance lint allow (M15, 2026-11-14)**: a module-level clippy allow (unwrap/expect/panic/indexing) is
+  accepted on the `conformance` module only (test-support code behind the `conformance` feature).
+
 ## 6. Open questions (recommended answers)
 
 1. **Several active generations per collection** (spec 6, Q1)? *Recommend no for v1*: exactly one active
@@ -414,3 +450,10 @@ These override the spec where they differ.
    with an explicit operator repair in M13 if ever needed. **Decided (M13)**: torn tail truncated at open;
    `Corrupt` and I2 violations are errors unless `RepairPolicy::TruncateAtCorruption`; open scans from a
    checkpoint.
+8. **URL lookup by massaged key** (**Decided (user, 2026-11-14)**, see §5): spec 4.3 says `uri = url exactement`.
+   *Recommend* massaged-key equality for http(s) (Wayback-like), exact raw equality for URLs `massage` rejects.
+9. **`by_id` across collections** (**Decided (user, 2026-11-14)**, see §5): most recently committed copy within a
+   collection; across collections the latest WARC-Date wins, ties by collection key (no reproducible
+   cross-collection commit order). *Recommend* as is.
+10. **Nearest ties / no date** (M15, pending user confirmation): equal distance -> later capture, then latest
+    commit; `date = None` -> latest date (not "now"). *Recommend* as is.

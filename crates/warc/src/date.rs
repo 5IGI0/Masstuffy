@@ -55,6 +55,17 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     )
 }
 
+/// Days from 1970-01-01 of (year, month, day), Hinnant's `days_from_civil` (inverse of `civil_from_days`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Value of a non-empty run of ASCII digits (at most 9, so it fits in a `u32`).
 fn digits(b: &[u8]) -> Option<u32> {
     if b.is_empty() || b.len() > 9 || !b.iter().all(u8::is_ascii_digit) {
@@ -149,6 +160,25 @@ impl WarcDate {
             u8::try_from(sod % 60).ok()?,
             d.subsec_nanos(),
         )
+    }
+
+    /// Nanoseconds since 1970-01-01T00:00:00Z (negative before). Second 60 counts as 60 seconds into
+    /// the minute, so a leap second equals second 0 of the next minute. Range: |v| < 2^69, so it fits
+    /// `i128` with no overflow possible.
+    #[must_use]
+    pub fn unix_nanos(&self) -> i128 {
+        // Every field is bounded by the type invariants (year <= 9999), so this arithmetic cannot
+        // overflow: |days| < 3_000_000 and the seconds total fits easily in i64.
+        let days = days_from_civil(
+            i64::from(self.year),
+            i64::from(self.month),
+            i64::from(self.day),
+        );
+        let secs = days * 86_400
+            + i64::from(self.hour) * 3600
+            + i64::from(self.minute) * 60
+            + i64::from(self.second);
+        i128::from(secs) * 1_000_000_000 + i128::from(self.nanos)
     }
 
     /// Year, 0..=9999.
@@ -329,5 +359,64 @@ mod tests {
         v.sort();
         let got: Vec<_> = v.iter().map(ToString::to_string).collect();
         assert_eq!(got, expected);
+    }
+
+    fn d(s: &str) -> WarcDate {
+        WarcDate::parse(s).unwrap()
+    }
+
+    #[test]
+    fn unix_nanos_epoch() {
+        assert_eq!(d("1970-01-01T00:00:00Z").unix_nanos(), 0);
+        assert_eq!(d("1970-01-01T00:00:00.000000001Z").unix_nanos(), 1);
+    }
+
+    #[test]
+    fn unix_nanos_known_values() {
+        const G: i128 = 1_000_000_000;
+        assert_eq!(d("2000-03-01T00:00:00Z").unix_nanos(), 951_868_800 * G);
+        assert_eq!(d("2025-05-03T11:43:01Z").unix_nanos(), 1_746_272_581 * G);
+        assert_eq!(d("1969-12-31T23:59:59Z").unix_nanos(), -G);
+        assert_eq!(d("0000-01-01T00:00:00Z").unix_nanos(), -62_167_219_200 * G);
+        assert_eq!(
+            d("9999-12-31T23:59:59.999999999Z").unix_nanos(),
+            253_402_300_799 * G + 999_999_999
+        );
+    }
+
+    #[test]
+    fn unix_nanos_matches_from_system_time() {
+        for s in [0u64, 86_399, 951_782_400, 4_102_444_800] {
+            for n in [0u32, 999_999_999] {
+                let t = WarcDate::from_system_time(UNIX_EPOCH + Duration::new(s, n)).unwrap();
+                assert_eq!(
+                    t.unix_nanos(),
+                    i128::from(s) * 1_000_000_000 + i128::from(n)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unix_nanos_monotonic() {
+        let mut dates = Vec::new();
+        for y in [1899u16, 1900, 1999, 2000, 2001, 2004] {
+            for m in 1u8..=12 {
+                let dim = days_in_month(y, m).unwrap();
+                for day in [1u8, dim.saturating_sub(1).max(1), dim] {
+                    dates.push(WarcDate::new(y, m, day, 0, 0, 0, 0).unwrap());
+                    dates.push(WarcDate::new(y, m, day, 23, 59, 59, 999_999_999).unwrap());
+                }
+            }
+        }
+        dates.sort();
+        dates.dedup();
+        for w in dates.windows(2) {
+            assert!(w[0].unix_nanos() < w[1].unix_nanos(), "{} {}", w[0], w[1]);
+        }
+        assert_eq!(
+            d("2000-12-31T23:59:60Z").unix_nanos(),
+            d("2001-01-01T00:00:00Z").unix_nanos()
+        );
     }
 }

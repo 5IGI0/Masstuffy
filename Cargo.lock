@@ -271,6 +271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "masstuffy-index"
+version = "0.1.0"
+dependencies = [
+ "masstuffy-cdx",
+ "masstuffy-urlkey",
+ "masstuffy-warc",
+ "thiserror",
+]
+
+[[package]]
 name = "masstuffy-seglog"
 version = "0.1.0"
 dependencies = [
