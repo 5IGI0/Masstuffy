@@ -6,7 +6,7 @@
 //! slot is one (collection incarnation, generation, staging attempt). The collection record keeps
 //! the list of live slots of its current incarnation; an entry is visible iff its slot is the slot
 //! of the collection's active generation. `ReplaceGeneration`, `DiscardStaged` and
-//! `DropCollection` only move slots to a `dead_slots` table (O(#generations)); [`purge`]
+//! `DropCollection` only move slots to a `dead_slots` table (O(#generations)); [`purge`](masstuffy_index::SecondaryIndex::purge)
 //! (`SecondaryIndex::purge`) later deletes their rows in bounded transactions, oldest dead slot
 //! first. Queries resolve the active slot with one lookup and scan only that slot's key range.
 //!
