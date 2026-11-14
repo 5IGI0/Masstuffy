@@ -4,7 +4,7 @@ Single-machine object storage built on WARC records, written in Rust. This is a 
 
 - **Source of truth: [`spec/`](spec/)** (written in French). Read [`spec/README.md`](spec/README.md) first, then the chapter(s) relevant to your task. Sections tagged **[RECO]** are the intended design. Sections tagged **[LEGACY]** describe the old implementation and its bugs: they explain intent, but they are **not** something to reproduce.
 - Do not port or imitate the legacy implementation. The spec and the rules below decide.
-- Out of scope unless explicitly requested: HTTP API, CLI, authentication.
+- Out of scope unless explicitly requested: CLI, authentication. The HTTP API (`crates/http`) and the Python client (`clients/python`, built on pywarc) were requested on 2026-11-14 and are in scope.
 
 ## Workspace layout
 
