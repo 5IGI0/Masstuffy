@@ -231,7 +231,9 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   then later position; no date -> latest); `by_pattern(collection, &UrlPattern, PatternQuery{limit ≤ 10 000,
   after: Cursor})` -> `Page{hits, next}` in (massaged key, date, position) order, all types, exact `next`,
   text cursor tokens; `list(collection, after, limit)` in position order (I8 dumps); `state`, `collections`.
-  Shared semantics in `index::rank` (both backends use it).
+  Shared semantics in `index::rank` (both backends use it). `rank` also holds the op rules every
+  backend applies: `validate_insert`, `check_op` (StaleGeneration/NotStaged), `step_state` (state transition
+  incl. checkpoint routing), and `Op::collection()`.
 - `MemIndex`: `RwLock<State>` over `BTreeMap`s, eager deletes, linear queries (reference + test double).
 - `conformance` module (feature `conformance`, also under `cfg(test)`) + `conformance_tests!(factory)` macro:
   the suite every implementation runs against itself (incl. drop/recreate, staging, pagination, I8
@@ -239,20 +241,40 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
 - Internal: `warc` (`WarcDate`), `cdx`, `urlkey`. External: `thiserror`. Features: `conformance`.
 
 **`crates/index-redb` — `masstuffy-index-redb`**: default embedded `SecondaryIndex` on `redb`.
-- Tables (suggested; M16 decides): `collections: u128 → (incarnation, active, checkpoint, staged_checkpoint,
-  slot ids)`. Each (collection incarnation, generation, staging attempt) gets a fresh `slot: u64` from a global
-  counter (new slot on first use after `DropCollection` or `DiscardStaged`). Every row key starts with the slot:
-  entries `(slot, segment, offset)`; `(record_id, slot, segment, offset)`; `(slot, massaged_key, date_nanos,
-  segment, offset)` (`UrlPattern::key_ranges` become range scans, cursor = seek); `(slot, raw_uri, date_nanos,
-  segment, offset)` only for URLs `massage` rejects. Visible = slot is the collection's active slot, so
-  pattern, nearest and list scans touch only active rows (O(log n + page) even during a rebuild). Dead slots
-  (retired, dropped, discarded) go to a list that `purge` deletes in bounded transactions. `DropCollection`,
-  `DiscardStaged` and `ReplaceGeneration` stay O(1), and old rows can never come back.
+- `RedbIndex::open(path, &Options)` (create-or-open, schema check), `flush`, `compact`, `close`;
+  `Options { cache_bytes = 64 MiB, sync_every = 1, quick_repair = true, verify_on_open = false }`;
+  `OpenError::{AlreadyOpen, SchemaMismatch, Corrupt, Unsupported, Io, Backend}` with `needs_rebuild()`.
+- Tables (decided in M16), big-endian, sign-flipped 16-byte dates, pattern bounds via `enc_bound`:
+  - `meta` (schema_version, next_slot, stored_entries);
+  - `collections: u128 → (active gen, checkpoint, staged_checkpoint, live (gen, slot) list)`;
+  - `slots: slot → (collection, gen)`;
+  - `dead_slots`;
+  - `entries: slot‖pos → entry`;
+  - `by_id: record_id‖0‖slot‖pos → date`;
+  - `urls: slot‖(0‖massaged‖0 | 1‖len‖raw)‖date‖pos → flags(request)`.
+- Slots: each (collection incarnation, generation, staging attempt) gets a fresh `slot: u64` from a global
+  counter (new slot on first use after `DropCollection` or `DiscardStaged`). Every row key starts with the
+  slot. Visible = slot is the collection's active slot, so pattern, nearest and list scans touch only active
+  rows (O(log n + page) even during a rebuild). Dead slots (retired, dropped, discarded) go to `dead_slots`
+  that `purge` deletes in bounded transactions. `DropCollection`, `DiscardStaged` and `ReplaceGeneration`
+  stay O(1), and old rows can never come back. The massaged key is not stored: it is recomputed on
+  `Tombstone` and `purge` (rows of the purged entries), so a change of `urlkey::massage` output bumps
+  `SCHEMA_VERSION`.
+- Durability: every commit fsynced by default; `sync_every > 1` makes intermediate commits non-durable
+  (crash = consistent older prefix, replayed by catch-up); batches with ReplaceGeneration/DiscardStaged/
+  DropCollection are always durable so the engine may delete files after they return.
+- Purge: `purge(n)`: oldest dead slot first, <= n entries (+ their by_id/url rows) per write txn.
+- Write gate: a `Mutex<()>` serialises `apply`/`purge`/`flush` from `begin_write` until after the `unsynced`
+  counter update (redb releases its writer lock inside `commit`). Lock order: gate, then redb's writer lock;
+  never held across anything else. `by_id` returns `None` for a query id containing NUL.
+- Locking: redb ExclusiveWriter whole-file lock on the index file (second guard behind DirLock); reopen
+  requires dropping the previous handle.
 - Why redb: pure Rust, ACID with fsync on commit, ordered range scans, single file in the workdir; keeps
   the "standalone" goal (spec 6). PostgreSQL would add a server, a network round-trip per lookup and an
   async driver for what is a rebuildable cache; SQLite/LMDB pull C code. A PostgreSQL backend can still be
   written against the trait later.
-- Internal: `index`, `warc`, `cdx`, `urlkey`. External: `redb`, `thiserror`.
+- Internal: `index`, `cdx` (`WarcDate`/`UrlPattern` via `index` re-exports). External: `redb` 4.6 (`std`
+  only; its only dependency is `libc` on Linux/macOS), `thiserror`.
 
 ### Engine
 
@@ -278,6 +300,13 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `prepare_raw` of `put_raw` (M17/M19).
 - Internal: all crates above. External: `tokio` (`rt-multi-thread`, `sync`), `uuid` (v4), `tracing`,
   `thiserror`. Features: `redb` (default) selects `index-redb`.
+- Index file: `<workdir>/data/index.redb`, opened in `spawn_blocking` at `Repository::open`;
+  `OpenError::needs_rebuild()` -> unlink the file, fsync `data/`, recreate, full catch-up from every
+  collection's CDX (no checkpoints); `AlreadyOpen` -> startup error.
+- One index-writer task drains a bounded queue of op batches from all collections into one `apply`
+  (group commit; redb serialises writers anyway).
+- Purge loop: after a structural op, `purge(4096)` in `spawn_blocking` until it returns 0.
+- Shutdown: stop the writer task, `flush()` then `close()`.
 
 ## 2. Dependency graph
 
@@ -311,10 +340,10 @@ Edge list (authoritative):
 | dictstore | zframe, durable |
 | collection | warc, zframe, cdx, seglog, durable |
 | index | warc, cdx, urlkey |
-| index-redb | index, warc, cdx, urlkey |
+| index-redb | index, cdx |
 | masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe, cdx, durable |
 
-`index` and `index-redb` also depend on `warc` (for `WarcDate`).
+`index` also depends on `warc` (for `WarcDate`); `index-redb` uses `WarcDate`/`UrlPattern` through `index`'s re-exports.
 
 `collection` and `index` do not know each other; only the engine connects data to the secondary index.
 
@@ -340,7 +369,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M13 | `collection`: `open` + recovery | crash states after each commit step (segment truncated at many offsets, CDX truncated at every byte, zero-filled tail) → `open` yields a clean CDX satisfying I2/I4, committed entries readable; corrupt mid-CDX → error, repair → cut + report; leftovers removed, unknown kept; aborted create → `ManifestMissing`; open idempotent; reopen after poison; partial scan from checkpoint; fallback reasons; stale checkpoint removed after repair |
 | M14 | `collection`: tombstones, `entries()`, `Rebuilder` (bounded worker pool) | rebuild None→Zstd, Zstd(D1)→Zstd(D1) (raw copy), Zstd(D1)→Zstd(D2), Zstd→None: live records byte-exact, tombstoned records not copied, new warcinfo first; crash before/after the manifest rename; writes during the rebuild carried over; concurrent readers; tombstone durability/idempotence; `entries()` with interleaved tombstones; pool: output identical for 1 and 4 workers, order preserved, error/panic stops and joins, in-flight memory bound |
 | M15 | `index`: trait, `MemIndex`, conformance suite | conformance suite on `MemIndex`: nearest-date semantics and ties, `request` excluded, ACTIVE only (tombstones, staged/retired generations, drop/recreate), pattern queries and cursor pagination, checkpoint atomic with ops, idempotent replay, I8 rebuilt == incremental, concurrent readers |
-| M16 | `index-redb` | conformance suite; reopen after drop; concurrent readers during `apply` |
+| M16 | `index-redb` | conformance suite; reopen after drop (incl. lazy sync); crash in a child process (abort) -> consistent prefix, structural batches durable; concurrent readers during a large `apply`; purge bounded progress; differential vs `MemIndex`; schema mismatch / foreign file / already open |
 | M17 | `masstuffy`: init/open, registry, writer task, `put`/`get` by locator | many tasks `put` to one collection → all entries present once, no interleaving inside a batch |
 | M18 | `masstuffy`: secondary-index wiring, catch-up from checkpoint, `rebuild_index` | kill between CDX fsync and index apply → catch-up; rebuilt index equals incremental one (I8) |
 | M19 | `masstuffy`: `put_raw`, `read_raw`, `scan`, `search` | delegated frames with wrong dict_id rejected; scan skips orphan bytes |
@@ -457,3 +486,7 @@ These override the spec where they differ.
    cross-collection commit order). *Recommend* as is.
 10. **Nearest ties / no date** (M15, pending user confirmation): equal distance -> later capture, then latest
     commit; `date = None` -> latest date (not "now"). *Recommend* as is.
+11. **Secondary-index durability** (M16): *Recommend* durable commits by default (`sync_every = 1`,
+    quick-repair on), structural batches always durable, engine free to raise `sync_every` after
+    measurement. Adopted in M16.
+12. **Index file location** (M16): *Recommend* `<workdir>/data/index.redb` (decided in M17/M18).

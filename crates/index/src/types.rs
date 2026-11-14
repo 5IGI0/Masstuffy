@@ -83,6 +83,26 @@ pub struct CollectionState {
     pub staged_checkpoint: Option<Checkpoint>,
 }
 
+impl CollectionState {
+    /// Routes a checkpoint: generation > active -> staged slot, else main slot. The caller validated
+    /// the generation (not older than active).
+    pub(crate) fn route_checkpoint(&mut self, cp: Checkpoint) {
+        match self.active_generation {
+            Some(a) if cp.generation > a => self.staged_checkpoint = Some(cp),
+            _ => self.checkpoint = Some(cp),
+        }
+    }
+
+    /// Makes `g` active, carrying the checkpoint slots over (A1.2 rule).
+    pub(crate) fn activate(&mut self, g: u32) {
+        let matching = |c: Option<Checkpoint>| c.filter(|c| c.generation == g);
+        let new_main = matching(self.checkpoint).or(matching(self.staged_checkpoint));
+        self.staged_checkpoint = self.staged_checkpoint.filter(|c| c.generation > g);
+        self.checkpoint = new_main;
+        self.active_generation = Some(g);
+    }
+}
+
 /// A visible (ACTIVE) entry: enough to read the record and to answer metadata without reading it.
 /// `entry.kind` is always `Kind::Add`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +199,21 @@ pub enum Op<'a> {
         /// New checkpoint.
         checkpoint: Checkpoint,
     },
+}
+
+impl Op<'_> {
+    /// Collection targeted by the op.
+    #[must_use]
+    pub fn collection(&self) -> CollectionKey {
+        match self {
+            Op::Insert { collection, .. }
+            | Op::Tombstone { collection, .. }
+            | Op::ReplaceGeneration { collection, .. }
+            | Op::DiscardStaged { collection, .. }
+            | Op::DropCollection { collection }
+            | Op::Checkpoint { collection, .. } => *collection,
+        }
+    }
 }
 
 /// Options of a pattern query.

@@ -9,15 +9,15 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::{RwLock, RwLockReadGuard};
 
-use masstuffy_cdx::{Entry, Kind};
+use masstuffy_cdx::Entry;
 use masstuffy_urlkey::UrlPattern;
 use masstuffy_warc::WarcDate;
 
 use crate::rank::{self, IdCandidate, UrlKey};
 use crate::types::check_limit;
 use crate::{
-    Checkpoint, CollectionKey, CollectionState, Cursor, Error, Hit, Op, Page, PatternQuery,
-    Position, SecondaryIndex,
+    CollectionKey, CollectionState, Cursor, Error, Hit, Op, Page, PatternQuery, Position,
+    SecondaryIndex,
 };
 
 /// In-memory index: one `RwLock<State>`. Writers (`apply`) hold the write lock only for validation
@@ -138,25 +138,6 @@ impl State {
     }
 }
 
-impl CollectionState {
-    /// Routes a checkpoint (generation already validated against the active one).
-    fn set_checkpoint(&mut self, cp: Checkpoint) {
-        match self.active_generation {
-            Some(a) if cp.generation > a => self.staged_checkpoint = Some(cp),
-            _ => self.checkpoint = Some(cp),
-        }
-    }
-
-    /// Makes `g` active, carrying the checkpoint slots over (A1.2 rule).
-    fn activate(&mut self, g: u32) {
-        let matching = |c: Option<Checkpoint>| c.filter(|c| c.generation == g);
-        let new_main = matching(self.checkpoint).or(matching(self.staged_checkpoint));
-        self.staged_checkpoint = self.staged_checkpoint.filter(|c| c.generation > g);
-        self.checkpoint = new_main;
-        self.active_generation = Some(g);
-    }
-}
-
 impl State {
     /// Removes the entries of `c` with generation in `from..=to`. The keys are collected first,
     /// then removed.
@@ -183,12 +164,7 @@ impl SecondaryIndex for MemIndex {
         let mut prepared: Vec<Option<Stored>> = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
             let stored = if let Op::Insert { entry, .. } = op {
-                if entry.kind != Kind::Add {
-                    return Err(Error::NotAnAdd { op: i });
-                }
-                entry
-                    .validate()
-                    .map_err(|source| Error::InvalidEntry { op: i, source })?;
+                rank::validate_insert(i, entry)?;
                 let url_key = entry.url.as_deref().map(|u| match rank::url_key(u) {
                     UrlKey::Massaged(k) => StoredUrlKey::Massaged(k),
                     UrlKey::Raw(r) => StoredUrlKey::Raw(r.to_owned()),
@@ -209,82 +185,26 @@ impl SecondaryIndex for MemIndex {
         // Pass 1: validate in order against an overlay, without mutating anything.
         let mut overlay: BTreeMap<CollectionKey, Option<CollectionState>> = BTreeMap::new();
         for (i, op) in ops.iter().enumerate() {
-            let collection = match op {
-                Op::Insert { collection, .. }
-                | Op::Tombstone { collection, .. }
-                | Op::ReplaceGeneration { collection, .. }
-                | Op::DiscardStaged { collection, .. }
-                | Op::DropCollection { collection }
-                | Op::Checkpoint { collection, .. } => *collection,
-            };
+            let collection = op.collection();
             let slot = overlay
                 .entry(collection)
                 .or_insert_with(|| state.collections.get(&collection).copied());
-            let checked = match op {
-                Op::Insert { generation, .. }
-                | Op::Tombstone { generation, .. }
-                | Op::ReplaceGeneration { generation, .. } => Some(*generation),
-                Op::Checkpoint { checkpoint, .. } => Some(checkpoint.generation),
-                Op::DiscardStaged { .. } | Op::DropCollection { .. } => None,
-            };
-            if let (Some(st), Some(generation)) = (slot.as_ref(), checked)
-                && let Some(active) = st.active_generation
-                && generation < active
-            {
-                return Err(Error::StaleGeneration {
-                    op: i,
-                    collection,
-                    generation,
-                    active,
-                });
-            }
-            if let (Op::DiscardStaged { generation, .. }, Some(st)) = (op, slot.as_ref())
-                && let Some(active) = st.active_generation
-                && *generation <= active
-            {
-                return Err(Error::NotStaged {
-                    op: i,
-                    collection,
-                    generation: *generation,
-                    active,
-                });
-            }
-            match op {
-                Op::DropCollection { .. } => *slot = None,
-                Op::DiscardStaged { generation, .. } => {
-                    if let Some(st) = slot.as_mut() {
-                        st.staged_checkpoint =
-                            st.staged_checkpoint.filter(|c| c.generation != *generation);
-                    }
-                }
-                _ => {
-                    let mut st = slot.unwrap_or_default();
-                    match op {
-                        Op::ReplaceGeneration { generation, .. }
-                            if st.active_generation != Some(*generation) =>
-                        {
-                            st.activate(*generation);
-                        }
-                        Op::Checkpoint { checkpoint, .. } => st.set_checkpoint(*checkpoint),
-                        _ => {}
-                    }
-                    *slot = Some(st);
-                }
-            }
+            rank::check_op(i, slot.as_ref(), op)?;
+            *slot = rank::step_state(*slot, op);
         }
 
         // Pass 2: mutate. Infallible: no `?`, no unwrap, no indexing.
         for (stored, op) in prepared.iter_mut().zip(ops) {
+            let c = op.collection();
+            let before = state.collections.get(&c).copied();
+            let after = rank::step_state(before, op);
             match op {
                 Op::Insert {
-                    collection,
-                    generation,
-                    entry,
+                    generation, entry, ..
                 } => {
-                    state.collections.entry(*collection).or_default();
                     if let Some(stored) = stored.take() {
                         let key = EntryKey {
-                            collection: *collection,
+                            collection: c,
                             generation: *generation,
                             position: Position {
                                 segment: entry.segment,
@@ -295,52 +215,37 @@ impl SecondaryIndex for MemIndex {
                     }
                 }
                 Op::Tombstone {
-                    collection,
                     generation,
                     position,
+                    ..
                 } => {
-                    state.collections.entry(*collection).or_default();
                     state.entries.remove(&EntryKey {
-                        collection: *collection,
+                        collection: c,
                         generation: *generation,
                         position: *position,
                     });
                 }
-                Op::ReplaceGeneration {
-                    collection,
-                    generation,
-                } => {
-                    let st = state.collections.entry(*collection).or_default();
-                    if st.active_generation != Some(*generation) {
-                        st.activate(*generation);
-                        if let Some(below) = generation.checked_sub(1) {
-                            state.remove_generations(*collection, 0, below);
-                        }
+                Op::ReplaceGeneration { generation, .. } => {
+                    if before.and_then(|s| s.active_generation) != Some(*generation)
+                        && let Some(below) = generation.checked_sub(1)
+                    {
+                        state.remove_generations(c, 0, below);
                     }
                 }
-                Op::DiscardStaged {
-                    collection,
-                    generation,
-                } => {
-                    if let Some(st) = state.collections.get_mut(collection) {
-                        st.staged_checkpoint =
-                            st.staged_checkpoint.filter(|c| c.generation != *generation);
-                        state.remove_generations(*collection, *generation, *generation);
+                Op::DiscardStaged { generation, .. } => {
+                    if before.is_some() {
+                        state.remove_generations(c, *generation, *generation);
                     }
                 }
-                Op::DropCollection { collection } => {
-                    state.collections.remove(collection);
-                    state.remove_generations(*collection, 0, u32::MAX);
+                Op::DropCollection { .. } => state.remove_generations(c, 0, u32::MAX),
+                Op::Checkpoint { .. } => {}
+            }
+            match after {
+                Some(st) => {
+                    state.collections.insert(c, st);
                 }
-                Op::Checkpoint {
-                    collection,
-                    checkpoint,
-                } => {
-                    state
-                        .collections
-                        .entry(*collection)
-                        .or_default()
-                        .set_checkpoint(*checkpoint);
+                None => {
+                    state.collections.remove(&c);
                 }
             }
         }

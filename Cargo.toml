@@ -15,13 +15,18 @@ masstuffy-cdx = { path = "crates/cdx", version = "0.1.0" }
 masstuffy-seglog = { path = "crates/seglog", version = "0.1.0" }
 masstuffy-urlkey = { path = "crates/urlkey", version = "0.1.0" }
 masstuffy-index = { path = "crates/index", version = "0.1.0" }
+masstuffy-index-redb = { path = "crates/index-redb", version = "0.1.0" }
 masstuffy-warc = { path = "crates/warc", version = "0.1.0", default-features = false }
+redb = { version = "4.6.0", default-features = false, features = ["std"] }
 xxhash-rust = { version = "0.8.16", default-features = false, features = ["xxh3"] }
 zstd = { version = "0.14.4", default-features = false }
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0.150", default-features = false, features = ["std"] }
 uuid = { version = "1.29.2", default-features = false, features = ["std", "v4"] }
+
+[profile.dev.package.redb]
+opt-level = 2
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -252,6 +252,23 @@ pub fn by_id_scope<I: SecondaryIndex>(new: &dyn Fn() -> I) {
     assert!(i.by_id(None, "missing").unwrap().is_none());
 }
 
+/// A query id containing NUL bytes matches nothing (record ids are atoms without NUL).
+pub fn by_id_nul_query_matches_nothing<I: SecondaryIndex>(new: &dyn Fn() -> I) {
+    let c = key(1);
+    let i = new();
+    let e = resp(1, 0, "a", "http://a.test/", date(2020, 1, 1, 0, 0, 0));
+    i.apply(&[rep(c, 1), ins(c, 1, e)]).unwrap();
+    for q in [
+        "a\0",
+        "a\0\0\0\0\0\0\0",
+        "a\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+    ] {
+        assert!(i.by_id(None, q).unwrap().is_none(), "{q:?}");
+        assert!(i.by_id(Some(c), q).unwrap().is_none(), "{q:?}");
+    }
+    assert!(i.by_id(None, "a").unwrap().is_some());
+}
+
 /// `by_id` returns the most recently committed copy.
 pub fn by_id_most_recent_commit<I: SecondaryIndex>(new: &dyn Fn() -> I) {
     let (c, d) = (key(1), key(2));
@@ -1880,7 +1897,7 @@ macro_rules! conformance_tests {
             pattern_pagination_stable, limits_validated, list_order_and_paging,
             checkpoint_basic, batch_atomic_on_error, ops_apply_in_order, idempotent_replay,
             rebuilt_equals_incremental, discard_staged_then_restage, staged_checkpoint_separate,
-            by_id_two_levels, concurrent_readers_see_whole_batches,
+            by_id_two_levels, by_id_nul_query_matches_nothing, concurrent_readers_see_whole_batches,
             concurrent_writers, insert_validation
         );
     };

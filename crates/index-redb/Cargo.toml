@@ -1,0 +1,20 @@
+[package]
+name = "masstuffy-index-redb"
+version = "0.1.0"
+description = "Embedded redb backend of the Masstuffy secondary index"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+masstuffy-index.workspace = true
+masstuffy-cdx.workspace = true
+redb.workspace = true
+
+[dev-dependencies]
+masstuffy-index = { workspace = true, features = ["conformance"] }
+masstuffy-urlkey.workspace = true
+
+[lints]
+workspace = true
