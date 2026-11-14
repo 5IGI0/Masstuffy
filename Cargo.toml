@@ -29,6 +29,10 @@ tokio = { version = "1.52.3", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 uuid = { version = "1.29.2", default-features = false, features = ["std", "v4"] }
 
+# Line tables keep file:line in backtraces while cutting debug build size several times.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package.redb]
 opt-level = 2
 
