@@ -59,6 +59,13 @@ fn meta_of(i: usize, len: usize) -> ImportMeta<'static> {
     }
 }
 
+/// The same record rewritten with a `WARC/1.0` first line.
+fn to_v10(r: &Record) -> Record {
+    let mut bytes = b"WARC/1.0\r\n".to_vec();
+    bytes.extend_from_slice(&r.as_bytes()[10..]);
+    Record::from(RecordRef::parse(&bytes, &Limits::DEFAULT).unwrap())
+}
+
 fn bytes_of(records: &[Record]) -> Vec<Vec<u8>> {
     records.iter().map(|r| r.as_bytes().to_vec()).collect()
 }
@@ -419,6 +426,60 @@ async fn put_get_round_trip_none() {
 rt_test! {
 async fn put_get_round_trip_zstd() {
     round_trip(zstd_codec(), true).await;
+}
+}
+
+async fn round_trip_warc10(codec: Codec, with_dict: bool) {
+    let td = TestDir::new();
+    let repo = if with_dict {
+        repo_with_dict(&td, &Config::default()).await
+    } else {
+        Repository::init(td.repo()).await.unwrap()
+    };
+    let h = repo.create_collection("rt10", codec).await.unwrap();
+    let recs: Vec<Record> = (0..4).map(|i| to_v10(&record(i, 300))).collect();
+    let bytes = bytes_of(&recs);
+    let at = h.put(recs).await.unwrap();
+    for (l, b) in at.iter().zip(&bytes) {
+        assert!(b.starts_with(b"WARC/1.0\r\n"));
+        assert_eq!(&repo.get(l).await.unwrap(), b);
+        let raw = repo.get_raw(l).await.unwrap();
+        if matches!(codec, Codec::None) {
+            assert_eq!(raw.encoding, RawEncoding::Warc);
+            assert_eq!(&raw.bytes, b);
+        }
+    }
+    repo.shutdown().await.unwrap();
+}
+
+rt_test! {
+async fn put_get_warc10_round_trip() {
+    round_trip_warc10(Codec::None, false).await;
+    round_trip_warc10(zstd_codec(), true).await;
+}
+}
+
+rt_test! {
+async fn put_fills_missing_headers_keeps_warc10() {
+    let td = TestDir::new();
+    let repo = Repository::init(td.repo()).await.unwrap();
+    let h = repo.create_collection("f10", Codec::None).await.unwrap();
+    let full = to_v10(&record(1, 5));
+    let text = String::from_utf8(full.as_bytes().to_vec()).unwrap();
+    let stripped: String = text
+        .split_inclusive("\r\n")
+        .filter(|l| !l.starts_with("WARC-Record-ID:") && !l.starts_with("WARC-Date:"))
+        .collect();
+    let view = RecordRef::parse(stripped.as_bytes(), &Limits::DEFAULT).unwrap();
+    assert!(view.record_id().is_none() && view.date().is_none());
+    let at = h.put(vec![Record::from(view)]).await.unwrap();
+    let bytes = repo.get(&at[0]).await.unwrap();
+    assert!(bytes.starts_with(b"WARC/1.0\r\n"));
+    let view = RecordRef::parse(&bytes, &Limits::DEFAULT).unwrap();
+    assert!(view.record_id().unwrap().starts_with("urn:uuid:"));
+    assert_eq!(view.date().unwrap().nanos(), 0);
+    assert_eq!(view.body(), RecordRef::parse(full.as_bytes(), &Limits::DEFAULT).unwrap().body());
+    repo.shutdown().await.unwrap();
 }
 }
 

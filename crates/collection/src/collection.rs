@@ -309,7 +309,7 @@ mod tests {
     use crate::snapshot::{RawEncoding, ReadCtx};
     use crate::testutil::{
         MapResolver, TestDir, create_none, create_with, create_zstd, id_str, names, record,
-        record_of_size, trained_id, uuid, zstd_codec,
+        record_of_size, to_v10, trained_id, uuid, zstd_codec,
     };
     use crate::writer::FailPoint;
     use crate::{DEFAULT_SPLIT_THRESHOLD, PLAIN_FRAME_MIN};
@@ -483,6 +483,40 @@ mod tests {
                         assert_eq!(enc, RawEncoding::Zstd { dict_id: want });
                     } else {
                         assert_eq!(enc, RawEncoding::Warc);
+                        assert_eq!(raw, *input);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_back_equals_input_warc10() {
+        for (name, create) in creators() {
+            let zstd = name == "zstd";
+            let d = TestDir::new();
+            let (mut c, _) = create(&d.sub());
+            let mut p = c.preparer().unwrap();
+            let snap = Arc::clone(c.snapshot());
+            let mut ctx = ReadCtx::new();
+            let (mut buf, mut raw) = (Vec::new(), Vec::new());
+            for round in 0..3 {
+                let mut recs: Vec<Record> =
+                    mixed(round * 10 + 1, zstd).iter().map(to_v10).collect();
+                if round == 2 {
+                    // Mix 1.0 and 1.1 in one batch.
+                    recs.push(record(round * 10 + 7, 64));
+                }
+                let inputs: Vec<Vec<u8>> = recs.iter().map(|r| r.as_bytes().to_vec()).collect();
+                let versions: Vec<_> = recs.iter().map(Record::version).collect();
+                let entries = commit(&mut c, &mut p, recs);
+                for ((e, input), ver) in entries.iter().zip(&inputs).zip(versions) {
+                    let rec = snap.read(e, &mut ctx, &mut buf).unwrap();
+                    assert_eq!(rec.as_bytes(), &input[..]);
+                    assert_eq!(rec.version(), ver);
+                    snap.read_raw(e, &mut raw).unwrap();
+                    assert_eq!(digest(&raw), e.digest);
+                    if !zstd {
                         assert_eq!(raw, *input);
                     }
                 }

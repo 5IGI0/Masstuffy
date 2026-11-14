@@ -12,7 +12,7 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 
 ### Format layer (no Masstuffy dependency, no filesystem policy)
 
-**`crates/warc` — `masstuffy-warc`**: parse and serialize WARC/1.1 records (spec 3.1).
+**`crates/warc` — `masstuffy-warc`**: parse and serialize WARC/1.0 and WARC/1.1 records (spec 3.1, 1.0 accepted per §5).
 - Zero-copy `RecordRef<'a>` (`parse` for one whole record, `parse_prefix` for the first record of a
   buffer): strict, capped by `Limits`, ordered headers kept verbatim, typed accessors `record_id()`
   (without `<>`), `warc_type()`, `date()`, `target_uri()`, `body()`, `as_bytes()` (byte-exact).
@@ -21,6 +21,7 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 - `WarcReader<R: BufRead>`: lending sequential reader (fsck, import) with one reusable buffer, caps on
   header bytes, header count and body length; poisoned after the first error.
 - `WarcDate`: strict W3C-ISO8601 parse/format, std only (no date crate); `unix_nanos() -> i128` (absolute instant used by the secondary index for nearest-date and ordering).
+- `Version` (`V1_0`, `V1_1`): `version()` on `RecordRef` and `Record`, `RecordBuilder::version` (default 1.1).
 - `Limits`: caps on header bytes, header count and body length.
 - Errors: `ParseError`, `BuildError`, `ReadError` (`thiserror`).
 - Feature `generate` (default on): `RecordBuilder::fill_missing` generates `WARC-Record-ID`
@@ -672,6 +673,11 @@ These override the spec where they differ.
   raw equality for the others; URL and pattern queries are per collection, `by_id` is global with an optional
   collection filter; `by_id` returns the most recently committed copy within a collection (greatest position),
   and across collections the copy with the latest WARC-Date, ties broken by the greater collection key.
+- **WARC/1.0 accepted (2026-11-14)**: parsing accepts `WARC/1.0\r\n` and `WARC/1.1\r\n` (spec 3.1 said 1.1 only);
+  other versions give `InvalidVersion`. The version is preserved byte-exactly (stored bytes are never
+  re-serialized). `RecordBuilder` and the warcinfo write 1.1; `from_record_ref` keeps the source version and
+  `fill_missing` uses whole seconds for 1.0. `WARC-Date` fractional seconds are accepted in both versions on
+  read. For 1.0, `target_uri()` (and therefore the indexed URL) drops one enclosing `<…>`.
 - **Conformance lint allow (M15, 2026-11-14)**: a module-level clippy allow (unwrap/expect/panic/indexing) is
   accepted on the `conformance` module only (test-support code behind the `conformance` feature).
 

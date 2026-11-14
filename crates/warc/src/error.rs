@@ -1,6 +1,6 @@
 //! Error types of the crate.
 
-/// Why a byte sequence is not a valid WARC/1.1 record.
+/// Why a byte sequence is not a valid WARC/1.0 or WARC/1.1 record.
 ///
 /// Offsets are byte offsets from the start of the record.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -9,8 +9,8 @@ pub enum ParseError {
     /// The input ends before the record is complete.
     #[error("input ends before the record is complete")]
     Truncated,
-    /// The first line is not exactly `WARC/1.1\r\n`.
-    #[error("first line is not exactly `WARC/1.1\\r\\n`")]
+    /// The first line is neither `WARC/1.0\r\n` nor `WARC/1.1\r\n`.
+    #[error("first line is not `WARC/1.0\\r\\n` or `WARC/1.1\\r\\n`")]
     InvalidVersion,
     /// A line is terminated by a bare LF.
     #[error("bare CR or LF at offset {offset}")]

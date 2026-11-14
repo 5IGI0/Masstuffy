@@ -225,6 +225,15 @@ pub(crate) fn record(i: usize, body_len: usize) -> Record {
     b.build(&letters(i, body_len)).unwrap()
 }
 
+/// The same record rewritten with a `WARC/1.0` first line.
+pub(crate) fn to_v10(r: &Record) -> Record {
+    let mut bytes = b"WARC/1.0\r\n".to_vec();
+    bytes.extend_from_slice(&r.as_bytes()[10..]);
+    Record::from(
+        masstuffy_warc::RecordRef::parse(&bytes, &masstuffy_warc::Limits::DEFAULT).unwrap(),
+    )
+}
+
 /// A record whose serialised size is exactly `total` bytes.
 pub(crate) fn record_of_size(i: usize, total: usize) -> Record {
     let base = record(i, 0).as_bytes().len();

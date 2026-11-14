@@ -1,16 +1,17 @@
-//! Streaming reader over concatenated WARC/1.1 records.
+//! Streaming reader over concatenated WARC/1.0 and WARC/1.1 records.
 
 use std::io::{self, BufRead, Read};
 
 use crate::error::{ParseError, ReadError};
 use crate::limits::Limits;
 use crate::parse::{RecordRef, scan_head};
+use crate::version::Version;
 
-const VERSION_LINE: &[u8] = b"WARC/1.1\r\n";
 /// Largest body buffer reserved up front, whatever `Content-Length` claims.
 const MAX_PREALLOC: u64 = 1 << 20;
 
-/// Sequential reader over concatenated WARC/1.1 records.
+/// Sequential reader over concatenated WARC/1.0 and WARC/1.1 records (they may be mixed in one
+/// stream).
 ///
 /// Reuses one internal buffer: each returned [`RecordRef`] borrows it until the next call (a lending
 /// API, hence not an `Iterator`). Memory is bounded by `Limits::max_header_bytes` for the head, and
@@ -128,13 +129,13 @@ impl<R: BufRead> WarcReader<R> {
                 if self.buf.len() >= max {
                     return Err(too_large.into());
                 }
-                if first && !VERSION_LINE.starts_with(&self.buf) {
+                if first && !Version::is_line_prefix(&self.buf) {
                     return Err(ParseError::InvalidVersion.into());
                 }
                 return Err(ParseError::Truncated.into());
             }
             if first {
-                if line != VERSION_LINE {
+                if Version::from_line(line).is_none() {
                     return Err(ParseError::InvalidVersion.into());
                 }
                 first = false;
@@ -174,7 +175,7 @@ impl<R: BufRead> WarcReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{MIN, MIN_BODY, rec, same_view};
+    use crate::testutil::{MIN, MIN_BODY, rec, rec_v, same_view};
     use std::io::BufReader;
 
     fn three() -> Vec<Vec<u8>> {
@@ -260,6 +261,75 @@ mod tests {
         for n in 1..b.len() {
             assert_truncated_then_poisoned(&b[..n]);
         }
+    }
+
+    #[test]
+    fn warc10_every_prefix_is_truncated() {
+        let b = rec_v("WARC/1.0\r\n", MIN, MIN_BODY);
+        for n in 1..b.len() {
+            assert_truncated_then_poisoned(&b[..n]);
+        }
+    }
+
+    #[test]
+    fn reads_mixed_versions() {
+        let v10 = "WARC/1.0\r\n";
+        let recs = [
+            rec(MIN, MIN_BODY),
+            rec_v(v10, MIN, b"world"),
+            rec_v(v10, "WARC-Type: metadata\r\nContent-Length: 0\r\n", b""),
+            rec("WARC-Type: metadata\r\nContent-Length: 3\r\n", b"abc"),
+        ];
+        let versions = [Version::V1_1, Version::V1_0, Version::V1_0, Version::V1_1];
+        let all = recs.concat();
+        for small in [true, false] {
+            let mut total = 0u64;
+            let mut check = |r: &mut dyn FnMut() -> Option<(Version, Vec<u8>)>| {
+                for (bytes, ver) in recs.iter().zip(versions) {
+                    let (v, got) = r().unwrap();
+                    assert_eq!(v, ver);
+                    assert_eq!(&got, bytes);
+                    total += u64::try_from(bytes.len()).unwrap();
+                }
+                assert!(r().is_none());
+            };
+            if small {
+                let mut rd = WarcReader::new(BufReader::with_capacity(7, &all[..]));
+                check(&mut || {
+                    let r = rd.next_record().unwrap()?;
+                    Some((r.version(), r.as_bytes().to_vec()))
+                });
+                assert_eq!(rd.offset(), total);
+            } else {
+                let mut rd = WarcReader::new(&all[..]);
+                check(&mut || {
+                    let r = rd.next_record().unwrap()?;
+                    Some((r.version(), r.as_bytes().to_vec()))
+                });
+                assert_eq!(rd.offset(), total);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_other_versions_in_stream() {
+        let mut all = rec_v("WARC/1.0\r\n", MIN, MIN_BODY);
+        all.extend_from_slice(&rec_v("WARC/1.2\r\n", MIN, MIN_BODY));
+        let mut r = WarcReader::new(&all[..]);
+        assert!(r.next_record().unwrap().is_some());
+        assert!(matches!(
+            r.next_record(),
+            Err(ReadError::Parse(ParseError::InvalidVersion))
+        ));
+        assert!(matches!(r.next_record(), Err(ReadError::Poisoned)));
+
+        assert_truncated_then_poisoned(b"WARC/1.0");
+
+        let mut r = WarcReader::new(&b"WARC/2.0\r\n"[..]);
+        assert!(matches!(
+            r.next_record(),
+            Err(ReadError::Parse(ParseError::InvalidVersion))
+        ));
     }
 
     #[test]

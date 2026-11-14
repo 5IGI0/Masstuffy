@@ -919,6 +919,23 @@ mod tests {
     }
 
     #[test]
+    fn prepare_raw_full_accepts_warc10() {
+        let v10 = crate::testutil::to_v10(&record(5, 400));
+        for use_dict in [false, true] {
+            let mut p = preparer(use_dict);
+            let stored = if use_dict {
+                dict_frame(v10.as_bytes())
+            } else {
+                v10.as_bytes().to_vec()
+            };
+            let out = p
+                .prepare_raw(&meta_for(&v10, &stored), stored.clone(), RawCheck::Full)
+                .unwrap();
+            assert_eq!(out.as_ref(), &stored[..]);
+        }
+    }
+
+    #[test]
     fn prepare_raw_none() {
         let mut p = preparer(false);
         let rec = record(1, 100);

@@ -8,8 +8,7 @@ use crate::header::{
 };
 use crate::limits::Limits;
 use crate::parse::RecordRef;
-
-const VERSION_LINE: &[u8] = b"WARC/1.1\r\n";
+use crate::version::Version;
 
 /// Owned serialized record.
 ///
@@ -29,6 +28,14 @@ impl Record {
     /// Consumes the record and returns its serialized bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// Version from the first line. O(1).
+    pub fn version(&self) -> Version {
+        // By the `Record` invariant the bytes start with a valid version line, so the fallback
+        // never runs; it avoids both `expect` and a silent wrong default.
+        Version::from_line(self.bytes.get(..Version::LINE_LEN).unwrap_or_default())
+            .unwrap_or_else(|| self.view().version())
     }
 
     /// Re-parses the bytes (O(head size), no allocation). Infallible by the type invariant.
@@ -64,6 +71,7 @@ impl AsRef<[u8]> for Record {
 /// and written as the last header.
 #[derive(Clone, Debug, Default)]
 pub struct RecordBuilder {
+    version: Version,
     headers: Vec<(String, String)>,
 }
 
@@ -101,7 +109,8 @@ impl RecordBuilder {
         Ok(b)
     }
 
-    /// Copies every header of `r` except `Content-Length`, in order. Infallible: `r` is validated.
+    /// Copies the version and every header of `r` except `Content-Length`, in order. Infallible:
+    /// `r` is validated.
     pub fn from_record_ref(r: &RecordRef<'_>) -> Self {
         let mut headers = Vec::with_capacity(r.header_count());
         for h in r.headers() {
@@ -109,7 +118,16 @@ impl RecordBuilder {
                 headers.push((h.name.to_owned(), h.value.to_owned()));
             }
         }
-        Self { headers }
+        Self {
+            version: r.version(),
+            headers,
+        }
+    }
+
+    /// Sets the version line written by `build` (default `Version::V1_1`).
+    pub fn version(&mut self, version: Version) -> &mut Self {
+        self.version = version;
+        self
     }
 
     /// Adds a header after validating name and value with the parser's rules.
@@ -199,7 +217,8 @@ impl RecordBuilder {
     }
 
     /// Fills in what is absent: `WARC-Record-ID` becomes `<urn:uuid:{v4}>` and `WARC-Date` the
-    /// current time truncated to whole microseconds. Present values are kept.
+    /// current time truncated to whole microseconds (whole seconds for a `Version::V1_0` builder).
+    /// Present values are kept.
     ///
     /// # Errors
     /// `ClockOutOfRange` if the system clock is outside 1970..=9999.
@@ -212,7 +231,11 @@ impl RecordBuilder {
         if self.get(WARC_DATE).is_none() {
             let now = WarcDate::from_system_time(std::time::SystemTime::now())
                 .ok_or(BuildError::ClockOutOfRange)?;
-            let micros = now.nanos() - now.nanos() % 1000;
+            let micros = if self.version == Version::V1_0 {
+                0
+            } else {
+                now.nanos() - now.nanos() % 1000
+            };
             let date = WarcDate::new(
                 now.year(),
                 now.month(),
@@ -250,7 +273,7 @@ impl RecordBuilder {
             .and_then(|n| n.checked_add(2))
             .ok_or(BuildError::TooLarge)?;
         cap = cap
-            .checked_add(VERSION_LINE.len() + 2) // version line + empty line
+            .checked_add(Version::LINE_LEN + 2) // version line + empty line
             .ok_or(BuildError::TooLarge)?;
         for (n, v) in &self.headers {
             cap = n
@@ -266,7 +289,7 @@ impl RecordBuilder {
             .ok_or(BuildError::TooLarge)?;
 
         let mut out = Vec::with_capacity(cap);
-        out.extend_from_slice(VERSION_LINE);
+        out.extend_from_slice(self.version.line());
         for (n, v) in &self.headers {
             out.extend_from_slice(n.as_bytes());
             out.extend_from_slice(b": ");
@@ -286,7 +309,7 @@ impl RecordBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{MIN, MIN_BODY, rec, same_view};
+    use crate::testutil::{MIN, MIN_BODY, rec, rec_v, same_view};
 
     fn builder() -> RecordBuilder {
         let mut b = RecordBuilder::new("resource").unwrap();
@@ -483,6 +506,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn warc10_byte_faithful_roundtrip() {
+        let dup = rec_v(
+            "WARC/1.0\r\n",
+            "X-A: 1\r\nContent-Length: 5\r\nx-a:  2 \r\nWARC-Type: resource\r\n",
+            MIN_BODY,
+        );
+        for input in [rec_v("WARC/1.0\r\n", MIN, MIN_BODY), dup] {
+            let view = RecordRef::parse(&input, &Limits::DEFAULT).unwrap();
+            let r = Record::from(view);
+            assert_eq!(r.as_bytes(), &input[..]);
+            assert_eq!(r.version(), Version::V1_0);
+            same_view(&r.view(), &view);
+        }
+        assert_eq!(
+            Record::from(RecordRef::parse(&rec(MIN, MIN_BODY), &Limits::DEFAULT).unwrap())
+                .version(),
+            Version::V1_1
+        );
+    }
+
+    #[test]
+    fn from_record_ref_keeps_warc10() {
+        let input = rec_v("WARC/1.0\r\n", MIN, MIN_BODY);
+        let v = RecordRef::parse(&input, &Limits::DEFAULT).unwrap();
+        let r = RecordBuilder::from_record_ref(&v).build(v.body()).unwrap();
+        assert_eq!(r.as_bytes(), &input[..]);
+    }
+
+    #[test]
+    fn builder_version_setter() {
+        let mut b = builder();
+        let r11 = b.build(b"hello").unwrap();
+        assert!(r11.as_bytes().starts_with(b"WARC/1.1\r\n"));
+        b.version(Version::V1_0);
+        let r = b.build(b"hello").unwrap();
+        let expected = "WARC/1.0\r\nWARC-Type: resource\r\nWARC-Record-ID: <urn:x:1>\r\n\
+            WARC-Date: 2026-11-12T10:00:00Z\r\nContent-Length: 5\r\n\r\nhello\r\n\r\n";
+        assert_eq!(r.as_bytes(), expected.as_bytes());
+        assert_eq!(r.as_bytes().len(), r.clone().into_bytes().capacity());
+        assert_eq!(r.view().version(), Version::V1_0);
+        assert_eq!(r.version(), Version::V1_0);
+        b.version(Version::V1_1);
+        assert_eq!(b.build(b"hello").unwrap(), r11);
+    }
+
+    #[cfg(feature = "generate")]
+    #[test]
+    fn fill_missing_warc10_whole_seconds() {
+        let mut b = RecordBuilder::new("resource").unwrap();
+        b.version(Version::V1_0).fill_missing().unwrap();
+        let r = b.build(b"").unwrap();
+        assert_eq!(r.view().version(), Version::V1_0);
+        assert_eq!(r.view().date().unwrap().nanos(), 0);
+    }
+
     #[cfg(feature = "generate")]
     #[test]
     fn fill_missing_generates() {
@@ -514,5 +593,6 @@ mod tests {
         check::<RecordBuilder>();
         check::<WarcDate>();
         check::<Limits>();
+        check::<Version>();
     }
 }

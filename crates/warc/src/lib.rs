@@ -1,4 +1,7 @@
-//! Strict, zero-copy WARC/1.1 record parser and serialiser.
+//! Strict, zero-copy WARC/1.0 and WARC/1.1 record parser and serialiser.
+//!
+//! The version is kept byte-exactly, and the builder writes 1.1 unless [`RecordBuilder::version`]
+//! says otherwise.
 //!
 //! * [`RecordRef`] is a borrowed, validated view of one record (hot path: one record per read).
 //! * [`Record`] and [`RecordBuilder`] build and own serialized records; `Content-Length` is always
@@ -36,6 +39,7 @@ mod reader;
 mod record;
 #[cfg(test)]
 mod testutil;
+mod version;
 
 pub use date::WarcDate;
 pub use error::{BuildError, ParseError, ReadError};
@@ -46,3 +50,4 @@ pub use limits::Limits;
 pub use parse::RecordRef;
 pub use reader::WarcReader;
 pub use record::{Record, RecordBuilder};
+pub use version::Version;

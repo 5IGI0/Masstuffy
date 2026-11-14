@@ -7,7 +7,12 @@ pub(crate) const MIN_BODY: &[u8] = b"hello";
 
 /// `"WARC/1.1\r\n" + headers + "\r\n" + body + "\r\n\r\n"`.
 pub(crate) fn rec(headers: &str, body: &[u8]) -> Vec<u8> {
-    let mut v = b"WARC/1.1\r\n".to_vec();
+    rec_v("WARC/1.1\r\n", headers, body)
+}
+
+/// `version_line + headers + "\r\n" + body + "\r\n\r\n"`.
+pub(crate) fn rec_v(version_line: &str, headers: &str, body: &[u8]) -> Vec<u8> {
+    let mut v = version_line.as_bytes().to_vec();
     v.extend_from_slice(headers.as_bytes());
     v.extend_from_slice(b"\r\n");
     v.extend_from_slice(body);

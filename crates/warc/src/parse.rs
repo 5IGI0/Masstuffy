@@ -1,4 +1,4 @@
-//! Zero-copy parsing of one WARC/1.1 record.
+//! Zero-copy parsing of one WARC/1.0 or WARC/1.1 record.
 
 use crate::date::WarcDate;
 use crate::error::ParseError;
@@ -7,12 +7,13 @@ use crate::header::{
     first_invalid_value_byte, parse_content_length, parse_record_id, validate_name,
 };
 use crate::limits::Limits;
+use crate::version::Version;
 
-const VERSION_LINE: &[u8] = b"WARC/1.1\r\n";
 const TRAILER: &[u8] = b"\r\n\r\n";
 
 /// Result of scanning the head (version line, header lines, empty line) of a record.
 pub(crate) struct Head<'a> {
+    pub(crate) version: Version,
     /// Bytes from the record start through the empty line, inclusive.
     pub(crate) head_len: usize,
     pub(crate) header_block: &'a str,
@@ -29,13 +30,12 @@ pub(crate) struct Head<'a> {
 /// Errors are reported in input order. `Truncated` is returned only when the input is a proper
 /// prefix of a head that would otherwise be valid under `limits`.
 pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>, ParseError> {
-    let vlen = VERSION_LINE.len();
-    match input.get(..vlen) {
-        Some(v) if v == VERSION_LINE => {}
-        Some(_) => return Err(ParseError::InvalidVersion),
-        None if VERSION_LINE.starts_with(input) => return Err(ParseError::Truncated),
+    let vlen = Version::LINE_LEN;
+    let version = match input.get(..vlen) {
+        Some(v) => Version::from_line(v).ok_or(ParseError::InvalidVersion)?,
+        None if Version::is_line_prefix(input) => return Err(ParseError::Truncated),
         None => return Err(ParseError::InvalidVersion),
-    }
+    };
 
     // Lines are only searched inside the cap, so an endless line is rejected as soon as it exceeds it.
     let window_end = input.len().min(limits.max_header_bytes);
@@ -144,6 +144,15 @@ pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>
         pos = nl + 1;
     };
 
+    // WARC/1.0 grammar brackets the URI: drop one enclosing pair (the raw header stays verbatim).
+    let target_uri = match (version, target_uri) {
+        (Version::V1_0, Some(u)) => Some(
+            u.strip_prefix('<')
+                .and_then(|s| s.strip_suffix('>'))
+                .unwrap_or(u),
+        ),
+        (_, t) => t,
+    };
     let warc_type = warc_type.ok_or(ParseError::MissingHeader(WARC_TYPE))?;
     let content_length = content_length.ok_or(ParseError::MissingHeader(CONTENT_LENGTH))?;
     // Every line was validated above (names are ASCII, values UTF-8, separators ASCII), so this
@@ -157,6 +166,7 @@ pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>
         })?
         .unwrap_or_default();
     Ok(Head {
+        version,
         head_len,
         header_block,
         warc_type,
@@ -168,7 +178,7 @@ pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>
     })
 }
 
-/// Zero-copy view of one validated WARC/1.1 record.
+/// Zero-copy view of one validated WARC/1.0 or WARC/1.1 record.
 ///
 /// Invariants: `raw` is exactly one complete record (head + body + `\r\n\r\n`) satisfying the wire
 /// rules; `header_block` is the UTF-8 text between the version line and the empty line (each line
@@ -176,6 +186,7 @@ pub(crate) fn scan_head<'a>(input: &'a [u8], limits: &Limits) -> Result<Head<'a>
 /// `WARC-Record-ID`, `WARC-Date`, `Content-Length`) appear at most once.
 #[derive(Clone, Copy, Debug)]
 pub struct RecordRef<'a> {
+    version: Version,
     raw: &'a [u8],
     header_block: &'a str,
     body: &'a [u8],
@@ -238,6 +249,7 @@ impl<'a> RecordRef<'a> {
             .ok_or(ParseError::Truncated)?;
         Ok((
             RecordRef {
+                version: head.version,
                 raw,
                 header_block: head.header_block,
                 body,
@@ -267,7 +279,13 @@ impl<'a> RecordRef<'a> {
         self.date
     }
 
-    /// First `WARC-Target-URI`, verbatim, if present.
+    /// Version from the first line. `as_bytes()` starts with exactly this version line.
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    /// First `WARC-Target-URI`, if present. Verbatim for WARC/1.1; for WARC/1.0, one enclosing
+    /// `<…>` pair is removed if present (1.0 grammar). The raw header stays available via `header()`.
     pub fn target_uri(&self) -> Option<&'a str> {
         self.target_uri
     }
@@ -308,7 +326,7 @@ impl<'a> RecordRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{MIN, MIN_BODY, rec, same_view};
+    use crate::testutil::{MIN, MIN_BODY, rec, rec_v, same_view};
 
     const D: Limits = Limits::DEFAULT;
 
@@ -463,18 +481,26 @@ mod tests {
     #[test]
     fn wrong_version() {
         for v in [
-            "WARC/1.0\r\n",
             "warc/1.1\r\n",
             "WARC/1.1\n",
             "WARC/1.10\r\n",
             "WARC/2.0\r\n",
+            "WARC/1.2\r\n",
+            "WARC/0.17\r\n",
+            "WARC/1.0 \r\n",
+            "WARC/1.0\n",
+            "WARC/1.01\r\n",
+            "WARC/1.\r\n",
+            "WARC/10\r\n",
         ] {
             let mut b = v.as_bytes().to_vec();
             b.extend_from_slice(b"WARC-Type: x\r\nContent-Length: 0\r\n\r\n\r\n\r\n");
             assert_eq!(err(&b), ParseError::InvalidVersion, "{v:?}");
         }
-        assert_eq!(err(b"WARC/1.0"), ParseError::InvalidVersion);
+        assert_eq!(err(b"WARC/1.0"), ParseError::Truncated);
         assert_eq!(err(b"XARC"), ParseError::InvalidVersion);
+        assert_eq!(err(b"WARC/1.2"), ParseError::InvalidVersion);
+        assert_eq!(err(b"WARC/2"), ParseError::InvalidVersion);
     }
 
     #[test]
@@ -803,6 +829,135 @@ mod tests {
                 assert_eq!(r.as_bytes().len(), n);
                 let again = RecordRef::parse(r.as_bytes(), &D).unwrap();
                 same_view(&r, &again);
+            }
+        }
+    }
+
+    const V10: &str = "WARC/1.0\r\n";
+
+    fn v10_with(extra: &str) -> Vec<u8> {
+        rec_v(
+            V10,
+            &format!("WARC-Type: resource\r\n{extra}Content-Length: 0\r\n"),
+            b"",
+        )
+    }
+
+    #[test]
+    fn parse_warc10_minimal() {
+        let input = rec_v(V10, MIN, MIN_BODY);
+        let v10 = parse(&input).unwrap();
+        let m = min();
+        let v11 = parse(&m).unwrap();
+        assert_eq!(v10.version(), Version::V1_0);
+        assert_eq!(v11.version(), Version::V1_1);
+        assert_eq!(v10.as_bytes(), &input[..]);
+        assert_eq!(v10.body(), v11.body());
+        assert_eq!(v10.warc_type(), v11.warc_type());
+        assert_eq!(v10.record_id(), v11.record_id());
+        assert_eq!(v10.date(), v11.date());
+        assert_eq!(v10.target_uri(), v11.target_uri());
+        assert_eq!(v10.content_length(), v11.content_length());
+        assert_eq!(v10.header_count(), v11.header_count());
+        assert!(v10.headers().eq(v11.headers()));
+    }
+
+    #[test]
+    fn warc10_every_prefix_is_truncated() {
+        let b = rec_v(V10, MIN, MIN_BODY);
+        for n in 0..b.len() {
+            assert_eq!(
+                RecordRef::parse(&b[..n], &D).unwrap_err(),
+                ParseError::Truncated,
+                "prefix {n}"
+            );
+            assert_eq!(
+                RecordRef::parse_prefix(&b[..n], &D).unwrap_err(),
+                ParseError::Truncated,
+                "prefix {n}"
+            );
+        }
+        assert!(RecordRef::parse(&b, &D).is_ok());
+    }
+
+    #[test]
+    fn warc10_target_uri_brackets() {
+        let uri = |version: &str, value: &str| {
+            let b = rec_v(
+                version,
+                &format!(
+                    "WARC-Type: resource\r\nWARC-Target-URI: {value}\r\nContent-Length: 0\r\n"
+                ),
+                b"",
+            );
+            let r = RecordRef::parse(&b, &D).unwrap();
+            (
+                r.target_uri().map(str::to_owned),
+                r.header("WARC-Target-URI").map(str::to_owned),
+            )
+        };
+        let (t, h) = uri(V10, "<http://a/>");
+        assert_eq!(t.as_deref(), Some("http://a/"));
+        assert_eq!(h.as_deref(), Some("<http://a/>"));
+        assert_eq!(uri(V10, "http://a/").0.as_deref(), Some("http://a/"));
+        assert_eq!(uri(V10, "<http://a/").0.as_deref(), Some("<http://a/"));
+        assert_eq!(uri(V10, "<>").0.as_deref(), Some(""));
+        // Exactly one pair is stripped.
+        assert_eq!(uri(V10, "<<http://a/>>").0.as_deref(), Some("<http://a/>"));
+        assert_eq!(
+            uri("WARC/1.1\r\n", "<http://a/>").0.as_deref(),
+            Some("<http://a/>")
+        );
+    }
+
+    #[test]
+    fn warc10_fractional_date_accepted() {
+        let b = v10_with("WARC-Date: 2026-11-12T10:00:00.5Z\r\n");
+        let r = parse(&b).unwrap();
+        assert_eq!(r.date().unwrap().nanos(), 500_000_000);
+    }
+
+    #[test]
+    fn warc10_strict_rules_still_apply() {
+        let b = rec_v(V10, "WARC-Type: x\nContent-Length: 0\r\n", b"");
+        assert!(matches!(err(&b), ParseError::InvalidLineEnding { .. }));
+        let b = v10_with("X:a\r\n");
+        assert!(matches!(err(&b), ParseError::MalformedHeaderLine { .. }));
+        let b = v10_with("WARC-Type: y\r\n");
+        assert_eq!(err(&b), ParseError::DuplicateHeader(WARC_TYPE));
+        let mut b = v10_with("");
+        b.truncate(b.len() - 4);
+        b.extend_from_slice(b"XXXX");
+        assert_eq!(err(&b), ParseError::InvalidTrailer);
+    }
+
+    #[test]
+    fn garbage_never_panics_warc10() {
+        let base = rec_v(V10, MIN, MIN_BODY);
+        let mut rng = XorShift(0x1234_5678_9ABC_DEF1);
+        for i in 0..10_000 {
+            let mut v = base.clone();
+            match i % 3 {
+                0 => {
+                    let p = rng.below(v.len());
+                    v[p] = rng.byte();
+                }
+                1 => {
+                    let p = rng.below(v.len() + 1);
+                    v.insert(p, rng.byte());
+                }
+                _ => {
+                    let p = rng.below(v.len());
+                    v.truncate(p);
+                }
+            }
+            if let Ok(r) = RecordRef::parse(&v, &D) {
+                let again = RecordRef::parse(r.as_bytes(), &D).unwrap();
+                same_view(&r, &again);
+                assert_eq!(r.version(), again.version());
+            }
+            if let Ok((r, n)) = RecordRef::parse_prefix(&v, &D) {
+                assert_eq!(r.as_bytes().len(), n);
             }
         }
     }
