@@ -1,0 +1,28 @@
+[package]
+name = "masstuffy"
+version = "0.1.0"
+description = "Masstuffy repository engine (async)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+masstuffy-collection.workspace = true
+masstuffy-dictstore.workspace = true
+masstuffy-durable.workspace = true
+masstuffy-cdx.workspace = true
+masstuffy-warc = { workspace = true, features = ["generate"] }
+masstuffy-zframe = { workspace = true, features = ["codec"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+masstuffy-zframe = { workspace = true, features = ["train"] }
+
+[lints]
+workspace = true

@@ -171,8 +171,8 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   shutdown and periodically from the writer task; never inside `commit`).
   Engine duties: `Repository::open` runs `Collection::open(.., &RecoveryOptions::default(), ..)` per
   collection dir; `ManifestMissing` -> `trash_dir` (aborted create); any other error -> collection skipped
-  and reported, startup continues; repair is an explicit operator action; after a poisoned `Writer`, drop it
-  and `Collection::open` again under the admin mutex (re-commit the unacknowledged batch); M18 resumes the
+  and reported, startup continues; repair is an explicit operator action; after a poisoned `Writer`, the
+  writer task drops it and runs `Collection::open` again (no admin mutex, see Engine) and re-commits the unacknowledged batch once; M18 resumes the
   CDX at its checkpoint on `Collection::cdx_path()`, and rebuilds the collection's index entries if
   `report.repair` is `Some` and the checkpoint offset is above `repair.at`.
   `Options { max_record_bytes, max_open_files }`.
@@ -279,10 +279,31 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
 ### Engine
 
 **`crates/masstuffy` — `masstuffy`**: the repository engine; the only async crate.
-- `Repository::init(dir)` / `open(dir)`: `DirLock`, config, dictstore scan, collection loading (an invalid
-  collection is skipped and reported), trash sweep, secondary-index catch-up.
-- `create_collection`, `delete_collection` (trash rename), `rename` (manifest only), `put(records)`,
-  `put_raw(envelope stream)`, `get_by_id`, `get_by_url`, `search`, `scan`, `read_raw`.
+- Repository layout: `.lock`, `config.json`, `data/{buffer,dict/zstd,repository/<uuid>}` (collection directories
+  are named after the uuid; the slug lives in the manifest only).
+- `config.json` (schema `version` 1, strict: unknown fields rejected, missing fields take their default, 64 KiB cap,
+  every range validated): `max_record_bytes`, `max_open_files`, `dict_cache_bytes`, `dict_max_file_size`,
+  `default_split_threshold`, `writer_queue` (64), `max_group_requests` (128), `max_group_bytes` (64 MiB),
+  `max_inflight_put_bytes` (256 MiB), `preparers_per_collection` (4), `max_concurrent_prepares` (null = cores),
+  `max_concurrent_reads` (64), `open_concurrency` (4), `checkpoint_every_bytes` (64 MiB). `init` writes all fields.
+- `Repository::init(dir)`: the directory must be empty, or hold only the leftovers of an interrupted init (`.lock`,
+  `.tmp-*`, the empty layout directories); dirs are created and fsynced, then `config.json` by `atomic_write` is
+  the commit point; then the open sequence runs with the lock already held.
+- `Repository::open(dir)`: `DirLock`; config; layout check; `sweep_tmp` (root) and `sweep_trash`
+  (`data/repository`); `DictStore::open` (fatal on error); scan of `data/repository` (non-uuid or non-directory
+  entries are kept and reported as unknown); parallel bounded `Collection::open`. `ManifestMissing` in a
+  uuid-named directory -> trashed (aborted create); any other error, a manifest uuid that differs from the
+  directory name, or a duplicate slug (all duplicates are skipped) -> collection skipped and reported. The slugs of
+  skipped collections are reserved so a new collection cannot take them.
+- `create_collection(slug, codec)`: slug `[a-z0-9][a-z0-9_-]{0,127}` for new collections, exact (case-sensitive)
+  lookup, slugs of loaded manifests accepted as they are; one global create lock.
+- `Located { collection, generation, entry }` names a committed record. `put(records)` and
+  `put_raw(Vec<RawItem>)` (M17) return one `Located` per record, contiguous (I9); `get(&Located)` returns the
+  serialized WARC bytes (`NotDecodable` for a `HeaderOnly` raw import that disagrees with its payload: use
+  `get_raw`); `get_raw` returns the stored bytes and their encoding. A locator of another generation is
+  `StaleLocator`. M19 keeps the envelope-stream import, `scan`, `search`, `get_by_id`, `get_by_url`.
+- Later milestones: `delete_collection` (trash rename), `rename` (manifest only), `get_by_id`, `get_by_url`, `search`,
+  `scan`.
 - `train_dictionary(collection, opts)` and `rebuild(collection, target_codec)`; `rebuild_index()`.
 - Rebuild protocol (M20): hold the admin mutex for the whole rebuild (tombstones, rename, delete, reopen wait);
   `start` in `spawn_blocking`; the writer task publishes `cdx_len()` after each commit; loop
@@ -295,10 +316,36 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   per-collection index rebuild → `DropCollection` + `ReplaceGeneration` + reinserts (the collection is
   unsearchable meanwhile). Record deletion = `prepare_tombstone` + `Writer::tombstone` under the admin mutex, then
   `Op::Tombstone`.
-- Per-collection writer task with a bounded queue and group commit; readers use `Arc<Snapshot>`.
+- Per-collection writer task with a bounded queue and group commit; readers use `Arc<Snapshot>`. The writer
+  task is a tokio task that runs each commit in one `spawn_blocking` (not a dedicated thread: a commit is
+  two fsyncs, and a thread per collection would idle). Callers prepare in the blocking pool, then queue a
+  request; the task drains the queued requests without waiting (at most `max_group_requests` and
+  `min(max_group_bytes, split_threshold)` stored bytes, a single larger request goes alone) into one
+  `Writer::commit`, then answers each request. A non-poisoning commit error (nothing was written) falls back to
+  committing each request alone; a poisoned writer is reopened **by the writer task itself** (no admin mutex: M20's
+  rebuild holds it while waiting for the writer task, so waiting for it here would deadlock; M20 must abort an
+  in-progress `Rebuilder` first) and the group is retried once; a lost writer is reopened at the next group. The
+  task publishes counters and exposes a hook point (`on_committed`) where M18 sends the index batch.
+- Admission: a repository-wide byte budget (`max_inflight_put_bytes`, from admission until the writer answered),
+  a prepare semaphore (CPU) and a read semaphore bound the work in flight; a request larger than the budget runs
+  alone.
+- Shutdown: puts and creates hold a read guard of a gate from admission until their request is queued;
+  `shutdown` flips the gate under the write guard (new puts get `ShuttingDown`), sends a `Shutdown` message
+  behind the queued requests to every writer task (each commits what is queued, writes a final checkpoint and
+  exits), joins them, then releases the `DirLock`. Every writer task also holds an `Arc<DirLock>`, so the
+  repository stays locked until the last task exited. Dropping everything without `shutdown` drains the same
+  way (channels close).
+- Cancellation rule (M18, M20, M21 must follow it): **a flow that mutates the repository must survive
+  cancellation of its caller, and every blocking job that mutates repository files owns an `Arc<DirLock>`
+  clone** (so the directory stays locked while an orphaned job runs). `create_collection` therefore runs
+  create + writer spawn + registration as one spawned unit holding owned gate and create-lock guards; `open`'s
+  scan and per-collection jobs and `create`'s blocking job carry a lock clone; `shutdown` runs in a spawned task
+  (a second or later call waits for it, the error goes to the first caller that observes completion).
+- tokio features: `rt` and `sync` in the library; `rt-multi-thread`, `macros` and `time` in dev-dependencies
+  only (the embedding application picks the runtime).
 - Reads `MASSTUFFY_RAW_IMPORT_CHECK` once at `Repository::open` (→ `RawCheck`) and passes it to every
-  `prepare_raw` of `put_raw` (M17/M19).
-- Internal: all crates above. External: `tokio` (`rt-multi-thread`, `sync`), `uuid` (v4), `tracing`,
+  `prepare_raw` of `put_raw` (M17/M19: `put_raw` of already split items and `get_raw` arrive in M17).
+- Internal: all crates above. External: `tokio` (`rt`, `sync`), `uuid` (v4), `tracing`,
   `thiserror`. Features: `redb` (default) selects `index-redb`.
 - Index file: `<workdir>/data/index.redb`, opened in `spawn_blocking` at `Repository::open`;
   `OpenError::needs_rebuild()` -> unlink the file, fsync `data/`, recreate, full catch-up from every
@@ -370,9 +417,9 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M14 | `collection`: tombstones, `entries()`, `Rebuilder` (bounded worker pool) | rebuild None→Zstd, Zstd(D1)→Zstd(D1) (raw copy), Zstd(D1)→Zstd(D2), Zstd→None: live records byte-exact, tombstoned records not copied, new warcinfo first; crash before/after the manifest rename; writes during the rebuild carried over; concurrent readers; tombstone durability/idempotence; `entries()` with interleaved tombstones; pool: output identical for 1 and 4 workers, order preserved, error/panic stops and joins, in-flight memory bound |
 | M15 | `index`: trait, `MemIndex`, conformance suite | conformance suite on `MemIndex`: nearest-date semantics and ties, `request` excluded, ACTIVE only (tombstones, staged/retired generations, drop/recreate), pattern queries and cursor pagination, checkpoint atomic with ops, idempotent replay, I8 rebuilt == incremental, concurrent readers |
 | M16 | `index-redb` | conformance suite; reopen after drop (incl. lazy sync); crash in a child process (abort) -> consistent prefix, structural batches durable; concurrent readers during a large `apply`; purge bounded progress; differential vs `MemIndex`; schema mismatch / foreign file / already open |
-| M17 | `masstuffy`: init/open, registry, writer task, `put`/`get` by locator | many tasks `put` to one collection → all entries present once, no interleaving inside a batch |
+| M17 | `masstuffy`: init/open, registry, writer task with group commit, `put`/`put_raw`/`get`/`get_raw` by locator, shutdown | many tasks `put` to one collection → all entries present once, no interleaving inside a batch |
 | M18 | `masstuffy`: secondary-index wiring, catch-up from checkpoint, `rebuild_index` | kill between CDX fsync and index apply → catch-up; rebuilt index equals incremental one (I8) |
-| M19 | `masstuffy`: `put_raw`, `read_raw`, `scan`, `search` | delegated frames with wrong dict_id rejected; scan skips orphan bytes |
+| M19 | `masstuffy`: `put_raw` from an envelope stream, `scan`, `search`, `get_by_id`, `get_by_url` | delegated frames with wrong dict_id rejected; scan skips orphan bytes |
 | M20 | `masstuffy`: `train_dictionary`, `rebuild` orchestration | deterministic sample; reads keep working during a rebuild (concurrent test) |
 | M21 | `masstuffy`: `delete_collection`, `rename` | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates |
 
@@ -386,7 +433,8 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
 
 1. **Errors**: one `thiserror` enum per crate, no shared error crate. Higher crates wrap lower errors
    with `#[from]` and add context (path, collection uuid). The engine error exposes a coarse
-   `kind()` (`NotFound`, `Conflict`, `Corrupt`, `Invalid`, `Io`) for future API layers. No `anyhow` in libs.
+   `kind()` (`NotFound`, `Conflict`, `Corrupt`, `Invalid`, `Io`, `Unavailable` for shutdown, a stopped writer or a failed
+   background task) for future API layers. No `anyhow` in libs.
 2. **Sync/async boundary**: all crates except `masstuffy` are sync and runtime-agnostic. The engine runs
    every blocking call (file I/O, fsync, zstd, redb) in `spawn_blocking`; tokio types never appear in
    lower public APIs. The `SecondaryIndex` trait is sync for the same reason.
@@ -489,4 +537,4 @@ These override the spec where they differ.
 11. **Secondary-index durability** (M16): *Recommend* durable commits by default (`sync_every = 1`,
     quick-repair on), structural batches always durable, engine free to raise `sync_every` after
     measurement. Adopted in M16.
-12. **Index file location** (M16): *Recommend* `<workdir>/data/index.redb` (decided in M17/M18).
+12. **Index file location** (M16): *Recommend* `<workdir>/data/index.redb` (still decided in M18: the index is not wired in M17).
