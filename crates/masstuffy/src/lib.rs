@@ -80,6 +80,7 @@ mod admin;
 mod admin_tests;
 mod collection;
 mod config;
+mod dicts;
 mod error;
 mod import;
 mod index;
@@ -108,6 +109,7 @@ mod writer;
 
 pub use collection::CollectionHandle;
 pub use config::{Config, ConfigError, MAX_CONFIG_BYTES, RAW_IMPORT_CHECK_ENV};
+pub use dicts::DictionaryInfo;
 pub use error::{Error, ErrorKind};
 pub use import::{
     ImportOptions, ImportReport, MAX_IMPORT_BATCH_RECORDS, MAX_REPORTED_REJECTIONS, OnInvalid,

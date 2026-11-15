@@ -131,6 +131,8 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
   sum of zstd `sizeof` (`cache_bytes`). Concurrent misses on a key prepare it once (`OnceLock` slot).
   An entry larger than the budget is returned uncached. Locks are never held during I/O or
   preparation. Lock order: `install` -> `files`; `cache` is standalone.
+- `bytes(dict_id) -> Vec<u8>` (M22): the verified file bytes (header magic and id checked, capped by
+  `max_file_size`), blocking, not cached (the prepared-dictionary caches are unchanged; HTTP clients cache by id).
 - Spec 4.4 split: id allocation and the write are in `dictstore`; sampling/training (in-memory
   `SampleSet`), label generation (`<slug>_<ts>` sanitised with `is_valid_label`) and rebuild are in the
   engine (M20).
@@ -324,6 +326,10 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `get_raw`); `get_raw` returns the stored bytes and their encoding. A locator of another generation is
   `StaleLocator`. M19 adds `CollectionHandle::put_raw_envelope`, `scan`, `search`, `find_by_url`/`get_by_url` and
   `Repository::find_by_id`/`get_by_id` (see "Queries and bulk import (M19)" below).
+- **Dictionary accessors (M22)**, `dicts.rs`: `Repository::dictionaries() -> Result<Vec<DictionaryInfo { dict_id, label,
+  size }>>` (sorted by id, in memory) and `Repository::dictionary(dict_id) -> Vec<u8>` (file bytes read in
+  `spawn_blocking` under one read permit; unknown id or 0 is `DictNotFound`). Not cached: clients that compress or
+  decompress themselves fetch a dictionary once and cache it by id (dictionaries are immutable, I5).
 - **Admin operations (M21)**, `admin.rs`: `Repository::delete_collection(impl Into<CollectionRef>) ->
   DeletedCollection`, `rename_collection(which, new_slug) -> CollectionHandle`, `CollectionHandle::delete(Vec<Located>)`
   and `delete_by_id`. `CollectionRef` is `Slug(&str)` or `Id(CollectionId)`. Each runs its mutation in a spawned unit
@@ -519,11 +525,46 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   - Deviation from the earlier text of this section ("a bounded queue of op batches", a purge task with a timer):
     tailing the CDX removes the queue, the loss on overflow and a second code path for catch-up.
 
+### API layer
+
+**`crates/http` — `masstuffy-http`** (M22): an HTTP/1.1 JSON + WARC API in front of the engine. The normative wire
+contract is [`http-api.md`](http-api.md). There is no authentication or TLS: the server binds to loopback by default
+and needs an authenticating reverse proxy to be exposed.
+- Library: `router(repo, HttpOptions, Option<&OpenReport>) -> Result<Router, OptionsError>` (axum 0.8, `http1` only:
+  no axum `json`/`query`/`tokio` features, so every rejection uses our error format),
+  `serve(listener, router, ServeOptions, watch::Receiver<Stop>)` (accept loop with a connection cap, header read
+  timeout, hyper graceful shutdown and a drain deadline; it never shuts the repository down) and the `locator`
+  module (versioned, checksummed token `L1…` carrying a full `Located`, so a record is addressable in a URL and
+  survives renames; not authentication).
+- Routes: health and status; collections (list, create, get, rename, delete); records (put WARC, get decoded or raw,
+  delete by locator, batch or id); raw import (`application/x-masstuffy-envelope`, streamed); lookups by id and by URL;
+  search; scan; export (paged WARC); rebuild, train and index rebuild as **jobs** (`/v1/jobs`, with `?wait=`);
+  index sync; dictionaries (`GET /v1/dictionaries`, `GET /v1/dictionaries/{id}`: immutable, strong ETag, 304) so
+  that clients can compress and decompress on their side. The raw route carries `Masstuffy-Encoding`, `-Dict-Id`,
+  `-Raw-Size`, `-Digest` and `-Content-Size` headers and never sets `Content-Encoding`.
+- Jobs: a registry bounded by `max_running_jobs` + `max_retained_jobs`; one leaf `std::sync::Mutex`, never held
+  across an `.await`; a job survives its client and ends when the engine shutdown cancels it.
+- Limits (all in `HttpOptions`/`ServeOptions`, reported by `GET /v1/status`): body caps, record count, request
+  timeout (not for streamed bodies, which use an idle timeout), concurrent requests (the permit is held while the
+  response body streams), connections, head size.
+- Bodies: request bodies reach blocking code through a bounded channel (`pump_body` on the async side,
+  `BodyReader` on a blocking thread); the WARC parse and the engine's import producer are the only readers.
+- Binary `masstuffy-server` (cargo feature `server`, default): hand-written argument parser, multi-thread runtime,
+  SIGINT/SIGTERM (first drains, second stops at once), `Repository::shutdown` always runs before exit.
+- Dependencies: `masstuffy`, `warc`, `cdx`, `zframe` (`codec`), axum, hyper, hyper-util, http-body, bytes,
+  form_urlencoded, serde, serde_json, thiserror, tracing, xxhash-rust, tokio; optional `tracing-subscriber`
+  (feature `server`).
+- Follow-ups: authentication (repository-wide routes, i.e. lookup by id without a collection, jobs, index and
+  dictionaries, are admin scope), an engine "entry at position" API (shorter tokens), a scan "exhausted" flag.
+
 ## 2. Dependency graph
 
 Strictly layered: an arrow means "depends on"; a crate only depends on crates in lower rows.
 
 ```
+ L6  api           masstuffy-http  (axum, hyper; bin `masstuffy-server`)
+                   │
+                   ▼
  L5  engine        masstuffy  (tokio)
                    ├──────────────┬──────────────────┬───────────────┐
                    ▼              ▼                  ▼               ▼
@@ -553,6 +594,7 @@ Edge list (authoritative):
 | index | warc, cdx, urlkey |
 | index-redb | index, cdx |
 | masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe (`codec`, `train`), cdx, durable |
+| masstuffy-http | masstuffy, warc, cdx, zframe (`codec`) |
 
 `index` also depends on `warc` (for `WarcDate`); `index-redb` uses `WarcDate`/`UrlPattern` through `index`'s re-exports.
 
@@ -586,6 +628,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M19 | `masstuffy`: `put_raw` from an envelope stream, `scan`, `search`, `get_by_id`, `get_by_url` | delegated frames with wrong dict_id rejected (both RawCheck levels); scan skips orphan bytes |
 | M20 | `masstuffy`: `train_dictionary`, `rebuild` orchestration | deterministic sample; reads keep working during a rebuild (concurrent test) |
 | M21 | `masstuffy`: `delete_collection`, `rename_collection`, record deletion (`delete`, `delete_by_id`) | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates and renames; deletes wait for rebuilds; I8 after deletes |
+| M22 | http: API crate + `masstuffy-server` + `docs/http-api.md`; dictstore `bytes`, engine `dictionaries`/`dictionary` | every endpoint, error mapping, limits, streaming import/export, disconnect, graceful shutdown, dictionary download with ETag |
 
 M3 and M4 are delivered together (one plan → code → review cycle).
 
@@ -629,7 +672,8 @@ Milestones M0, M1 and M2 are delivered together by the first milestone.
 8. **Bounded resources**: open-file LRU in `seglog::Reader`, dictionary cache in `dictstore`, bounded writer
    queues, caps on header bytes, record size, envelope size and decompressed size, all configurable.
 9. **Libraries do not log**: recovery and load problems are returned as data (`RecoveryReport`, skipped
-   collections); only the engine logs, with `tracing`.
+   collections); only the engine logs, with `tracing`. The HTTP crate logs requests (debug) and 5xx errors (warn)
+   with `tracing`; the binary installs the subscriber.
 
 ## 5. Decisions confirmed by the user (2026-11-13)
 

@@ -677,30 +677,33 @@ async fn scan_resume_cursor_tombstone_line_before_from() {
 
 rt_test! {
 async fn scan_cancelled_page_is_not_lost() {
-    let (_td, repo, h) = fresh(RawCheck::Full, Codec::None, &Config::default()).await;
+    let cfg = Config::default();
+    let (_td, repo, h) = fresh(RawCheck::Full, Codec::None, &cfg).await;
     h.put((1..=20).map(|i| record(i, 50)).collect()).await.unwrap();
     let mut scan = h.scan(ScanOptions { page_records: 5, ..ScanOptions::default() }).unwrap();
     let mut got = Vec::new();
+    // Hold every read permit: `next_page` is guaranteed to be pending (waiting for its permit)
+    // when the ready arm wins and drops it. No timing involved.
+    let held = std::sync::Arc::clone(&repo.core().read_sem)
+        .acquire_many_owned(cfg.max_concurrent_reads)
+        .await
+        .unwrap();
     let mut dropped = 0;
-    let mut attempts = 0;
+    for _ in 0..3 {
+        tokio::select! {
+            biased;
+            // Polled first: it parks on the semaphore, then the ready arm wins and drops it.
+            _ = scan.next_page() => panic!("a page was produced without a read permit"),
+            () = async {} => dropped += 1,
+        }
+    }
+    assert_eq!(dropped, 3);
+    drop(held);
+    // The cancelled attempts lost nothing: the scan replays from the same cursor.
     loop {
-        attempts += 1;
-        let page = if attempts <= 5 {
-            tokio::select! {
-                biased;
-                () = tokio::task::yield_now() => {
-                    dropped += 1;
-                    continue;
-                }
-                r = scan.next_page() => r.unwrap(),
-            }
-        } else {
-            scan.next_page().await.unwrap()
-        };
-        let Some(p) = page else { break };
+        let Some(p) = scan.next_page().await.unwrap() else { break };
         got.extend(p.items.into_iter().map(|i| i.located.entry));
     }
-    assert!(dropped >= 1);
     assert_eq!(got, live_entries(&h).await);
     repo.shutdown().await.unwrap();
 }

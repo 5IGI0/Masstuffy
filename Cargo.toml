@@ -28,6 +28,15 @@ serde_json = { version = "1.0.150", default-features = false, features = ["std"]
 tokio = { version = "1.52.3", default-features = false }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 uuid = { version = "1.29.2", default-features = false, features = ["std", "v4"] }
+masstuffy = { path = "crates/masstuffy", version = "0.1.0" }
+axum = { version = "0.8.9", default-features = false, features = ["http1"] }
+hyper = { version = "1.12.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "server", "server-graceful", "service", "http1"] }
+http-body = { version = "1.1.0", default-features = false }
+bytes = { version = "1.12.1", default-features = false, features = ["std"] }
+form_urlencoded = { version = "1.2.2", default-features = false, features = ["std"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
 
 # Line tables keep file:line in backtraces while cutting debug build size several times.
 [profile.dev]

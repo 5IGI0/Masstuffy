@@ -200,6 +200,17 @@ impl DictStore {
         Ok(bytes)
     }
 
+    /// The verified bytes of `dict_id`'s file: header magic and id checked, at most `max_file_size`.
+    /// Blocking. Not cached: the encoder and decoder caches stay as they are; HTTP clients cache.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] (unknown id, including 0), [`Error::Io`], [`Error::NotAFile`],
+    /// [`Error::FileTooLarge`], [`Error::BadHeader`], [`Error::IdMismatch`].
+    pub fn bytes(&self, dict_id: u32) -> Result<Vec<u8>, Error> {
+        self.read_dict(dict_id)
+    }
+
     /// The prepared decoder of `dict_id`, cached. Blocking on a miss (file read and preparation).
     ///
     /// # Errors
@@ -790,6 +801,43 @@ mod tests {
         assert_eq!(inspect_single_frame(&f).unwrap().dict_id, id);
         dc.decompress(&f, Some(&dec), 1 << 20, &mut back).unwrap();
         assert_eq!(back, sample);
+    }
+
+    #[test]
+    fn bytes_roundtrip_after_install() {
+        let t = TestDir::new();
+        let s = open(t.path());
+        let d = variant(1);
+        let id = s.install("a", &d).unwrap().dict_id;
+        assert_eq!(s.bytes(id).unwrap(), with_id(d, id));
+    }
+
+    #[test]
+    fn bytes_unknown_and_zero_not_found() {
+        let t = TestDir::new();
+        let s = open(t.path());
+        for id in [0, 12345] {
+            assert!(matches!(s.bytes(id), Err(Error::NotFound { .. })));
+        }
+    }
+
+    #[test]
+    fn bytes_file_too_large() {
+        let t = TestDir::new();
+        let d = place(t.path(), "a", 40000, 1);
+        let len = u64::try_from(d.len()).unwrap();
+        let opts = Options {
+            max_file_size: len + 10,
+            ..Options::default()
+        };
+        let (s, _) = DictStore::open(t.path(), opts).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(t.path().join("a.40000.zstdict"))
+            .unwrap()
+            .set_len(len + 100)
+            .unwrap();
+        assert!(matches!(s.bytes(40000), Err(Error::FileTooLarge { .. })));
     }
 
     #[test]

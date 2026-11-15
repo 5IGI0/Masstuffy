@@ -1,0 +1,49 @@
+[package]
+name = "masstuffy-http"
+version = "0.1.0"
+description = "HTTP API for the Masstuffy repository engine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "masstuffy_http"
+
+[[bin]]
+name = "masstuffy-server"
+path = "src/bin/masstuffy-server.rs"
+required-features = ["server"]
+
+[dependencies]
+masstuffy.workspace = true
+masstuffy-warc.workspace = true
+masstuffy-cdx.workspace = true
+masstuffy-zframe = { workspace = true, features = ["codec"] }
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body.workspace = true
+bytes.workspace = true
+form_urlencoded.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = ["server"]
+# The masstuffy-server binary: multi-thread runtime, signals, log output.
+server = ["dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "net", "macros", "io-util"] }
+tower = { workspace = true }
+hyper = { workspace = true, features = ["client"] }
+masstuffy-warc = { workspace = true, features = ["generate"] }
+masstuffy-collection.workspace = true
+
+[lints]
+workspace = true
