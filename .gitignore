@@ -1,1 +1,5 @@
 /target
+__pycache__/
+*.egg-info/
+clients/python/build/
+clients/python/dist/

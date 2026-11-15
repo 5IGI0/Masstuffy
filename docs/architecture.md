@@ -557,6 +557,10 @@ and needs an authenticating reverse proxy to be exposed.
 - Follow-ups: authentication (repository-wide routes, i.e. lookup by id without a collection, jobs, index and
   dictionaries, are admin scope), an engine "entry at position" API (shorter tokens), a scan "exhausted" flag.
 
+### Clients
+
+`clients/python`: Python client (`masstuffy`) on pywarc, see its README.
+
 ## 2. Dependency graph
 
 Strictly layered: an arrow means "depends on"; a crate only depends on crates in lower rows.

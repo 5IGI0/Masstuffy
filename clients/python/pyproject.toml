@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "masstuffy"
+dynamic = ["version"]
+description = "Python client for the Masstuffy HTTP API"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "AGPL-3.0-or-later"}
+dependencies = ["pywarc>=0.4.1,<0.5"]
+
+[project.optional-dependencies]
+zstd = ["zstandard>=0.22", "xxhash>=3.0"]
+envelope = ["xxhash>=3.0"]
+
+[tool.setuptools]
+packages = ["masstuffy"]
+
+[tool.setuptools.dynamic]
+version = {attr = "masstuffy._version.__version__"}
+
+[tool.setuptools.package-data]
+masstuffy = ["py.typed"]
