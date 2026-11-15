@@ -11,7 +11,7 @@ name = "masstuffy_http"
 
 [[bin]]
 name = "masstuffy-server"
-path = "src/bin/masstuffy-server.rs"
+path = "src/bin/masstuffy-server/main.rs"
 required-features = ["server"]
 
 [dependencies]

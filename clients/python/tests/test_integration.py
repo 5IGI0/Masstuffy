@@ -25,7 +25,8 @@ HAVE_BIN = bool(BIN) and os.path.isfile(BIN) and os.access(BIN, os.X_OK)
 class ServerProcess:
     def __init__(self, env=None):
         self.tmp = tempfile.TemporaryDirectory()
-        e = dict(os.environ)
+        # Hermetic: a developer's MASSTUFFY_* variables must not change the server under test.
+        e = {k: v for k, v in os.environ.items() if not k.startswith("MASSTUFFY_")}
         e.update(env or {})
         self.proc = subprocess.Popen([BIN, os.path.join(self.tmp.name, "repo"), "--init", "--listen", "127.0.0.1:0",
                                       "--log", "info"], env=e, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)

@@ -108,7 +108,7 @@ For a body cap or failure during an import, the import report is attached as `de
 
 ## 4. Limits
 
-`GET /v1/status` reports the values in force.
+`GET /v1/status` reports the values in force. Each limit is settable by a flag or an environment variable, see section 8.
 
 | Limit | Default |
 |---|---|
@@ -235,17 +235,61 @@ One page per request: `200 application/warc`, the decoded records in index order
 ## 8. Server
 
 ```
-masstuffy-server <WORKDIR> [--listen ADDR] [--init] [--max-body-bytes N] [--max-connections N]
-                 [--max-concurrent-requests N] [--request-timeout SECS] [--drain-timeout SECS]
-                 [--log error|warn|info|debug|trace] [--help] [--version]
+masstuffy-server [WORKDIR] [OPTIONS]
 ```
 
-Defaults: `--listen 127.0.0.1:8470`, `--log info`, other values as in section 4. `--init` creates the repository if
-`WORKDIR` has none. `--max-body-bytes` sets both the put and the import body caps. `--max-concurrent-requests` is at most 384 (see section 4). `--flag=value` is accepted.
+### Configuration
 
-- Signals: the first SIGINT/SIGTERM drains (stops accepting, waits for in-flight requests up to `--drain-timeout`, 30 s);
+Every option is set by a command-line flag or by an environment variable; precedence is flag > environment
+variable > built-in default. The variable name is derived from the flag: `MASSTUFFY_` + the flag without `--`,
+upper-cased, `-` becoming `_` (`--max-body-bytes` is `MASSTUFFY_MAX_BODY_BYTES`); `WORKDIR` is
+`MASSTUFFY_WORKDIR`. `--flag value` and `--flag=value` are accepted. `masstuffy-server --help` prints the same table.
+
+- SIZE: bytes, or a number with suffix `KiB`, `MiB`, `GiB` or `TiB` (binary, case-sensitive, e.g. `64MiB`).
+  `--max-import-body-bytes` also accepts `unlimited`.
+- DURATION: seconds, or a number with suffix `ms`, `s`, `m` or `h` (e.g. `500ms`, `30s`, `2m`).
+- N: a positive decimal integer. Zero, signs, spaces and other characters are rejected.
+- Booleans (`MASSTUFFY_INIT`): `1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`, case-insensitive. `--init` on the
+  command line takes no value and cannot be negated: unset the variable or set it to `0`.
+- An empty variable is an error, and so is a non-UTF-8 value (except `MASSTUFFY_WORKDIR`, a path). A malformed
+  variable is an error even when a flag overrides it.
+- An unknown `MASSTUFFY_*` variable is ignored with a warning in the log (names only, never values).
+- An invalid or out-of-range value (flag or variable) is a usage error: the message names the flag or variable, the
+  exit code is 2, and the repository is not opened.
+- Layers: the environment is applied first, then the command line, each in the order of the table below. A higher
+  layer overrides a lower one entirely: `--max-body-bytes` overrides `MASSTUFFY_MAX_PUT_BODY_BYTES`. Within one layer
+  the specific cap beats `--max-body-bytes` / `MASSTUFFY_MAX_BODY_BYTES` whatever the order.
+- The repository's `config.json` (engine configuration) is not overridable by the environment.
+
+| Flag | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `WORKDIR` (argument) | `MASSTUFFY_WORKDIR` | required | Repository directory. |
+| `--listen ADDR` | `MASSTUFFY_LISTEN` | `127.0.0.1:8470` | Address to bind, IP:PORT (IPv6 as [::1]:PORT). |
+| `--init` | `MASSTUFFY_INIT` | `false` | Create the repository if WORKDIR has none. |
+| `--log LEVEL` | `MASSTUFFY_LOG` | `info` | Log level: error, warn, info, debug or trace. |
+| `--max-body-bytes SIZE` | `MASSTUFFY_MAX_BODY_BYTES` | `unset` | Sets both --max-put-body-bytes and --max-import-body-bytes. |
+| `--max-put-body-bytes SIZE` | `MASSTUFFY_MAX_PUT_BODY_BYTES` | `64MiB` | Body cap of POST .../records, also the per-record cap. |
+| `--max-import-body-bytes SIZE` | `MASSTUFFY_MAX_IMPORT_BODY_BYTES` | `unlimited` | Body cap of POST .../import, or unlimited (the import is streamed). |
+| `--max-put-records N` | `MASSTUFFY_MAX_PUT_RECORDS` | `10000` | Records per POST .../records, at most 1000000. |
+| `--max-json-body-bytes SIZE` | `MASSTUFFY_MAX_JSON_BODY_BYTES` | `32MiB` | Cap of JSON request bodies. |
+| `--max-export-page-bytes SIZE` | `MASSTUFFY_MAX_EXPORT_PAGE_BYTES` | `64MiB` | Upper bound of max_bytes on export, at most 1GiB. |
+| `--request-timeout DURATION` | `MASSTUFFY_REQUEST_TIMEOUT` | `60s` | Timeout of routes without a streamed request body. |
+| `--body-idle-timeout DURATION` | `MASSTUFFY_BODY_IDLE_TIMEOUT` | `30s` | Longest gap between two request-body chunks. |
+| `--max-concurrent-requests N` | `MASSTUFFY_MAX_CONCURRENT_REQUESTS` | `256` | Requests in flight, response streaming included, at most 384. |
+| `--max-running-jobs N` | `MASSTUFFY_MAX_RUNNING_JOBS` | `8` | Jobs running at once, at most 1024. |
+| `--max-retained-jobs N` | `MASSTUFFY_MAX_RETAINED_JOBS` | `256` | Finished jobs kept for GET /v1/jobs, at most 100000. |
+| `--max-job-wait DURATION` | `MASSTUFFY_MAX_JOB_WAIT` | `60s` | Upper bound of wait on GET /v1/jobs/{id}, at most 1h. |
+| `--max-connections N` | `MASSTUFFY_MAX_CONNECTIONS` | `256` | Open connections, at most 1000000. |
+| `--header-read-timeout DURATION` | `MASSTUFFY_HEADER_READ_TIMEOUT` | `30s` | Time allowed to receive a request head. |
+| `--max-head-bytes SIZE` | `MASSTUFFY_MAX_HEAD_BYTES` | `512KiB` | Largest request head, above 416KiB and at most 16MiB. |
+| `--drain-timeout DURATION` | `MASSTUFFY_DRAIN_TIMEOUT` | `30s` | How long a graceful shutdown waits for in-flight requests. |
+
+`--init` creates the repository if `WORKDIR` has none. `--max-body-bytes` sets both the put and the import body caps.
+Limits are described in section 4; `--max-concurrent-requests` is at most 384.
+
+- Signals: the first SIGINT/SIGTERM drains (stops accepting, waits for in-flight requests up to `--drain-timeout`, 30 s by default);
   a second one skips the wait; a third exits the process at once (status 130) without waiting for `Repository::shutdown` (the next open repairs whatever was in flight). Otherwise `Repository::shutdown` runs before exit.
 - Exit codes: 0 clean shutdown, 1 runtime failure, 2 usage error.
-- Environment: `MASSTUFFY_RAW_IMPORT_CHECK=full|header`.
+- Environment: `MASSTUFFY_RAW_IMPORT_CHECK=full|header` (read by the engine, no flag).
 - Listening on a non-loopback address logs a warning: there is no authentication; put an authenticating reverse proxy in
   front.

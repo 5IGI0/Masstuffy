@@ -549,7 +549,11 @@ and needs an authenticating reverse proxy to be exposed.
   response body streams), connections, head size.
 - Bodies: request bodies reach blocking code through a bounded channel (`pump_body` on the async side,
   `BodyReader` on a blocking thread); the WARC parse and the engine's import producer are the only readers.
-- Binary `masstuffy-server` (cargo feature `server`, default): hand-written argument parser, multi-thread runtime,
+- Binary `masstuffy-server` (cargo feature `server`, default): hand-written parser driven by one option table
+  (`src/bin/masstuffy-server/settings.rs`) from which the CLI flags, the `MASSTUFFY_*` env vars, `--help` and the
+  http-api.md table derive (a test checks the docs); precedence flag > env > default; the binary reads the
+  environment once in `main` via an injected snapshot (no `set_var`); the library crates still never read env vars
+  (the engine's `MASSTUFFY_RAW_IMPORT_CHECK` remains the single documented exception). Multi-thread runtime,
   SIGINT/SIGTERM (first drains, second stops at once), `Repository::shutdown` always runs before exit.
 - Dependencies: `masstuffy`, `warc`, `cdx`, `zframe` (`codec`), axum, hyper, hyper-util, http-body, bytes,
   form_urlencoded, serde, serde_json, thiserror, tracing, xxhash-rust, tokio; optional `tracing-subscriber`
@@ -633,6 +637,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M20 | `masstuffy`: `train_dictionary`, `rebuild` orchestration | deterministic sample; reads keep working during a rebuild (concurrent test) |
 | M21 | `masstuffy`: `delete_collection`, `rename_collection`, record deletion (`delete`, `delete_by_id`) | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates and renames; deletes wait for rebuilds; I8 after deletes |
 | M22 | http: API crate + `masstuffy-server` + `docs/http-api.md`; dictstore `bytes`, engine `dictionaries`/`dictionary` | every endpoint, error mapping, limits, streaming import/export, disconnect, graceful shutdown, dictionary download with ETag |
+| M23 | http: env-var configuration of masstuffy-server (one option table; flags for every HttpOptions/ServeOptions field) | precedence, layer order, malformed values per parser, empty/non-UTF-8 env, unknown-variable warning, validation names its source, docs table in sync |
 
 M3 and M4 are delivered together (one plan → code → review cycle).
 
@@ -799,3 +804,6 @@ These override the spec where they differ.
     operation, slug still taken); a second `delete_collection` retries, a reopen loads it normally. *Adopted.*
 25. **Skipped collections** (M21): cannot be deleted or renamed through the API (not loaded: `UnknownCollection`);
     repairing them is an operator action and their slug stays reserved. *Adopted.*
+26. **Engine config by environment** (M23): not supported; `config.json` stays the only engine
+    configuration. Reason: it is persistent, validated and written at init; a runtime override layer needs an engine
+    API (`open` takes no config) and a way to report effective values. Follow-up if containers need it.
