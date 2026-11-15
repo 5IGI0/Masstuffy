@@ -1,0 +1,7 @@
+# Allowlist: only what the build needs enters the build context. Anything new in the repo
+# (notes, secrets, local data) stays out unless it is added here explicitly.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/**/target
