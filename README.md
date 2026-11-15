@@ -1,109 +1,103 @@
 # Masstuffy
 
-Stockage d'objets **mono-machine** écrit en Rust, pensé pour ranger des **millions de petits objets** (pages web,
-documents, réponses d'API…) de façon compacte, durable et rapide à relire. Chaque objet est un **record WARC**, le format
-d'archivage du web (ISO 28500).
+A **single-machine** object store written in Rust, built to hold **millions of small objects** (web pages, documents,
+API responses…) compactly, durably, and with fast reads. Every object is a **WARC record**, the web archiving format
+(ISO 28500).
 
-## Le problème
+## The problem
 
-Stocker beaucoup de petits objets semble simple, mais les solutions habituelles cassent vite :
+Storing lots of small objects looks easy, but the usual approaches break down quickly:
 
-| Approche classique | Ce qui coince |
+| Usual approach | What goes wrong |
 |---|---|
-| **Un fichier par objet** | Des millions d'inodes, un système de fichiers lent à parcourir, à sauvegarder et à copier, et de l'espace perdu en fin de bloc pour chaque petit fichier. |
-| **Une base de données (blobs)** | La base grossit sans limite, se compacte mal et devient le goulot d'étranglement. Les données sont enfermées dans un format propriétaire. |
-| **Un stockage objet distribué** (S3, Ceph, MinIO…) | Un cluster à faire tourner et à surveiller, de la latence réseau, alors qu'une seule machine suffit pour le volume visé. |
-| **Compresser chaque objet seul** | Un objet de quelques Ko compresse mal : le compresseur n'a pas d'historique sur lequel s'appuyer. |
-| **Compresser de grosses archives d'un bloc** (`.tar.gz`, `.warc.gz` d'une traite) | Bon taux de compression, mais relire un seul objet oblige à décompresser tout ce qui le précède. |
+| **One file per object** | Millions of inodes, a filesystem that is slow to walk, back up and copy, and wasted space at the end of every small file's last block. |
+| **A database (blobs)** | The database grows without bound, compacts poorly and becomes the bottleneck. The data is locked into a proprietary format. |
+| **A distributed object store** (S3, Ceph, MinIO…) | A cluster to run and monitor, plus network latency, when one machine is enough for the target volume. |
+| **Compressing each object on its own** | An object of a few KB compresses badly: the compressor has no history to work from. |
+| **Compressing big archives in one go** (`.tar.gz`, a `.warc.gz` as a single stream) | Good ratio, but reading one object means decompressing everything before it. |
 
-Masstuffy vise le compromis qui manque : **le taux de compression d'une grosse archive, avec l'accès direct d'un
-fichier par objet, sur une seule machine et sans service externe.**
+Masstuffy aims for the missing trade-off: **the compression ratio of a big archive, with the direct access of one file
+per object, on one machine and with no external service.**
 
-## Comment Masstuffy le règle
+## How Masstuffy solves it
 
-### Peu de fichiers, beaucoup d'objets
+### Few files, many objects
 
-Les records sont **concaténés** dans des **segments** de plusieurs Go, en ajout seul (append-only). Une collection de
-dix millions d'objets tient dans une poignée de fichiers. Les copies, sauvegardes et `rsync` restent rapides.
+Records are **concatenated** into multi-GB **segments**, append-only. A collection of ten million objects fits in a
+handful of files, so copies, backups and `rsync` stay fast.
 
-### Un seul accès disque par lecture
+### One disk access per read
 
-Chaque record est repéré par un **localisateur** `(segment, offset, taille)`. Une lecture correspond à **une seule
-lecture positionnelle** (`pread`) : pas de parcours, pas de décompression du voisinage. Les lectures ne prennent aucun
-verrou et ne bloquent jamais les écritures.
+Each record is addressed by a **locator** `(segment, offset, size)`. A read is **a single positioned read** (`pread`):
+no scanning, no decompressing of neighbouring data. Reads take no lock and never block writes.
 
-### Bien compresser les petits objets
+### Compressing small objects well
 
-Chaque record est une **frame zstd indépendante**, compressée avec un **dictionnaire entraîné sur la collection**.
-Le dictionnaire apporte l'historique commun qui manque à un petit objet seul. On obtient un taux proche d'une compression
-de bout en bout, tout en gardant chaque objet lisible isolément.
+Each record is an **independent zstd frame**, compressed with a **dictionary trained on its collection**. The dictionary
+supplies the shared history a small object lacks on its own. The ratio gets close to end-to-end compression while every
+object stays readable by itself.
 
-Les objets d'une même collection se ressemblent (même site, même type de document), donc la collection est la bonne
-unité pour un dictionnaire. Quand les données évoluent, on **entraîne un nouveau dictionnaire et on recompresse la
-collection sans l'arrêter** : les écritures continuent pendant la reconstruction, et la nouvelle version ne devient
-active qu'une fois complète.
+Objects in the same collection look alike (same site, same kind of document), so the collection is the right unit for a
+dictionary. When the data drifts, you **train a new dictionary and recompress the collection without stopping it**:
+writes keep flowing during the rebuild, and the new generation only becomes active once it is complete.
 
-### Autonome
+### Self-contained
 
-Tout l'état tient dans **un répertoire de travail** : les segments, l'index de chaque collection (CDX), les
-dictionnaires et un index de recherche embarqué ([redb](https://github.com/cberner/redb)). Pas de base de données à
-installer, pas de cluster : un binaire et un dossier.
+All state lives in **one working directory**: the segments, each collection's index (CDX), the dictionaries and an
+embedded search index ([redb](https://github.com/cberner/redb)). No database to install, no cluster: one binary and one
+directory.
 
-### Des données qui survivent au logiciel
+### Data that outlives the software
 
-Les segments sont des **fichiers WARC standards** (compressés en zstd). Un outil d'archivage web peut les relire sans
-Masstuffy. Chaque collection commence par un record `warcinfo` qui la décrit. Les métadonnées de chaque objet voyagent
-dans ses en-têtes WARC, et les octets d'origine sont conservés tels quels. WARC/1.0 et WARC/1.1 sont acceptés.
+Segments are **standard WARC files** (zstd-compressed). Web archiving tools can read them without Masstuffy. Every
+collection starts with a `warcinfo` record that describes it. Each object's metadata travels in its WARC headers, and
+the original bytes are kept as they were. Both WARC/1.0 and WARC/1.1 are accepted.
 
-### Retrouver un objet
+### Finding an object
 
-En plus du localisateur, l'index de recherche permet de retrouver un record :
+Besides the locator, the search index finds records:
 
-- **par identifiant** (`WARC-Record-ID`) ;
-- **par URL et date**, avec la sémantique « Wayback » : la version la plus proche de la date demandée ;
-- **par motif d'URL** : un domaine avec ou sans ses sous-domaines, un hôte, un port, un chemin exact ou un préfixe de
-  chemin ;
-- en **parcours complet** d'une collection, ou en **export** vers un fichier WARC.
+- **by identifier** (`WARC-Record-ID`);
+- **by URL and date**, with "Wayback" semantics: the capture closest to the requested date;
+- **by URL pattern**: a domain with or without its subdomains, a host, a port, an exact path or a path prefix;
+- by a **full scan** of a collection, or an **export** to a WARC file.
 
-Cet index n'est qu'un cache : il se **reconstruit entièrement** à partir des index des collections, qui restent la
-référence.
+This index is only a cache: it can be **rebuilt entirely** from the collection indexes, which remain the source of
+truth.
 
-### Fiable en cas de crash
+### Crash-safe
 
-L'ordre des écritures est fixé et vérifié : d'abord les données, puis `fsync`, puis l'index, puis `fsync`, puis le
-point de validation. Après un crash ou une coupure de courant, un objet est soit entièrement présent, soit absent.
-Un objet dont l'écriture a été confirmée n'est jamais perdu. Les `fsync` sont regroupés entre écritures concurrentes
-(group commit), pour garder un bon débit sans sacrifier la durabilité.
+The write order is fixed and checked: data, then `fsync`, then index, then `fsync`, then the commit point. After a
+crash or a power cut, an object is either fully present or absent, and an acknowledged write is never lost. `fsync`
+calls are shared between concurrent writes (group commit), which keeps throughput high without giving up durability.
 
-### Décharger le serveur
+### Offloading the server
 
-Le client peut **compresser et décompresser lui-même** : il récupère la configuration de la collection et son
-dictionnaire (mis en cache, immuable), puis envoie des frames déjà compressées. Le serveur les vérifie et les range
-sans recompresser. Une lecture peut aussi renvoyer la frame brute, que le client décompresse de son côté.
+Clients can **compress and decompress on their side**: they fetch the collection's codec settings and its dictionary
+(immutable, cacheable), then send frames that are already compressed. The server checks them and stores them without
+recompressing. A read can also return the raw frame for the client to decompress.
 
-## Ce que Masstuffy n'est pas
+## What Masstuffy is not
 
-- **Pas un système distribué** : une machine, un processus, un répertoire. La réplication et les sauvegardes se font au
-  niveau des fichiers.
-- **Pas fait pour modifier des objets** : un record est immuable. Le modifier, c'est en écrire un nouveau. La suppression
-  est logique (l'objet devient invisible) et l'espace est récupéré lors de la reconstruction suivante.
-- **Pas d'authentification** pour l'instant : l'API HTTP écoute en local par défaut et doit être placée derrière un
-  proxy si elle est exposée.
+- **Not distributed**: one machine, one process, one directory. Replication and backups happen at the file level.
+- **Not built for updating objects**: a record is immutable, and changing it means writing a new one. Deletion is
+  logical (the object becomes invisible) and the space is reclaimed at the next rebuild.
+- **No authentication** yet: the HTTP API listens on localhost by default and belongs behind a proxy if exposed.
 
-## Démarrage rapide
+## Quick start
 
 ```sh
-# Lancer le serveur sur un nouveau dépôt (écoute sur 127.0.0.1:8470)
+# Start the server on a new repository (listens on 127.0.0.1:8470)
 cargo run --release --bin masstuffy-server -- ./data --init
 
-# Créer une collection (non compressée ; voir docs/http-api.md pour zstd)
+# Create a collection (uncompressed; see docs/http-api.md for zstd)
 curl -X POST localhost:8470/v1/collections -d '{"slug":"web"}'
 ```
 
-Toutes les options du serveur se règlent aussi par variables d'environnement (`MASSTUFFY_WORKDIR`,
-`MASSTUFFY_LISTEN`, `MASSTUFFY_INIT=1`…). La liste complète est dans `masstuffy-server --help`.
+Every server option can also be set through environment variables (`MASSTUFFY_WORKDIR`, `MASSTUFFY_LISTEN`,
+`MASSTUFFY_INIT=1`…). `masstuffy-server --help` lists them all.
 
-Un client Python est fourni, voir [`clients/python`](clients/python/README.md) :
+A Python client is included, see [`clients/python`](clients/python/README.md):
 
 ```python
 import masstuffy as m
@@ -115,23 +109,23 @@ with m.Client("http://127.0.0.1:8470") as client:
         print(rec.read())
 ```
 
-## Organisation du dépôt
+## Repository layout
 
-| Chemin | Contenu |
+| Path | Contents |
 |---|---|
-| [`spec/`](spec/README.md) | Spécification du concept et du format sur disque (en français) : la référence. |
-| [`docs/architecture.md`](docs/architecture.md) | Carte des crates et graphe de dépendances. |
-| [`docs/http-api.md`](docs/http-api.md) | Contrat de l'API HTTP v1. |
-| `crates/warc`, `urlkey`, `zframe`, `cdx` | Formats : WARC, URL canonique, frames zstd et dictionnaires, index CDX. Réutilisables seuls. |
-| `crates/durable`, `seglog`, `dictstore`, `collection` | Stockage : écritures durables, segments, dictionnaires, collections. |
-| `crates/index`, `index-redb` | Index de recherche secondaire et son implémentation sur redb. |
-| `crates/masstuffy` | Le moteur (asynchrone, tokio). |
-| `crates/http` | L'API HTTP et le binaire `masstuffy-server`. |
-| [`clients/python`](clients/python/README.md) | Client Python, basé sur [pywarc](https://github.com/5IGI0/pywarc). |
+| [`spec/`](spec/README.md) | Specification of the concept and the on-disk format (in French): the source of truth. |
+| [`docs/architecture.md`](docs/architecture.md) | Crate map and dependency graph. |
+| [`docs/http-api.md`](docs/http-api.md) | HTTP API v1 contract. |
+| `crates/warc`, `urlkey`, `zframe`, `cdx` | Formats: WARC, canonical URLs, zstd frames and dictionaries, CDX index. Usable on their own. |
+| `crates/durable`, `seglog`, `dictstore`, `collection` | Storage: durable writes, segments, dictionaries, collections. |
+| `crates/index`, `index-redb` | Secondary search index and its redb implementation. |
+| `crates/masstuffy` | The engine (async, tokio). |
+| `crates/http` | The HTTP API and the `masstuffy-server` binary. |
+| [`clients/python`](clients/python/README.md) | Python client, built on [pywarc](https://github.com/5IGI0/pywarc). |
 
-Le code est en Rust sûr (`unsafe` interdit dans toutes les crates). Chaque crate a une responsabilité unique et peut
-servir hors de Masstuffy.
+The code is safe Rust (`unsafe` is forbidden in every crate). Each crate has a single responsibility and can be used
+outside Masstuffy.
 
-## Licence
+## License
 
 AGPL-3.0-or-later.
