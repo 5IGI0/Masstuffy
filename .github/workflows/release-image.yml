@@ -28,12 +28,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The image version is the masstuffy-http crate version (what `masstuffy-server --version`
+      # prints). A published version is never overwritten: bump it before merging into release.
+      - id: version
+        run: |
+          v=$(awk -F'"' '/^\[/{p=($0=="[package]")} p && /^version *=/{print $2; exit}' crates/http/Cargo.toml)
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected version in crates/http/Cargo.toml: '$v'"; exit 1
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if docker manifest inspect "$image:$v" >/dev/null 2>&1; then
+            echo "::error::$image:$v already exists; bump the version in crates/http/Cargo.toml"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "minor=${v%.*}" >> "$GITHUB_OUTPUT"
+
       # Image name is lower-cased by the action (ghcr.io/5igi0/masstuffy).
       - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.minor }}
             type=raw,value=latest
             type=sha,format=long
 
