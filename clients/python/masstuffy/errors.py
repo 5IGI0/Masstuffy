@@ -10,7 +10,7 @@ __all__ = [
     "InvalidRequestError", "PayloadTooLargeError", "NotFoundError", "ConflictError",
     "StaleLocatorError", "NotDecodableError", "UnavailableError", "ServerError",
     "JobFailedError", "JobTimeoutError", "PartialPutError", "ExportInterruptedError",
-    "RecordTooLargeError", "error_from_response", "error_from_object",
+    "RecordTooLargeError", "GrepIncompleteError", "error_from_response", "error_from_object",
 ]
 
 
@@ -151,6 +151,19 @@ class RecordTooLargeError(MasstuffyError, ValueError):
         self.ordinal = ordinal
         self.size = size
         self.limit = limit
+
+
+class GrepIncompleteError(MasstuffyError):
+    """A grep finished (its ``end`` line arrived) but at least one collection has status ``failed``.
+
+    ``.report`` is the full ``GrepReport``; hits already yielded are valid but the result is partial.
+    """
+
+    def __init__(self, report: Any) -> None:
+        failed = [c for c in getattr(report, "collections", []) if getattr(c, "status", "") == "failed"]
+        detail = "; ".join(f"{c.slug}: {c.error}" for c in failed)
+        super().__init__(f"grep incomplete ({len(failed)} collection(s) failed): {detail}")
+        self.report = report
 
 
 def _parse_retry_after(headers: Optional[Mapping[str, str]]) -> Optional[float]:

@@ -8,12 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pywarc
 
-from .errors import ProtocolError
+from .errors import ApiError, ProtocolError, error_from_object
 
 __all__ = [
     "Locator", "LocatorLike", "locator_token", "Codec", "RawRules", "CollectionStats", "CollectionInfo",
     "DeletedCollection", "Limits", "ServerStatus", "DictionaryInfo", "Rejection", "ImportReport", "Page",
-    "PutFileReport", "ExportReport",
+    "PutFileReport", "ExportReport", "GrepQuery", "GrepHit", "GrepUnreadable", "GrepProgress",
+    "GrepCollectionReport", "GrepReport",
 ]
 
 MAX_TOKEN_CHARS = 360_448
@@ -287,3 +288,122 @@ class ExportReport:
     pages: int
     bytes: int
     cursor: Optional[str]
+
+
+@dataclass(frozen=True)
+class GrepQuery:
+    """One grep query: a literal (default) or a regex. Regexes run in byte mode (see the HTTP docs);
+    ``case_insensitive`` folds ASCII letters only."""
+
+    pattern: str
+    regex: bool = False
+    case_insensitive: bool = False
+
+    def to_json(self) -> Dict[str, Any]:
+        return {"pattern": self.pattern, "regex": self.regex, "case_insensitive": self.case_insensitive}
+
+
+@dataclass(frozen=True)
+class GrepHit:
+    """A record that matched; ``queries`` are the indices (in request order) of the queries that matched."""
+
+    slug: str
+    locator: Locator
+    queries: List[int]
+
+    @classmethod
+    def from_json(cls, obj: Dict[str, Any]) -> "GrepHit":
+        qs = _req(obj, "queries", list)
+        if not all(isinstance(q, int) and not isinstance(q, bool) for q in qs):
+            raise ProtocolError("field 'queries' must be a list of integers")
+        return cls(_req(obj, "slug", str), Locator.from_json(_req(obj, "record", dict)), list(qs))
+
+
+@dataclass(frozen=True)
+class GrepUnreadable:
+    """A record the grep needed but could not read or decode. The grep continues."""
+
+    slug: str
+    locator: Locator
+    error: ApiError
+
+    @classmethod
+    def from_json(cls, obj: Dict[str, Any]) -> "GrepUnreadable":
+        return cls(_req(obj, "slug", str), Locator.from_json(_req(obj, "record", dict)),
+                   error_from_object(_req(obj, "error", dict)))
+
+
+@dataclass(frozen=True)
+class GrepProgress:
+    """Progress of one collection of a grep (CDX bytes of the grep's range).
+
+    ``fraction`` is a progress indicator only: it follows index lines, not data volume, and reaching 1.0 does
+    not mean the grep was complete (a truncated or failed collection can end there too). Judge completeness
+    from ``GrepCollectionReport.status``.
+    """
+
+    slug: str
+    records: int
+    bytes: int
+    cdx_done: int
+    cdx_total: int
+
+    @classmethod
+    def from_json(cls, obj: Dict[str, Any]) -> "GrepProgress":
+        return cls(_req(obj, "slug", str), _req(obj, "records", int), _req(obj, "bytes", int),
+                   _req(obj, "cdx_done", int), _req(obj, "cdx_total", int))
+
+    @property
+    def fraction(self) -> float:
+        """``cdx_done / cdx_total`` (1.0 when ``cdx_total`` is 0). A progress indicator, never a completeness test."""
+        if self.cdx_total == 0:
+            return 1.0
+        return self.cdx_done / self.cdx_total
+
+
+@dataclass(frozen=True)
+class GrepCollectionReport:
+    """Final outcome for one collection. ``status`` is ``"complete"``, ``"truncated"`` (``max_hits`` reached) or
+    ``"failed"`` (``error`` is set). Only ``status`` tells whether the collection was fully examined."""
+
+    slug: str
+    id: str
+    status: str
+    records: int
+    bytes: int
+    cdx_done: int
+    cdx_total: int
+    hits: int
+    unreadable: int
+    error: Optional[ApiError]
+
+    @classmethod
+    def from_json(cls, obj: Dict[str, Any]) -> "GrepCollectionReport":
+        err = _opt(obj, "error", dict)
+        status = _req(obj, "status", str)
+        if status not in ("complete", "truncated", "failed"):
+            raise ProtocolError(f"unknown grep status {status!r}")
+        return cls(_req(obj, "slug", str), _req(obj, "id", str), status, _req(obj, "records", int),
+                   _req(obj, "bytes", int), _req(obj, "cdx_done", int), _req(obj, "cdx_total", int),
+                   _req(obj, "hits", int), _req(obj, "unreadable", int),
+                   None if err is None else error_from_object(err))
+
+
+@dataclass(frozen=True)
+class GrepReport:
+    """The ``end`` line of a grep: totals and one entry per collection, in request order."""
+
+    hits: int
+    truncated: bool
+    collections: List[GrepCollectionReport]
+
+    @classmethod
+    def from_json(cls, obj: Dict[str, Any]) -> "GrepReport":
+        cols = _req(obj, "collections", list)
+        return cls(_req(obj, "hits", int), _req(obj, "truncated", bool),
+                   [GrepCollectionReport.from_json(c) for c in cols])
+
+    @property
+    def complete(self) -> bool:
+        """True iff every collection has status ``"complete"``."""
+        return all(c.status == "complete" for c in self.collections)

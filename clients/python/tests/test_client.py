@@ -682,5 +682,178 @@ class ErrorMappingTest(Base):
             self.client.job("9")
 
 
+def _nd(*objs):
+    return b"".join(json.dumps(o).encode() + b"\n" for o in objs)
+
+
+def _hit(i, slug="c", queries=(0,)):
+    return {"type": "hit", "slug": slug, "queries": list(queries), "record": loc_obj(i)}
+
+
+def _prog(done, total=10, slug="c"):
+    return {"type": "progress", "slug": slug, "records": done, "bytes": done * 5, "cdx_done": done,
+            "cdx_total": total}
+
+
+def _end_col(slug="c", status="complete", error=None, done=10, total=10, hits=1):
+    return {"slug": slug, "id": "uuid-" + slug, "status": status, "records": 3, "bytes": 30, "cdx_done": done,
+            "cdx_total": total, "hits": hits, "unreadable": 0, "error": error}
+
+
+def _end(*cols, hits=1, truncated=False):
+    return {"type": "end", "hits": hits, "truncated": truncated, "collections": list(cols)}
+
+
+def nd_resp(body, chunked=True):
+    return Resp(200, {"Content-Type": "application/x-ndjson"}, body, chunked=chunked)
+
+
+class GrepTest(Base):
+    def test_hits_progress_end_parsed(self):
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_prog(0), _hit(1, queries=(0, 2)), _prog(5),
+                                                       _end(_end_col()))))
+        with self.client.grep("c", "needle") as st:
+            items = list(st)
+        self.assertEqual(len(items), 1)
+        self.assertIsInstance(items[0], m.GrepHit)
+        self.assertEqual((items[0].slug, items[0].queries, items[0].locator.token), ("c", [0, 2], "L1tok1"))
+        self.assertEqual(st.report.hits, 1)
+        self.assertTrue(st.report.complete)
+        self.assertEqual(st.report.collections[0].cdx_total, 10)
+        self.assertEqual(st.progress["c"].cdx_done, 5)
+        body = self.srv.requests[-1].json()
+        self.assertEqual(body["queries"], [{"pattern": "needle", "regex": False, "case_insensitive": False}])
+        self.assertEqual(body["collections"], ["c"])
+        self.assertEqual(body["scope"], "all")
+        self.assertNotIn("max_hits", body)
+
+    def test_request_always_asks_for_progress(self):
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_prog(0), _end(_end_col(hits=0)))))
+        with self.client.grep(["c"], [m.GrepQuery("a+", regex=True, case_insensitive=True)], events=("hit",),
+                              scope="payload", max_hits=5) as st:
+            self.assertEqual(list(st), [])
+            self.assertEqual(st.progress["c"].cdx_total, 10)
+        body = self.srv.requests[-1].json()
+        self.assertEqual(body["events"], ["hit", "progress"])
+        self.assertEqual((body["scope"], body["max_hits"]), ("payload", 5))
+        self.assertEqual(body["queries"], [{"pattern": "a+", "regex": True, "case_insensitive": True}])
+
+    def test_progress_yielded_on_request_and_fraction(self):
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_prog(0, 0), _prog(5), _hit(1), _end(_end_col()))))
+        with self.client.grep("c", "x", events=("hit", "progress", "end")) as st:
+            items = list(st)
+        self.assertEqual([type(i).__name__ for i in items], ["GrepProgress", "GrepProgress", "GrepHit"])
+        self.assertEqual(items[0].fraction, 1.0)
+        self.assertEqual(items[1].fraction, 0.5)
+        self.assertEqual(self.srv.requests[-1].json()["events"], ["hit", "progress"])
+
+    def test_unreadable_yielded(self):
+        err = {"kind": "corrupt", "code": "unreadable_record", "message": "bad"}
+        line = {"type": "unreadable", "slug": "c", "record": loc_obj(2), "error": err}
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(line, _end(_end_col(hits=0)))))
+        with self.client.grep("c", "x") as st:
+            items = list(st)
+        self.assertIsInstance(items[0].error, m.ServerError)
+        self.assertEqual(items[0].error.code, "unreadable_record")
+
+    def test_collection_grep(self):
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_end(_end_col(hits=0)))))
+        col = self.client.collection("c")
+        with col.grep(["a", m.GrepQuery("b")]) as st:
+            self.assertEqual(list(st), [])
+        self.assertEqual(self.srv.requests[-1].json()["collections"], ["c"])
+        self.assertEqual(len(self.srv.requests[-1].json()["queries"]), 2)
+
+    def test_missing_end_line(self):
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_hit(1))))
+        with self.client.grep("c", "x") as st:
+            with self.assertRaises(m.ProtocolError):
+                list(st)
+        self.assertIsNone(st.report)
+
+    def test_bad_lines(self):
+        for body in (b"not json\n", _nd({"type": "weird"}), _nd({"nope": 1}), _nd(_hit(1))[:-1]):
+            self.srv.route("POST", "/v1/grep", nd_resp(body))
+            with self.client.grep("c", "x") as st:
+                with self.assertRaises(m.ProtocolError):
+                    list(st)
+
+    def test_oversize_line(self):
+        self.srv.route("POST", "/v1/grep", nd_resp(b"x" * ((2 << 20) + 10) + b"\n"))
+        with self.client.grep("c", "x") as st:
+            with self.assertRaises(m.ProtocolError):
+                list(st)
+
+    def test_failed_collection_strict(self):
+        err = {"kind": "conflict", "code": "stale_locator", "message": "rebuilt"}
+        end = _end(_end_col(), _end_col("d", "failed", err, 0, 0, 0))
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_hit(1), end)))
+        with self.client.grep(["c", "d"], "x") as st:
+            it = iter(st)
+            self.assertIsInstance(next(it), m.GrepHit)
+            with self.assertRaises(m.GrepIncompleteError) as cm:
+                next(it)
+        rep = cm.exception.report
+        self.assertIs(rep, st.report)
+        self.assertEqual(rep.collections[1].status, "failed")
+        self.assertIsInstance(rep.collections[1].error, m.StaleLocatorError)
+        self.assertFalse(rep.complete)
+
+    def test_failed_collection_not_strict(self):
+        err = {"kind": "unavailable", "code": "grep_lagged", "message": "slow"}
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_end(_end_col("c", "failed", err, 10, 10, 0)))))
+        with self.client.grep("c", "x", strict=False) as st:
+            self.assertEqual(list(st), [])
+        self.assertEqual(st.report.collections[0].status, "failed")
+
+    def test_truncated_is_not_an_error_and_fraction_is_not_completeness(self):
+        end = _end(_end_col("c", "truncated", None, 10, 10), truncated=True)
+        self.srv.route("POST", "/v1/grep", nd_resp(_nd(_prog(10), end)))
+        with self.client.grep("c", "x", events=("progress",)) as st:
+            items = list(st)
+        self.assertEqual(items[0].fraction, 1.0)
+        self.assertTrue(st.report.truncated)
+        self.assertEqual(st.report.collections[0].status, "truncated")
+        self.assertFalse(st.report.complete)
+
+    def test_invalid_pattern_before_stream(self):
+        self.srv.route("POST", "/v1/grep", error_resp(400, "invalid", "invalid_pattern", "bad", {"index": 1}))
+        with self.assertRaises(m.InvalidRequestError) as cm:
+            self.client.grep("c", "(")
+        self.assertEqual((cm.exception.code, cm.exception.details), ("invalid_pattern", {"index": 1}))
+
+    def test_too_many_greps_retried(self):
+        c = m.Client(self.srv.url, retries=2, backoff=0.01)
+        self.addCleanup(c.close)
+        self.srv.route("POST", "/v1/grep", [
+            error_resp(503, "unavailable", "too_many_greps", retry_after=0),
+            nd_resp(_nd(_end(_end_col(hits=0)))),
+        ])
+        with c.grep("c", "x") as st:
+            self.assertEqual(list(st), [])
+        self.assertEqual(len(self.srv.requests), 2)
+
+    def test_argument_validation(self):
+        with self.assertRaises(ValueError):
+            self.client.grep("c", "x", scope="body")
+        with self.assertRaises(ValueError):
+            self.client.grep("c", "x", events=("hits",))
+        with self.assertRaises(TypeError):
+            self.client.grep("c", [5])
+        self.assertEqual(self.srv.requests, [])
+
+    def test_close_midstream_does_not_reuse_connection(self):
+        body = _nd(*[_hit(i) for i in range(200)], _end(_end_col(hits=200)))
+        self.srv.route("POST", "/v1/grep", nd_resp(body))
+        self.srv.route("GET", "/healthz", json_resp(200, {"ok": True}))
+        st = self.client.grep("c", "x")
+        self.assertIsInstance(next(st), m.GrepHit)
+        st.close()
+        st.close()
+        self.assertEqual(self.client._t.idle_count(), 0)
+        self.client.healthz()
+        self.assertEqual(self.srv.connections, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

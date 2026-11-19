@@ -1,7 +1,8 @@
 import unittest
 
 from masstuffy.errors import ProtocolError
-from masstuffy.models import (Codec, CollectionInfo, DeletedCollection, Locator, ServerStatus, RawRules,
+from masstuffy.models import (GrepCollectionReport, GrepHit, GrepProgress, GrepQuery, GrepReport, GrepUnreadable,
+                              Codec, CollectionInfo, DeletedCollection, Locator, ServerStatus, RawRules,
                               locator_token)
 
 LOC = {"locator": "L1abc", "collection": "u", "generation": 1, "segment": 0, "offset": 5, "raw_size": 9,
@@ -77,6 +78,35 @@ class ModelsTest(unittest.TestCase):
             locator_token(5)
         self.assertEqual(locator_token("L1ok"), "L1ok")
         self.assertEqual(locator_token(Locator.from_json(LOC)), "L1abc")
+
+    def test_grep_models(self):
+        self.assertEqual(GrepQuery("a", regex=True).to_json(),
+                         {"pattern": "a", "regex": True, "case_insensitive": False})
+        h = GrepHit.from_json({"slug": "s", "queries": [0, 3], "record": LOC})
+        self.assertEqual((h.slug, h.queries, h.locator.token), ("s", [0, 3], "L1abc"))
+        with self.assertRaises(ProtocolError):
+            GrepHit.from_json({"slug": "s", "queries": ["x"], "record": LOC})
+        u = GrepUnreadable.from_json({"slug": "s", "record": LOC,
+                                      "error": {"kind": "corrupt", "code": "unreadable_record", "message": "m"}})
+        self.assertEqual(u.error.code, "unreadable_record")
+        p = GrepProgress.from_json({"slug": "s", "records": 1, "bytes": 2, "cdx_done": 1, "cdx_total": 4})
+        self.assertEqual(p.fraction, 0.25)
+        self.assertEqual(GrepProgress("s", 0, 0, 0, 0).fraction, 1.0)
+
+    def test_grep_report(self):
+        col = {"slug": "s", "id": "u", "status": "complete", "records": 1, "bytes": 2, "cdx_done": 4,
+               "cdx_total": 4, "hits": 1, "unreadable": 0, "error": None}
+        rep = GrepReport.from_json({"hits": 1, "truncated": False, "collections": [col]})
+        self.assertTrue(rep.complete)
+        self.assertIsNone(rep.collections[0].error)
+        with self.assertRaises(ProtocolError):
+            GrepCollectionReport.from_json(dict(col, status="weird"))
+        with self.assertRaises(ProtocolError):
+            GrepCollectionReport.from_json({k: v for k, v in col.items() if k != "cdx_total"})
+        bad = GrepCollectionReport.from_json(dict(col, status="failed",
+                                                  error={"kind": "conflict", "code": "stale_locator",
+                                                         "message": "m"}))
+        self.assertEqual(bad.error.code, "stale_locator")
 
 
 if __name__ == "__main__":

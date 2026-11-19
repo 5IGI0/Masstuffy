@@ -22,7 +22,7 @@ from .errors import ApiError, ProtocolError, TransportError, UnavailableError, e
 __all__ = ["Transport", "Response", "StreamingResponse", "seg"]
 
 IDLE_MAX_AGE = 15.0
-RETRY_CODES = frozenset({"overloaded", "too_many_jobs", "index_lagging"})
+RETRY_CODES = frozenset({"overloaded", "too_many_jobs", "index_lagging", "too_many_greps"})
 ERROR_BODY_MAX = 1 << 20
 
 Body = Union[None, bytes, bytearray, memoryview, Iterable[bytes], Callable[[], Iterable[bytes]]]
