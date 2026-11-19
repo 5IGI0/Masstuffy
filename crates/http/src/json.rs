@@ -3,8 +3,8 @@
 use std::num::NonZeroU32;
 
 use masstuffy::{
-    Codec, CollectionInfo, DeletedCollection, ImportReport, Located, OpenReport, RawCheck,
-    RebuildReport, RecordSkipReason, SkipReason, TrainReport, WriterStats,
+    Codec, CollectionInfo, DeletedCollection, GrepEvents, GrepScope, ImportReport, Located,
+    OpenReport, RawCheck, RebuildReport, RecordSkipReason, SkipReason, TrainReport, WriterStats,
 };
 use masstuffy_cdx::EnvelopeFormat;
 use masstuffy_warc::WarcDate;
@@ -420,6 +420,73 @@ pub(crate) struct RebuildRequestJson {
     pub max_inflight_bytes: Option<u64>,
 }
 
+/// `POST /v1/grep`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GrepRequestJson {
+    pub collections: Vec<String>,
+    pub queries: Vec<GrepQueryJson>,
+    #[serde(default)]
+    pub scope: GrepScopeJson,
+    #[serde(default)]
+    pub max_hits: Option<u64>,
+    #[serde(default)]
+    pub events: Option<Vec<GrepEventKindJson>>,
+}
+
+/// One query of a grep request.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GrepQueryJson {
+    pub pattern: String,
+    #[serde(default)]
+    pub regex: bool,
+    #[serde(default)]
+    pub case_insensitive: bool,
+}
+
+/// Which bytes of a record a grep searches.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GrepScopeJson {
+    Payload,
+    Headers,
+    #[default]
+    All,
+}
+
+impl GrepScopeJson {
+    pub(crate) fn to_scope(self) -> GrepScope {
+        match self {
+            GrepScopeJson::Payload => GrepScope::Payload,
+            GrepScopeJson::Headers => GrepScope::Headers,
+            GrepScopeJson::All => GrepScope::All,
+        }
+    }
+}
+
+/// A line type the client may ask for. `End` is always sent and has no effect.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GrepEventKindJson {
+    Hit,
+    Unreadable,
+    Progress,
+    End,
+}
+
+/// The engine event filter of a request: absent means everything.
+pub(crate) fn grep_events(list: Option<&[GrepEventKindJson]>) -> GrepEvents {
+    match list {
+        None => GrepEvents::ALL,
+        Some(l) => GrepEvents {
+            hits: l.contains(&GrepEventKindJson::Hit),
+            unreadable: l.contains(&GrepEventKindJson::Unreadable),
+            progress: l.contains(&GrepEventKindJson::Progress),
+        },
+    }
+}
+
 /// Parses a JSON request body, mapping failures to `invalid_json`.
 pub(crate) fn parse_json<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ApiError> {
     serde_json::from_slice(bytes).map_err(|e| ApiError::invalid("invalid_json", e.to_string()))
@@ -509,5 +576,35 @@ mod tests {
         let j = serde_json::to_value(locator_json(&at)).unwrap();
         assert_eq!(j["url"], "http://a/");
         assert!(j["locator"].as_str().unwrap().starts_with("L1"));
+    }
+
+    #[test]
+    fn grep_request_parse() {
+        let r: GrepRequestJson =
+            parse_json(br#"{"collections":["a"],"queries":[{"pattern":"x"}]}"#).unwrap();
+        assert_eq!(r.scope, GrepScopeJson::All);
+        assert!(r.max_hits.is_none());
+        assert!(!r.queries[0].regex && !r.queries[0].case_insensitive);
+        assert_eq!(grep_events(r.events.as_deref()), GrepEvents::ALL);
+        let r: GrepRequestJson = parse_json(
+            br#"{"collections":[],"queries":[],"scope":"payload","max_hits":3,"events":["hit","end"]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.scope.to_scope(), GrepScope::Payload);
+        let e = grep_events(r.events.as_deref());
+        assert!(e.hits && !e.unreadable && !e.progress);
+        assert_eq!(grep_events(Some(&[])), GrepEvents::NONE);
+        for bad in [
+            &br#"{"collections":[],"queries":[],"bogus":1}"#[..],
+            br#"{"collections":[],"queries":[{"pattern":"x","bogus":1}]}"#,
+            br#"{"collections":[],"queries":[],"scope":"body"}"#,
+            br#"{"collections":[],"queries":[],"events":["hits"]}"#,
+            br#"{"collections":[]}"#,
+        ] {
+            assert_eq!(
+                parse_json::<GrepRequestJson>(bad).unwrap_err().code,
+                "invalid_json"
+            );
+        }
     }
 }

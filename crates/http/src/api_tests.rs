@@ -1504,3 +1504,408 @@ async fn import_idle_timeout_408_carries_report_and_cause() {
     })
     .await;
 }
+
+// ---- Grep.
+
+/// A record whose body is `body`; `http` makes it an `application/http` response.
+fn grep_record(i: usize, http: bool, body: &[u8]) -> Record {
+    let mut b =
+        masstuffy_warc::RecordBuilder::new(if http { "response" } else { "resource" }).unwrap();
+    b.record_id(&id_str(i)).unwrap();
+    b.date(masstuffy_warc::WarcDate::new(2024, 1, 1, 0, 0, 0, 0).unwrap());
+    b.target_uri(&format!("http://example.com/g/{i}")).unwrap();
+    if http {
+        b.header("Content-Type", "application/http; msgtype=response")
+            .unwrap();
+    }
+    b.build(body).unwrap()
+}
+
+fn ndjson(b: &Bytes) -> Vec<Value> {
+    b.split(|&c| c == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_slice(l).unwrap_or_else(|e| panic!("bad line ({e}): {l:?}")))
+        .collect()
+}
+
+async fn grep_lines(app: &TestApp, body: &Value) -> Vec<Value> {
+    let (s, h, b) = post_json(app, "/v1/grep", body).await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(h["content-type"], "application/x-ndjson");
+    assert_eq!(h["cache-control"], "no-store");
+    ndjson(&b)
+}
+
+fn lines_of<'a>(lines: &'a [Value], ty: &str) -> Vec<&'a Value> {
+    lines.iter().filter(|l| l["type"] == ty).collect()
+}
+
+async fn put_needles(app: &TestApp, slug: &str, total: usize, every: usize) -> Vec<Value> {
+    let recs: Vec<Record> = (0..total)
+        .map(|i| {
+            let body = if i % every == 0 {
+                format!("xx needle {i} yy")
+            } else {
+                format!("plain text {i}")
+            };
+            grep_record(i, false, body.as_bytes())
+        })
+        .collect();
+    put(app, slug, &recs).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_streams_ndjson() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        put_needles(&app, "a", 10, 3).await;
+        let lines = grep_lines(
+            &app,
+            &json!({"collections": ["a"], "queries": [{"pattern": "needle"}]}),
+        )
+        .await;
+        assert_eq!(lines[0]["type"], "progress");
+        assert_eq!(lines[0]["slug"], "a");
+        assert_eq!(lines[0]["cdx_done"], 0);
+        assert!(lines[0]["cdx_total"].as_u64().unwrap() > 0);
+        let hits = lines_of(&lines, "hit");
+        assert_eq!(hits.len(), 4);
+        for h in &hits {
+            assert_eq!(h["slug"], "a");
+            assert_eq!(h["queries"], json!([0]));
+            let (s, b) = get_record(&app, "a", &h["record"]).await;
+            assert_eq!(s, StatusCode::OK);
+            assert!(String::from_utf8_lossy(&b).contains("needle"));
+        }
+        let end = lines.last().unwrap();
+        assert_eq!(end["type"], "end");
+        assert_eq!(end["hits"], 4);
+        assert_eq!(end["truncated"], false);
+        let c = &end["collections"][0];
+        assert_eq!(c["slug"], "a");
+        assert_eq!(c["status"], "complete");
+        // 10 puts plus the warcinfo record every new collection starts with.
+        assert_eq!(c["records"], 11);
+        assert_eq!(c["hits"], 4);
+        assert_eq!(c["unreadable"], 0);
+        assert!(c["error"].is_null());
+        assert_eq!(c["cdx_done"], c["cdx_total"]);
+        assert_eq!(c["cdx_total"], lines[0]["cdx_total"]);
+        assert_eq!(lines_of(&lines, "end").len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_scope_and_queries() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        let recs = vec![
+            grep_record(0, false, b"alpha-body"),
+            grep_record(
+                1,
+                true,
+                b"HTTP/1.1 200 OK\r\nX-Mark: hmark\r\n\r\npmark payload",
+            ),
+        ];
+        let locs = put(&app, "a", &recs).await;
+        let hit_ids = |body: Value| {
+            let app = &app;
+            let locs = &locs;
+            async move {
+                let lines = grep_lines(app, &body).await;
+                let mut out: Vec<(usize, Value)> = Vec::new();
+                for h in lines_of(&lines, "hit") {
+                    let i = locs
+                        .iter()
+                        .position(|l| l["locator"] == h["record"]["locator"])
+                        .unwrap();
+                    out.push((i, h["queries"].clone()));
+                }
+                out.sort_by_key(|(i, _)| *i);
+                out
+            }
+        };
+        let q = |p: &str| json!([{"pattern": p}]);
+        let one = |i: usize, qs: Value| vec![(i, qs)];
+        assert_eq!(
+            hit_ids(json!({"collections":["a"],"queries":q("hmark"),"scope":"headers"})).await,
+            one(1, json!([0]))
+        );
+        assert!(
+            hit_ids(json!({"collections":["a"],"queries":q("hmark"),"scope":"payload"}))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            hit_ids(json!({"collections":["a"],"queries":q("pmark"),"scope":"payload"})).await,
+            one(1, json!([0]))
+        );
+        assert!(
+            hit_ids(json!({"collections":["a"],"queries":q("pmark"),"scope":"headers"}))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            hit_ids(json!({"collections":["a"],"queries":q("alpha"),"scope":"payload"})).await,
+            one(0, json!([0]))
+        );
+        // Default scope is `all`; several queries OR; regex and case folding.
+        let got = hit_ids(json!({"collections":["a"],"queries":[
+            {"pattern":"ALPHA","case_insensitive":true},
+            {"pattern":"p[m]ark","regex":true},
+            {"pattern":"hmark"},
+            {"pattern":"absent"},
+        ]}))
+        .await;
+        assert_eq!(got, vec![(0, json!([0])), (1, json!([1, 2]))]);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_errors_before_stream() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        let ok_q = json!([{"pattern": "x"}]);
+        let (s, _, b) = post_json(
+            &app,
+            "/v1/grep",
+            &json!({"collections": ["nope"], "queries": ok_q}),
+        )
+        .await;
+        err(s, &b, 404, "unknown_collection");
+        let (s, _, b) = post_json(
+            &app,
+            "/v1/grep",
+            &json!({"collections": ["a"], "queries": [{"pattern":"ok"},{"pattern":"(","regex":true}]}),
+        )
+        .await;
+        let e = err(s, &b, 400, "invalid_pattern");
+        assert_eq!(e["details"]["index"], 1);
+        let (s, _, b) = post_json(
+            &app,
+            "/v1/grep",
+            &json!({"collections": ["a"], "queries": ok_q, "bogus": 1}),
+        )
+        .await;
+        err(s, &b, 400, "invalid_json");
+        let (s, _, b) = call(
+            &app.router,
+            req(
+                Method::POST,
+                "/v1/grep",
+                Some("text/plain"),
+                br#"{"collections":["a"],"queries":[{"pattern":"x"}]}"#.to_vec(),
+            ),
+        )
+        .await;
+        err(s, &b, 415, "unsupported_media_type");
+        let (s, _, b) = post_json(&app, "/v1/grep", &json!({"collections": ["a"], "queries": []}))
+            .await;
+        err(s, &b, 400, "invalid_query");
+        let many: Vec<String> = (0..17).map(|i| format!("c{i}")).collect();
+        let (s, _, b) = post_json(&app, "/v1/grep", &json!({"collections": many, "queries": ok_q}))
+            .await;
+        err(s, &b, 400, "invalid_query");
+        let (s, _, b) = get(&app, "/v1/grep").await;
+        err(s, &b, 405, "method_not_allowed");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_max_hits_truncated() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        put_needles(&app, "a", 10, 1).await;
+        let lines = grep_lines(
+            &app,
+            &json!({"collections":["a"],"queries":[{"pattern":"needle"}],"max_hits":3}),
+        )
+        .await;
+        assert_eq!(lines_of(&lines, "hit").len(), 3);
+        let end = lines.last().unwrap();
+        assert_eq!(end["type"], "end");
+        assert_eq!(end["truncated"], true);
+        assert_eq!(end["hits"], 3);
+        assert_eq!(end["collections"][0]["status"], "truncated");
+        assert!(end["collections"][0]["error"].is_null());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_events_filter() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        put_needles(&app, "a", 10, 2).await;
+        let body = |events: Value| {
+            json!({"collections":["a"],"queries":[{"pattern":"needle"}],"events":events})
+        };
+        let lines = grep_lines(&app, &body(json!([]))).await;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["type"], "end");
+        assert_eq!(lines[0]["hits"], 5);
+        assert_eq!(lines[0]["collections"][0]["status"], "complete");
+        let lines = grep_lines(&app, &body(json!(["hit"]))).await;
+        assert_eq!(lines_of(&lines, "hit").len(), 5);
+        assert!(lines_of(&lines, "progress").is_empty());
+        assert!(lines_of(&lines, "unreadable").is_empty());
+        assert_eq!(lines.last().unwrap()["type"], "end");
+        let lines = grep_lines(&app, &body(json!(["progress", "end"]))).await;
+        assert!(!lines_of(&lines, "progress").is_empty());
+        assert!(lines_of(&lines, "hit").is_empty());
+        assert_eq!(lines.last().unwrap()["hits"], 5);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_events_invalid() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        let (s, _, b) = post_json(
+            &app,
+            "/v1/grep",
+            &json!({"collections":["a"],"queries":[{"pattern":"x"}],"events":["hits"]}),
+        )
+        .await;
+        let e = err(s, &b, 400, "invalid_json");
+        assert!(e["message"].as_str().unwrap().contains("hits"), "{e}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_disconnect_releases_slot() {
+    bounded(async {
+        let app = TestApp::new().await;
+        create(&app, "a").await;
+        put_needles(&app, "a", 3, 1).await;
+        let body =
+            serde_json::to_vec(&json!({"collections":["a"],"queries":[{"pattern":"needle"}]}))
+                .unwrap();
+        let open = || {
+            call_head(
+                &app.router,
+                req(
+                    Method::POST,
+                    "/v1/grep",
+                    Some("application/json"),
+                    body.clone(),
+                ),
+            )
+        };
+        let mut open_bodies = Vec::new();
+        for _ in 0..masstuffy::MAX_CONCURRENT_GREPS {
+            let (s, _, b) = open().await;
+            assert_eq!(s, StatusCode::OK);
+            open_bodies.push(b);
+        }
+        let (s, h, b) = call(
+            &app.router,
+            req(
+                Method::POST,
+                "/v1/grep",
+                Some("application/json"),
+                body.clone(),
+            ),
+        )
+        .await;
+        err(s, &b, 503, "too_many_greps");
+        assert_eq!(h["retry-after"], "1");
+        drop(open_bodies.pop());
+        let (s, _, b) = call(
+            &app.router,
+            req(
+                Method::POST,
+                "/v1/grep",
+                Some("application/json"),
+                body.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let lines = ndjson(&b);
+        assert_eq!(lines.last().unwrap()["type"], "end");
+        assert_eq!(
+            lines.last().unwrap()["collections"][0]["status"],
+            "complete"
+        );
+    })
+    .await;
+}
+
+/// Sends `req` and returns the response head with the unread body.
+async fn call_head(
+    router: &Router,
+    req: axum::http::Request<axum::body::Body>,
+) -> (StatusCode, axum::http::HeaderMap, axum::body::Body) {
+    use tower::ServiceExt;
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let (parts, body) = resp.into_parts();
+    (parts.status, parts.headers, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grep_not_cut_by_request_timeout() {
+    bounded(async {
+        let app = TestApp::with(HttpOptions {
+            request_timeout: Duration::from_secs(1),
+            ..HttpOptions::default()
+        })
+        .await;
+        create(&app, "a").await;
+        put_needles(&app, "a", 1000, 1).await;
+        let body =
+            serde_json::to_vec(&json!({"collections":["a"],"queries":[{"pattern":"needle"}]}))
+                .unwrap();
+        let (s, _, mut b) = call_head(
+            &app.router,
+            req(Method::POST, "/v1/grep", Some("application/json"), body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let mut out = Vec::new();
+        let first = std::future::poll_fn(|cx| {
+            use http_body::Body as _;
+            std::pin::Pin::new(&mut b).poll_frame(cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        out.extend_from_slice(&first.into_data().unwrap());
+        // The first frame hit the size cap: the grep is still streaming, no `end` yet.
+        assert!(!String::from_utf8_lossy(&out).contains(r#""type":"end""#));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        out.extend_from_slice(&crate::testutil::collect(b).await);
+        let lines = ndjson(&Bytes::from(out));
+        assert_eq!(lines.last().unwrap()["type"], "end");
+        assert_eq!(lines.last().unwrap()["hits"], 1000);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_grep_limits() {
+    bounded(async {
+        let app = TestApp::new().await;
+        let (s, _, b) = get(&app, "/v1/status").await;
+        assert_eq!(s, StatusCode::OK);
+        let g = &json(&b)["limits"]["grep"];
+        assert_eq!(g["max_queries"], 64);
+        assert_eq!(g["max_pattern_bytes"], 4096);
+        assert_eq!(g["max_collections"], 16);
+        assert_eq!(g["max_hits"], 1_000_000);
+        assert_eq!(g["default_max_hits"], 10_000);
+        assert_eq!(g["max_concurrent"], 32);
+    })
+    .await;
+}

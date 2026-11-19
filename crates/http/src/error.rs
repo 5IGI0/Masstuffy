@@ -253,6 +253,9 @@ fn code_details(e: &Error) -> (&'static str, Option<Value>) {
             ("index_lagging", Some(json!({ "collections": ids })))
         }
         Error::IndexUnavailable => ("index_unavailable", None),
+        Error::InvalidPattern { index, .. } => ("invalid_pattern", Some(json!({ "index": index }))),
+        Error::TooManyGreps => ("too_many_greps", None),
+        Error::GrepLagged => ("grep_lagged", None),
         _ => ("error", None),
     }
 }
@@ -281,7 +284,7 @@ impl From<&Error> for ApiError {
         let (code, details) = code_details(e);
         let mut out = ApiError::new(status, kind, code, e.to_string());
         out.details = details;
-        if matches!(e, Error::IndexLagging { .. }) {
+        if matches!(e, Error::IndexLagging { .. } | Error::TooManyGreps) {
             out.retry_after = Some(1);
         }
         out
@@ -402,5 +405,33 @@ mod tests {
         let o = a.object();
         assert_eq!(o["details"]["index"], 1);
         assert_eq!(a.to_string(), "invalid_param: bad");
+    }
+
+    #[test]
+    fn grep_errors_map() {
+        let a = map(Error::InvalidPattern {
+            index: Some(2),
+            message: "bad".into(),
+        });
+        assert_eq!(
+            (a.status.as_u16(), a.kind, a.code, a.retry_after),
+            (400, "invalid", "invalid_pattern", None)
+        );
+        assert_eq!(a.details.unwrap()["index"], 2);
+        let a = map(Error::InvalidPattern {
+            index: None,
+            message: "bad".into(),
+        });
+        assert!(a.details.unwrap()["index"].is_null());
+        let a = map(Error::TooManyGreps);
+        assert_eq!(
+            (a.status.as_u16(), a.kind, a.code, a.retry_after),
+            (503, "unavailable", "too_many_greps", Some(1))
+        );
+        let a = map(Error::GrepLagged);
+        assert_eq!(
+            (a.status.as_u16(), a.code, a.retry_after),
+            (503, "grep_lagged", None)
+        );
     }
 }

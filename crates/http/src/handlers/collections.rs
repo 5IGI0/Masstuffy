@@ -7,7 +7,10 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
-use masstuffy::Error;
+use masstuffy::{
+    DEFAULT_GREP_MAX_HITS, Error, MAX_CONCURRENT_GREPS, MAX_GREP_COLLECTIONS, MAX_GREP_HITS,
+    MAX_GREP_PATTERN_BYTES, MAX_GREP_QUERIES,
+};
 use serde_json::json;
 
 use super::{collection, json_response, path_err};
@@ -59,6 +62,14 @@ pub(crate) async fn status(State(st): St, RawQuery(q): RawQuery) -> Result<Respo
                 "request_timeout_ms": u64::try_from(o.request_timeout.as_millis()).unwrap_or(u64::MAX),
                 "body_idle_timeout_ms": u64::try_from(o.body_idle_timeout.as_millis()).unwrap_or(u64::MAX),
                 "max_concurrent_requests": o.max_concurrent_requests,
+                "grep": {
+                    "max_queries": MAX_GREP_QUERIES,
+                    "max_pattern_bytes": MAX_GREP_PATTERN_BYTES,
+                    "max_collections": MAX_GREP_COLLECTIONS,
+                    "max_hits": MAX_GREP_HITS,
+                    "default_max_hits": DEFAULT_GREP_MAX_HITS,
+                    "max_concurrent": MAX_CONCURRENT_GREPS,
+                },
             },
             "open_report": st.open_report,
         }),

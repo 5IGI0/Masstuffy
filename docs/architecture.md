@@ -564,7 +564,7 @@ and needs an authenticating reverse proxy to be exposed.
   survives renames; not authentication).
 - Routes: health and status; collections (list, create, get, rename, delete); records (put WARC, get decoded or raw,
   delete by locator, batch or id); raw import (`application/x-masstuffy-envelope`, streamed); lookups by id and by URL;
-  search; scan; export (paged WARC); rebuild, train and index rebuild as **jobs** (`/v1/jobs`, with `?wait=`);
+  search; scan; export (paged WARC); `POST /v1/grep` (streamed NDJSON, `GrepBody`, no request timeout); rebuild, train and index rebuild as **jobs** (`/v1/jobs`, with `?wait=`);
   index sync; dictionaries (`GET /v1/dictionaries`, `GET /v1/dictionaries/{id}`: immutable, strong ETag, 304) so
   that clients can compress and decompress on their side. The raw route carries `Masstuffy-Encoding`, `-Dict-Id`,
   `-Raw-Size`, `-Digest` and `-Content-Size` headers and never sets `Content-Encoding`.
