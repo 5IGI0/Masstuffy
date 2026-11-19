@@ -136,6 +136,7 @@ async fn collection_crud() {
         assert_eq!(v["collections"].as_array().unwrap().len(), 1);
         assert_eq!(v["collections"][0]["slug"], "a");
         assert!(v["collections"][0].get("stats").is_none());
+        assert!(v["collections"][0]["size"]["records"].is_u64());
         let (_, _, b) = get(&app, "/v1/collections/a").await;
         assert!(json(&b)["stats"]["records"].is_u64());
         let (s, _, b) = send_json(
@@ -158,6 +159,54 @@ async fn collection_crud() {
         assert_eq!(json(&b)["trash_removed"], true);
         let (s, _, b) = get(&app, "/v1/collections/b").await;
         err(s, &b, 404, "unknown_collection");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collection_size_json() {
+    const KEYS: [&str; 7] = [
+        "records",
+        "records_total",
+        "tombstones",
+        "stored_bytes",
+        "tombstoned_bytes",
+        "segment_bytes",
+        "cdx_bytes",
+    ];
+    bounded(async {
+        let app = TestApp::new().await;
+        let (s, _, b) = post_json(&app, "/v1/collections", &json!({"slug": "a"})).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let size = json(&b)["size"].clone();
+        assert_eq!(size["records"], 0);
+        assert!(size["stored_bytes"].as_u64().unwrap() > 0);
+        let recs: Vec<Record> = (0..3).map(|i| record(i, 50)).collect();
+        let l = put(&app, "a", &recs).await;
+        let (_, _, b) = get(&app, "/v1/collections/a").await;
+        let v = json(&b);
+        assert_eq!(v["size"]["records"], 3);
+        assert_eq!(v["size"]["records_total"], 3);
+        assert!(v.get("stats").is_some());
+        let (_, _, b) = get(&app, "/v1/collections").await;
+        let v = json(&b);
+        assert_eq!(v["collections"][0]["size"]["records"], 3);
+        assert!(v["collections"][0].get("stats").is_none());
+        let (s, _, b) = post_json(
+            &app,
+            "/v1/collections/a/records/delete",
+            &json!({"locators": [tok(&l[0])]}),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b:?}");
+        let (_, _, b) = get(&app, "/v1/collections/a").await;
+        let size = json(&b)["size"].clone();
+        assert_eq!(size["records"], 2);
+        assert_eq!(size["tombstones"], 1);
+        for k in KEYS {
+            assert!(size[k].is_u64(), "{k}");
+        }
+        assert_eq!(size.as_object().unwrap().len(), KEYS.len());
     })
     .await;
 }

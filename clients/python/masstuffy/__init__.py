@@ -8,7 +8,7 @@ from .errors import (ApiError, ConflictError, ExportInterruptedError, GrepIncomp
                      JobTimeoutError, MasstuffyError, MissingDependencyError, NotDecodableError, NotFoundError,
                      PartialPutError, PayloadTooLargeError, ProtocolError, RecordTooLargeError, ServerError,
                      StaleLocatorError, TransportError, UnavailableError)
-from .models import (Codec, CollectionInfo, CollectionStats, DeletedCollection, DictionaryInfo, ExportReport,
+from .models import (Codec, CollectionInfo, CollectionSize, CollectionStats, DeletedCollection, DictionaryInfo, ExportReport,
                      ImportReport, Limits, Locator, LocatorLike, Page, PutFileReport, RawRules, Rejection,
                      ServerStatus, GrepCollectionReport, GrepHit, GrepProgress, GrepQuery, GrepReport,
                      GrepUnreadable)
@@ -16,7 +16,7 @@ from .records import RawBody, Record, RecordSpec
 
 __all__ = [
     "__version__", "Client", "Collection", "Job", "Record", "RawBody", "RecordSpec", "Locator", "LocatorLike",
-    "Codec", "RawRules", "CollectionInfo", "CollectionStats", "DeletedCollection", "ServerStatus", "Limits",
+    "Codec", "RawRules", "CollectionInfo", "CollectionSize", "CollectionStats", "DeletedCollection", "ServerStatus", "Limits",
     "DictionaryInfo", "ImportReport", "Rejection", "Page", "PutFileReport", "ExportReport", "EnvelopeWriter",
     "DictionaryCache", "RecordCompressor", "MasstuffyError", "TransportError", "ProtocolError",
     "MissingDependencyError", "ApiError", "InvalidRequestError", "PayloadTooLargeError", "NotFoundError",

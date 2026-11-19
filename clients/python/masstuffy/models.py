@@ -147,6 +147,28 @@ class CollectionStats:
 
 
 @dataclass(frozen=True)
+class CollectionSize:
+    """Size of a collection's active generation (see docs/http-api.md, "Collection size").
+
+    ``records`` is exact unless a record was deleted more than once; ``stored_bytes`` are stored
+    (possibly compressed) bytes.
+    """
+
+    records: int
+    records_total: int
+    tombstones: int
+    stored_bytes: int
+    tombstoned_bytes: int
+    segment_bytes: int
+    cdx_bytes: int
+
+    @classmethod
+    def from_json(cls, obj: Dict[str, Any]) -> "CollectionSize":
+        return cls(*(_req(obj, k, int) for k in ("records", "records_total", "tombstones", "stored_bytes",
+                                                 "tombstoned_bytes", "segment_bytes", "cdx_bytes")))
+
+
+@dataclass(frozen=True)
 class CollectionInfo:
     id: str
     slug: str
@@ -154,13 +176,16 @@ class CollectionInfo:
     codec: Codec
     raw_rules: RawRules
     stats: Optional[CollectionStats]   # single GET, create and rename only
+    size: Optional[CollectionSize] = None   # absent on servers older than M27
 
     @classmethod
     def from_json(cls, obj: Dict[str, Any]) -> "CollectionInfo":
         stats = _opt(obj, "stats", dict)
+        size = _opt(obj, "size", dict)
         return cls(_req(obj, "id", str), _req(obj, "slug", str), _req(obj, "generation", int),
                    Codec.from_json(_req(obj, "codec", dict)), RawRules.from_json(_req(obj, "raw_rules", dict)),
-                   None if stats is None else CollectionStats.from_json(stats))
+                   None if stats is None else CollectionStats.from_json(stats),
+                   None if size is None else CollectionSize.from_json(size))
 
 
 @dataclass(frozen=True)

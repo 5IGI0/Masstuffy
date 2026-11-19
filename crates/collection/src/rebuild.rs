@@ -74,6 +74,7 @@ use masstuffy_zframe::{CodecError, inspect_frame};
 use crate::checkpoint::{self, MAX_CHECKPOINT_SEGMENTS};
 use crate::collection::warcinfo_record;
 use crate::context::{GenContext, Options};
+use crate::counts::CdxCounts;
 use crate::entries::collect_tombstones;
 use crate::error::{CommitError, Error, PrepareError, ReadError};
 use crate::layout::{MANIFEST_NAME, cdx_name, checkpoint_name, create_cdx, segment_naming};
@@ -526,6 +527,7 @@ fn append_batch(
         path: cdx_path.to_path_buf(),
         source,
     })?;
+    scan.counts.add_batch(&locs);
     if let (Some(f), Some(l)) = (locs.first(), locs.last()) {
         // All items share one segment (I9).
         scan.record(written, batch.len(), f.segment, l.end());
@@ -687,6 +689,7 @@ impl Rebuilder {
             cdx_len: header_len,
             entries: 0,
             seg_ends: Vec::new(),
+            counts: CdxCounts::default(),
             valid: true,
         };
 
@@ -1216,11 +1219,13 @@ impl Rebuilder {
         let mut checkpoint_written = None;
         if self.scan.valid
             && self.scan.seg_ends.len() <= MAX_CHECKPOINT_SEGMENTS
+            && self.scan.counts.lines() == Some(self.scan.entries)
             && checkpoint::write(
                 &self.dir,
                 generation,
                 self.scan.cdx_len,
                 self.scan.entries,
+                &self.scan.counts,
                 &self.scan.seg_ends,
             )?
         {
@@ -1674,6 +1679,31 @@ mod tests {
     #[test]
     fn rebuild_pool_with_catch_up() {
         writes_continue(4);
+    }
+
+    #[test]
+    fn rebuild_counts() {
+        use crate::testutil::{brute_counts, seg_bytes};
+        let mut fx = build(zstd_codec(), 10, None);
+        let recs = fx.recs.clone();
+        fx.c.tombstone(&[recs[1].clone(), recs[4].clone(), recs[7].clone()])
+            .unwrap();
+        fx.c.tombstone(&[recs[4].clone()]).unwrap();
+        let (report, _old) = do_rebuild(&mut fx.c, other_codec(), ro(2)).unwrap();
+        let none = matches!(other_codec(), Codec::None);
+        let check = |c: &mut Collection, dir: &Path| {
+            let counts = c.writer().counts();
+            assert_eq!(counts.adds, report.copied + 1);
+            assert_eq!(counts.tombstones, 0);
+            assert_eq!(counts, brute_counts(dir, 2));
+            assert_eq!(c.writer().segment_bytes(), seg_bytes(dir, 2, !none));
+        };
+        check(&mut fx.c, &fx.dir);
+        let Fx { _d, dir, c, .. } = fx;
+        drop(c);
+        let (mut c, rep) = open_ok(&dir);
+        assert!(matches!(rep.scan, ScanMode::Partial { .. }));
+        check(&mut c, &dir);
     }
 
     #[test]

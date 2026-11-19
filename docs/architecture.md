@@ -108,7 +108,9 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
   say `>=`; `>` deliberately makes the threshold an inclusive max). An empty current segment takes any batch,
   so an oversize batch is written alone without an extra empty file. Empty items are rejected (`EmptyItem`).
   Any I/O error poisons the Appender (reopen continues at the file length). `sync()` fsyncs every segment
-  touched since the last sync, and the directory after a rollover.
+  touched since the last sync, and the directory after a rollover. `total_len()` (M27) is the total length of the
+  log as written by this appender: the earlier segments (stat'ed at `open`, left behind at each rollover) plus the
+  current one, orphan tails included.
 - `Reader` (`Clone`, `Send + Sync`, `ReaderOptions { max_open_files, max_read_len }`): `read_at(&Locator,
   &mut Vec<u8>)` via `FileExt::read_exact_at` on a shared handle, `len_of(segment)`, `forget(segment)` /
   `forget_all()`. Hand-written bounded LRU of open files; its lock is never held during open or read.
@@ -149,8 +151,12 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   None | Zstd { dict_id, level } }`. The manifest is the **single commit point**; it is written only through
   `atomic_write`. Any format extension bumps `version`.
 - Files: `manifest.json`, `seg.<gen>.<N>.warc[.zst]`, `index.<gen>.cdx` (one CDX per generation),
-  `scan.<gen>.json` (derived checkpoint: line-aligned fsynced CDX offset, entry count, per-segment max end;
-  written with `atomic_write`; deleting it is always safe).
+  `scan.<gen>.json` (derived checkpoint, version 2: line-aligned fsynced CDX offset, entry count, the line counters
+  `adds`/`add_bytes`/`tombstones`/`tombstone_bytes` (M27), per-segment max end; written with `atomic_write`;
+  deleting it is always safe; a file of any version other than 2 is ignored, so the first open after M27 does one full CDX scan).
+  `CdxCounts` (M27): exact counts of the CDX prefix `[header, cdx_len)`, kept by `ScanState` next to `entries`
+  (updated by `commit`, `tombstone` and the rebuild's batches, recomputed by the `open` scan, rolled back with the
+  deep-check cut). `Writer::counts()` and `Writer::segment_bytes()` (`Appender::total_len`) expose them in O(1).
 - `Collection::create(dir, CreateSpec { uuid, slug, codec, split_threshold }, &Options, &dyn DictResolver)
   -> (Collection, warcinfo Entry)` creates `dir` itself and writes the `warcinfo` first record (entry 0,
   holding the manifest); `Collection::open(dir, &Options, &RecoveryOptions { repair: RepairPolicy::
@@ -434,7 +440,12 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   rebuild holds it while waiting for the writer task, so waiting for it here would deadlock; the reopen cancels and
   drops an in-progress `Rebuilder` under the slot mutex first) and the group is retried once; a lost writer is reopened at the next group. The
   task publishes counters and the fsynced CDX length (`Published::cdx_len`, read together with the snapshot by
-  `Published::tail`), then wakes the indexer if the length changed. `on_committed` is only a debug log: the index
+  `Published::tail`), then wakes the indexer if the length changed. M27: it also publishes the collection size
+  (`CollectionSize`, from `Writer::counts()`/`segment_bytes()`/`cdx_len()`) in `Published::snapshot` (`Snaps::size`),
+  after the fsync and before the replies of `commit_group` and `run_tombstone` (read-your-writes), after a rename
+  that reopened, and with the snapshot at a reopen (`store`) or a rebuild switch (`switch`, one write guard). It is
+  read by `CollectionHandle::size()`, `CollectionHandle::info()` (`CollectionInfo::size`) and
+  `Repository::collections()`; a lost writer leaves the last size in place. `on_committed` is only a debug log: the index
   tails the CDX.
 - Admission: a repository-wide byte budget (`max_inflight_put_bytes`, from admission until the writer answered),
   a prepare semaphore (CPU) and a read semaphore bound the work in flight; a request larger than the budget runs
@@ -667,6 +678,7 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M24 | `masstuffy` (+ `warc::RecordRef::head`): shared circular-scan `Repository::grep` | one scanner per collection (`started == 1`) with a late joiner reading the missed prefix exactly twice and no other record twice; coverage `[header, T)` under growth and deletes; rebuild, shutdown, delete_collection end the grep; lagging consumer detached without stalling others; limits and validation |
 | M25 | http: `POST /v1/grep`, NDJSON stream, error codes, `docs/http-api.md` | planned (not part of M24) |
 | M26 | python client: `Client.grep` / `Collection.grep` | planned (not part of M24) |
+| M27 | collection size: CdxCounts, checkpoint v2, Appender::total_len, CollectionSize, HTTP "size", python CollectionSize | exact counts after concurrent puts, deletes, reopen (partial and full scan), repair cut, rebuild; v1 checkpoint upgrade |
 
 M3 and M4 are delivered together (one plan → code → review cycle).
 
@@ -862,3 +874,14 @@ These override the spec where they differ.
     never use channel capacity (fewer `GrepLagged`), allocations or serialisation. Counters are always maintained and
     `max_hits` applies to matches whether or not hits are delivered (a count-only grep is truncated at `max_hits`).
     The HTTP `end` line is produced by the HTTP layer and cannot be filtered. *Adopted.*
+36. **Collection size semantics** (M27): `size` describes the active generation from exact CDX counters kept by the
+    writer (O(1), no scan, no I/O): `records_total` (Add lines minus the generation's own warcinfo), `tombstones`,
+    `records = records_total - tombstones`, `stored_bytes`, `tombstoned_bytes`, `segment_bytes`, `cdx_bytes`.
+    `records` is exact except after a re-delete or a crafted locator (a rebuild restores it); an exact live count
+    would need the tombstone set or per-collection counters in the secondary index. Only the active generation's own
+    warcinfo is excluded (earlier generations' warcinfo records are ordinary records). Not counted: dictionaries,
+    uncompressed size, manifest, checkpoint, rebuild-in-progress and retired-generation files. `size` is on every
+    collection object including the list; `stats` is unchanged. *Adopted.*
+37. **Checkpoint v2** (M27): `scan.<gen>.json` carries the line counters, because with a valid checkpoint `open`
+    never reads the prefix. It is a derived cache: upgrade and downgrade each cost one full scan and no recovery
+    rule changes. *Adopted.*

@@ -532,3 +532,27 @@ pub(crate) fn with_timeout<T: Send + 'static>(
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("test timed out (hang?)"),
     }
 }
+
+// ---- M27 helpers: counts.
+
+use crate::counts::CdxCounts;
+
+/// Counts computed by reading every line of `index.<gen>.cdx`.
+pub(crate) fn brute_counts(dir: &Path, generation: u32) -> CdxCounts {
+    let mut c = CdxCounts::default();
+    for (_, _, e) in cdx_lines(dir, generation) {
+        c.count(e.kind, e.raw_size);
+    }
+    c
+}
+
+/// Sum of the lengths of the segment files of `generation`.
+pub(crate) fn seg_bytes(dir: &Path, generation: u32, zstd: bool) -> u64 {
+    let prefix = format!("seg.{generation}.");
+    let ext = if zstd { ".warc.zst" } else { ".warc" };
+    names(dir)
+        .iter()
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(ext))
+        .map(|n| file_len(&dir.join(n)))
+        .sum()
+}

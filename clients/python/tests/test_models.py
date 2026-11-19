@@ -2,7 +2,7 @@ import unittest
 
 from masstuffy.errors import ProtocolError
 from masstuffy.models import (GrepCollectionReport, GrepHit, GrepProgress, GrepQuery, GrepReport, GrepUnreadable,
-                              Codec, CollectionInfo, DeletedCollection, Locator, ServerStatus, RawRules,
+                              Codec, CollectionInfo, CollectionSize, DeletedCollection, Locator, ServerStatus, RawRules,
                               locator_token)
 
 LOC = {"locator": "L1abc", "collection": "u", "generation": 1, "segment": 0, "offset": 5, "raw_size": 9,
@@ -54,6 +54,20 @@ class ModelsTest(unittest.TestCase):
         self.assertIsNone(CollectionInfo.from_json(base).stats)
         ci = CollectionInfo.from_json(dict(base, stats={"commits": 1, "records": 2, "cdx_len": 3}))
         self.assertEqual(ci.stats.records, 2)
+
+    def test_collection_info_size(self):
+        base = {"id": "u", "slug": "s", "generation": 1, "codec": {"algo": "none"}, "raw_rules": RULES}
+        self.assertIsNone(CollectionInfo.from_json(base).size)
+        size = {"records": 1, "records_total": 2, "tombstones": 1, "stored_bytes": 30, "tombstoned_bytes": 10,
+                "segment_bytes": 40, "cdx_bytes": 50}
+        ci = CollectionInfo.from_json(dict(base, size=size))
+        self.assertEqual(ci.size, CollectionSize(1, 2, 1, 30, 10, 40, 50))
+        with self.assertRaises(ProtocolError):
+            CollectionInfo.from_json(dict(base, size=dict(size, records=True)))
+        missing = dict(size)
+        del missing["cdx_bytes"]
+        with self.assertRaises(ProtocolError):
+            CollectionInfo.from_json(dict(base, size=missing))
 
     def test_raw_rules(self):
         r = RawRules.from_json(RULES)

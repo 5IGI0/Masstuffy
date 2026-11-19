@@ -3,8 +3,9 @@
 use std::num::NonZeroU32;
 
 use masstuffy::{
-    Codec, CollectionInfo, DeletedCollection, GrepEvents, GrepScope, ImportReport, Located,
-    OpenReport, RawCheck, RebuildReport, RecordSkipReason, SkipReason, TrainReport, WriterStats,
+    Codec, CollectionInfo, CollectionSize, DeletedCollection, GrepEvents, GrepScope, ImportReport,
+    Located, OpenReport, RawCheck, RebuildReport, RecordSkipReason, SkipReason, TrainReport,
+    WriterStats,
 };
 use masstuffy_cdx::EnvelopeFormat;
 use masstuffy_warc::WarcDate;
@@ -146,8 +147,35 @@ pub(crate) struct CollectionJson {
     pub generation: u32,
     pub codec: CodecJson,
     pub raw_rules: RawRulesJson,
+    pub size: SizeJson,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<StatsJson>,
+}
+
+/// Size of a collection (see docs/http-api.md "Collection size").
+#[derive(Debug, Serialize)]
+pub(crate) struct SizeJson {
+    pub records: u64,
+    pub records_total: u64,
+    pub tombstones: u64,
+    pub stored_bytes: u64,
+    pub tombstoned_bytes: u64,
+    pub segment_bytes: u64,
+    pub cdx_bytes: u64,
+}
+
+impl From<CollectionSize> for SizeJson {
+    fn from(s: CollectionSize) -> Self {
+        SizeJson {
+            records: s.records,
+            records_total: s.records_total,
+            tombstones: s.tombstones,
+            stored_bytes: s.stored_bytes,
+            tombstoned_bytes: s.tombstoned_bytes,
+            segment_bytes: s.segment_bytes,
+            cdx_bytes: s.cdx_bytes,
+        }
+    }
 }
 
 pub(crate) fn collection_json(info: &CollectionInfo, stats: Option<WriterStats>) -> CollectionJson {
@@ -157,6 +185,7 @@ pub(crate) fn collection_json(info: &CollectionInfo, stats: Option<WriterStats>)
         generation: info.generation,
         codec: info.codec.into(),
         raw_rules: info.codec.into(),
+        size: info.size.into(),
         stats: stats.map(StatsJson::from),
     }
 }

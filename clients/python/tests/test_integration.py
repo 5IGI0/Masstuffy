@@ -108,6 +108,8 @@ class IntegrationTest(unittest.TestCase):
         self.assertIn(col.slug, [c.slug for c in self.client.collections()])
         info = self.client.get_collection(col.slug)
         self.assertEqual(info.stats.records, 0)
+        self.assertEqual(info.size.records, 0)
+        self.assertGreater(info.size.stored_bytes, 0)
         new = col.rename(col.slug + "-r")
         with self.assertRaises(m.NotFoundError):
             self.client.get_collection(col.slug)

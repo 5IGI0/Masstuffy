@@ -64,8 +64,9 @@ use std::sync::Arc;
 use masstuffy_cdx::{CdxReader, CdxWriter, DEFAULT_MAX_LINE, Entry, Kind, LineError, Step, Tail};
 use masstuffy_seglog::{Appender, Locator};
 
-use crate::checkpoint::{self, CHECKPOINT_MIN_GROWTH, CheckpointV1, MAX_CHECKPOINT_SEGMENTS};
+use crate::checkpoint::{self, CHECKPOINT_MIN_GROWTH, CheckpointV2, MAX_CHECKPOINT_SEGMENTS};
 use crate::context::{GenContext, Options};
+use crate::counts::CdxCounts;
 use crate::error::{Error, I2Violation};
 use crate::layout::{FileClass, cdx_name, checkpoint_name, classify, segment_naming};
 use crate::manifest::{Codec, Generation, Manifest};
@@ -360,6 +361,8 @@ struct Recent {
     cdx_offset: u64,
     loc: Locator,
     digest: u64,
+    /// Counts of the lines before this one.
+    counts: CdxCounts,
 }
 
 struct CdxScan {
@@ -369,6 +372,8 @@ struct CdxScan {
     valid_len: u64,
     /// Lines kept (including the checkpointed prefix).
     entries: u64,
+    /// Counts of the kept lines (checkpointed prefix included).
+    counts: CdxCounts,
     torn: Option<TornTail>,
     cut: Option<Repair>,
     recent: VecDeque<Recent>,
@@ -399,7 +404,7 @@ fn bump_seg_end(seg_ends: &mut Vec<u64>, segment: u32, end: u64) -> bool {
 }
 
 /// Checks a checkpoint against the segment lengths (stat only).
-fn check_segments(ck: &CheckpointV1, lens: &[u64]) -> Result<(), FullScanReason> {
+fn check_segments(ck: &CheckpointV2, lens: &[u64]) -> Result<(), FullScanReason> {
     for (i, &end) in ck.seg_ends.iter().enumerate() {
         let segment = u32::try_from(i.saturating_add(1)).unwrap_or(u32::MAX);
         match lens.get(i) {
@@ -416,10 +421,10 @@ fn check_segments(ck: &CheckpointV1, lens: &[u64]) -> Result<(), FullScanReason>
 /// Checks that the checkpoint offset is a line boundary of the CDX.
 fn check_alignment(
     file: &File,
-    ck: CheckpointV1,
+    ck: CheckpointV2,
     header_len: u64,
     file_len: u64,
-) -> Result<CheckpointV1, FullScanReason> {
+) -> Result<CheckpointV2, FullScanReason> {
     let offset = ck.cdx_offset;
     if offset > file_len {
         return Err(FullScanReason::BeyondCdx {
@@ -449,7 +454,7 @@ fn scan_cdx(
     generation: u32,
     lens: &[u64],
     recovery: &RecoveryOptions,
-    ck: Result<CheckpointV1, FullScanReason>,
+    ck: Result<CheckpointV2, FullScanReason>,
 ) -> Result<CdxScan, Error> {
     let io_err = |op: &'static str| {
         let path = path.to_path_buf();
@@ -484,14 +489,24 @@ fn scan_cdx(
         check_alignment(br.get_ref(), c, header_len, file_len)
             .and_then(|c| check_segments(&c, lens).map(|()| c))
     });
-    let (start, mode, mut entries, mut seg_ends) = match checked {
-        Ok(c) => (
-            c.cdx_offset,
-            ScanMode::Partial { from: c.cdx_offset },
-            c.entries,
-            c.seg_ends,
+    let (start, mode, mut entries, mut counts, mut seg_ends) = match checked {
+        Ok(c) => {
+            let counts = c.counts();
+            (
+                c.cdx_offset,
+                ScanMode::Partial { from: c.cdx_offset },
+                c.entries,
+                counts,
+                c.seg_ends,
+            )
+        }
+        Err(reason) => (
+            header_len,
+            ScanMode::Full { reason },
+            0,
+            CdxCounts::default(),
+            Vec::new(),
         ),
-        Err(reason) => (header_len, ScanMode::Full { reason }, 0, Vec::new()),
     };
     br.seek(SeekFrom::Start(start)).map_err(io_err("seek"))?;
     let mut r = CdxReader::resume(br, generation, start, DEFAULT_MAX_LINE).map_err(cdx_read)?;
@@ -542,8 +557,10 @@ fn scan_cdx(
                             len: entry.raw_size,
                         },
                         digest: entry.digest,
+                        counts,
                     });
                 }
+                counts.count(entry.kind, entry.raw_size);
                 entries = entries.checked_add(1).ok_or(Error::Internal("entries"))?;
             }
             Ok(Step::End(Tail::Clean { end })) => break end,
@@ -576,6 +593,7 @@ fn scan_cdx(
         file_len,
         valid_len,
         entries,
+        counts,
         torn,
         cut,
         recent,
@@ -627,6 +645,7 @@ fn verify_recent(
                         reason: RepairReason::I2(v),
                     });
                     out.entries = rec.ordinal;
+                    out.counts = rec.counts;
                     break;
                 }
             }
@@ -778,7 +797,14 @@ pub(crate) fn open(
         scan.ck_blocked,
     );
     if action == CkAction::Write {
-        if checkpoint::write(dir, active.id, target, out.entries, &out.seg_ends)? {
+        if checkpoint::write(
+            dir,
+            active.id,
+            target,
+            out.entries,
+            &out.counts,
+            &out.seg_ends,
+        )? {
             checkpoint_written = Some(target);
         } else if full {
             // Too large to store: a stale file must not survive a full scan.
@@ -826,6 +852,7 @@ pub(crate) fn open(
         cdx_len: target,
         entries: out.entries,
         seg_ends: out.seg_ends,
+        counts: out.counts,
         valid: out.cut.is_none() && !out.seg_overflow && !scan.ck_blocked,
     };
     let mut writer = Writer::from_parts(ctx, appender, cdx, cdx_path, state);
@@ -1853,7 +1880,7 @@ mod tests {
         dir.join("scan.1.json")
     }
 
-    fn read_ck(dir: &Path) -> CheckpointV1 {
+    fn read_ck(dir: &Path) -> CheckpointV2 {
         serde_json::from_slice(&fs::read(ck_path(dir)).unwrap()).unwrap()
     }
 
@@ -1881,7 +1908,7 @@ mod tests {
         assert!(!c.checkpoint().unwrap());
         let ck = read_ck(&dir);
         assert_eq!(ck.cdx_offset, file_len(&dir.join("index.1.cdx")));
-        assert_eq!((ck.entries, ck.version, ck.generation), (4, 1, 1));
+        assert_eq!((ck.entries, ck.version, ck.generation), (4, 2, 1));
         assert_eq!(ck.seg_ends.len(), 1);
         commit_batch(&mut c, &mut p, vec![record(4, 100)]);
         drop((p, c));
@@ -1939,7 +1966,11 @@ mod tests {
             (reason, rep)
         };
         let write = |p: &Path, off: u64, seg_ends: &[u64]| {
-            fs::write(ck_path(p), checkpoint::encode(1, off, ck.entries, seg_ends)).unwrap();
+            fs::write(
+                ck_path(p),
+                checkpoint::encode(1, off, ck.entries, &ck.counts(), seg_ends),
+            )
+            .unwrap();
         };
 
         // CDX shorter than the checkpoint.
@@ -1998,11 +2029,23 @@ mod tests {
             vec![b' '; 2 << 20],
             String::from_utf8(good.clone())
                 .unwrap()
-                .replace("\"version\":1", "\"version\":1,\"extra\":0")
+                .replace("\"version\":2", "\"version\":2,\"extra\":0")
                 .into_bytes(),
             String::from_utf8(good.clone())
                 .unwrap()
-                .replace("\"version\":1", "\"version\":2")
+                .replace("\"version\":2", "\"version\":1")
+                .into_bytes(),
+            String::from_utf8(good.clone())
+                .unwrap()
+                .replace("\"version\":2", "\"version\":3")
+                .into_bytes(),
+            String::from_utf8(good.clone())
+                .unwrap()
+                .replace("\"adds\":", "\"adds_x\":")
+                .into_bytes(),
+            String::from_utf8(good.clone())
+                .unwrap()
+                .replace("\"tombstones\":0", "\"tombstones\":1")
                 .into_bytes(),
         ];
         for (i, content) in bad.iter().enumerate() {
@@ -2136,7 +2179,7 @@ mod tests {
     fn checkpoint_too_large_is_not_written() {
         let d = TestDir::new();
         let big = vec![u64::MAX; MAX_CHECKPOINT_SEGMENTS];
-        assert!(!checkpoint::write(d.path(), 1, 1, 1, &big).unwrap());
+        assert!(!checkpoint::write(d.path(), 1, 1, 1, &CdxCounts::default(), &big).unwrap());
         assert!(!ck_path(d.path()).exists());
     }
 

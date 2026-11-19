@@ -119,6 +119,8 @@ mod repository;
 mod resolver;
 mod scan;
 #[cfg(test)]
+mod size_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod testutil;
@@ -156,7 +158,7 @@ pub use repository::Repository;
 pub use scan::{MAX_SCAN_PAGE, Scan, ScanCursor, ScanItem, ScanOptions, ScanPage};
 pub use train::{TrainOptions, TrainReport};
 pub use types::{
-    CollectionInfo, CollectionRef, DeletedCollection, LoadedCollection, Located,
+    CollectionInfo, CollectionRef, CollectionSize, DeletedCollection, LoadedCollection, Located,
     MAX_DELETE_TARGETS, MAX_REPORTED_UNKNOWN, OpenReport, RawItem, RawRecord, SkipReason,
     SkippedCollection, WriterStats,
 };

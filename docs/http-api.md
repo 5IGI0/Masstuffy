@@ -145,7 +145,7 @@ Success statuses are in the headings. Every error follows section 3.
 `{"version","api":1,"repository","raw_check":"full"|"header","max_record_bytes","collections","dictionaries","jobs_running","limits":{max_put_body_bytes,max_put_records,max_import_body_bytes (null if unbounded),max_json_body_bytes,max_export_page_bytes,request_timeout_ms,body_idle_timeout_ms,max_concurrent_requests,"grep":{max_queries,max_pattern_bytes,max_collections,max_hits,default_max_hits,max_concurrent}},"open_report":null|{loaded,skipped,trashed,unknown_count,tmp_removed,trash_removed,index_recreated}}`.
 
 ### Collections
-Collection object: `{"id","slug","generation","codec","raw_rules"}` (+ `"stats":{"commits","records","cdx_len"}` on single GET, create and rename).
+Collection object: `{"id","slug","generation","codec","raw_rules","size"}` (+ `"stats":{"commits","records","cdx_len"}` on single GET, create and rename). `size` is on every collection object, the list included; see "Collection size" below.
 
 - `GET /v1/collections` 200: `{"collections":[…]}` sorted by slug.
 - `POST /v1/collections` 201, `Location: /v1/collections/{slug}`. Body `{"slug", "codec"?}` (default `{"algo":"none"}`). Errors: `slug_taken` 409, `invalid_slug`, `invalid_codec`, `dict_not_found` 404.
@@ -156,6 +156,25 @@ Collection object: `{"id","slug","generation","codec","raw_rules"}` (+ `"stats":
 ```
 curl -X POST localhost:8470/v1/collections -d '{"slug":"web","codec":{"algo":"zstd","dict_id":32770,"level":3}}'
 ```
+
+#### Collection size
+`size` is `{"records","records_total","tombstones","stored_bytes","tombstoned_bytes","segment_bytes","cdx_bytes"}`, all unsigned integers. Every value is O(1) to read (counters kept in memory by the collection's writer, no scan and no I/O), so it is cheap in the list too. All measures describe the **active generation** as of the last commit or delete acknowledged: the fsynced CDX prefix plus the segment files of that generation. A put or delete that has returned is already included.
+
+| field | definition | exactness |
+|---|---|---|
+| `records_total` | Number of `Add` lines in the CDX, minus 1: the generation's own warcinfo (segment 1, offset 0) is excluded. Deleted records still count until the next rebuild. Warcinfo records of earlier generations that a rebuild copied are ordinary records and are counted. | exact |
+| `tombstones` | Number of `T` lines in the CDX (duplicates included). 0 right after a rebuild. | exact |
+| `records` | `records_total - tombstones` (saturating): live records. Equals the number of entries a full `scan` returns, minus 1. | exact only if every `T` line names a distinct record. It is lower than the truth when the same record was deleted more than once (a re-delete is accepted and writes another `T` line) or when a delete used a crafted locator that names no record start. A rebuild makes it exact again. |
+| `stored_bytes` | Sum of `raw_size` over the `Add` lines: stored bytes (compressed in a zstd collection), warcinfo and deleted records included. | exact |
+| `tombstoned_bytes` | Sum of `raw_size` over the `T` lines: about what a rebuild would reclaim. | same caveat as `records` (overcounts on duplicates) |
+| `segment_bytes` | Sum of the lengths of the active generation's segment files. At least `stored_bytes`; the difference is orphan bytes of unacknowledged writes. | exact for the files as written by this process (stat at open, then tracked) |
+| `cdx_bytes` | Length of the active CDX file: the fsynced length, header included. | exact; same value as `stats.cdx_len`, but the two are published separately and may differ for an instant |
+
+Notes:
+- `stats.records` counts the records acknowledged since the server started. It is not the collection size: use `size.records`.
+- Not counted: dictionaries (they live in a shared store), the uncompressed size (it is not known without reading the records), the manifest and checkpoint files, and the files of a rebuild in progress or of a retired generation not yet removed.
+- During a rebuild `size` keeps describing the old generation, including the puts still being accepted (deletes wait for the rebuild to end). It switches to the new generation at the same instant as `generation`.
+- If the collection's writer is lost after a failed reopen, `size` stays at its last value until the writer is back.
 
 ### Records
 - `POST /v1/collections/{slug}/records` 201. `Content-Type: application/warc`, body = concatenated uncompressed WARC records.

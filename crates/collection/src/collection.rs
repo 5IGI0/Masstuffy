@@ -12,6 +12,7 @@ use masstuffy_warc::{BuildError, Record, RecordBuilder};
 
 use crate::SOFTWARE;
 use crate::context::{GenContext, Options};
+use crate::counts::CdxCounts;
 use crate::entries::Entries;
 use crate::error::{Error, PrepareError};
 use crate::id::CollectionId;
@@ -121,6 +122,7 @@ impl Collection {
             cdx_len: header_len,
             entries: 0,
             seg_ends: Vec::new(),
+            counts: CdxCounts::default(),
             valid: true,
         };
         let mut writer = Writer::from_parts(Arc::clone(&ctx), appender, cdx, cdx_path, state);

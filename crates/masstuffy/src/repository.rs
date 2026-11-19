@@ -28,7 +28,7 @@ use crate::types::{
     CollectionInfo, LoadedCollection, Located, MAX_REPORTED_UNKNOWN, OpenReport, RawRecord,
     SkipReason, SkippedCollection,
 };
-use crate::writer::{Msg, Published, WriterParams, WriterTask};
+use crate::writer::{Msg, Published, WriterParams, WriterTask, size_of};
 
 /// State shared by the repository and every collection handle. It never points to a [`Shared`].
 pub(crate) struct Core {
@@ -411,10 +411,13 @@ impl Repository {
             let shared = spawn_writer(&core, id, *coll, lock);
             registry.by_slug.insert(shared.slug(), id);
             feeds.push(Arc::clone(&shared.feed));
+            let size = shared.published.size();
             info!(
                 collection = %id,
                 slug = %shared.slug(),
                 entries = rec.entries,
+                records = size.records,
+                stored_bytes = size.stored_bytes,
                 scan = ?rec.scan,
                 "collection loaded"
             );
@@ -961,7 +964,7 @@ fn spawn_writer(
     let slug: Arc<str> = Arc::from(coll.manifest().slug());
     let split = coll.manifest().split_threshold().get();
     let (writer, snapshot) = coll.into_parts();
-    let published = Arc::new(Published::new(snapshot, writer.cdx_len()));
+    let published = Arc::new(Published::new(snapshot, writer.cdx_len(), size_of(&writer)));
     let feed = Arc::new(IndexFeed::new(id, Arc::clone(&published), writer.cdx_len()));
     let queue = usize::try_from(core.config.writer_queue)
         .unwrap_or(1)
