@@ -45,6 +45,8 @@ pub(crate) struct Core {
     pub(crate) closed: AtomicBool,
     pub(crate) prepare_sem: Arc<Semaphore>,
     pub(crate) read_sem: Arc<Semaphore>,
+    /// One permit per running grep (`MAX_CONCURRENT_GREPS`); never closed.
+    pub(crate) grep_sem: Arc<Semaphore>,
     /// One permit is one KiB of input admitted but not yet committed.
     pub(crate) inflight_sem: Arc<Semaphore>,
     pub(crate) read_ctxs: CtxPool,
@@ -315,6 +317,7 @@ impl Repository {
             closed: AtomicBool::new(false),
             prepare_sem: Arc::new(Semaphore::new(prepare_permits)),
             read_sem: Arc::new(Semaphore::new(read_permits)),
+            grep_sem: Arc::new(Semaphore::new(crate::grep::MAX_CONCURRENT_GREPS)),
             inflight_sem: Arc::new(Semaphore::new(inflight)),
             read_ctxs: CtxPool::new(read_permits),
             closing: tokio::sync::watch::channel(false).0,
@@ -778,6 +781,15 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
             failure = Some(Error::Join(e));
         }
     }
+    // Grep scanners see `closing` at their next iteration and fail their subscriptions with
+    // `ShuttingDown`: the wait is bounded by one batch. They take neither `gate` nor `admin`.
+    for s in &shareds {
+        for h in s.grep.close() {
+            if let Err(e) = h.await {
+                failure.get_or_insert(Error::Join(e));
+            }
+        }
+    }
     // Units still waiting for a permit get `ShuttingDown`.
     core.rebuild_sem.close();
     core.train_sem.close();
@@ -995,6 +1007,7 @@ fn spawn_writer(
         admission: tokio::sync::RwLock::new(()),
         deleted: AtomicBool::new(false),
         rebuild,
+        grep: crate::grep_scan::GrepSlot::new(),
         task: Mutex::new(Some(handle)),
         #[cfg(test)]
         hooks,

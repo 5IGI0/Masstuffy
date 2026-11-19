@@ -37,6 +37,8 @@ pub(crate) struct Shared {
     pub(crate) deleted: AtomicBool,
     /// Rebuild state shared with the writer task.
     pub(crate) rebuild: Arc<crate::rebuild::RebuildSlot>,
+    /// The shared grep scanner of this collection (a leaf lock, see `grep_scan`).
+    pub(crate) grep: crate::grep_scan::GrepSlot,
     pub(crate) task: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     pub(crate) hooks: Arc<crate::writer::TestHooks>,

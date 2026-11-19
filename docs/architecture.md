@@ -15,7 +15,8 @@ and take versions from `[workspace.dependencies]`. Everything except `masstuffy`
 **`crates/warc` — `masstuffy-warc`**: parse and serialize WARC/1.0 and WARC/1.1 records (spec 3.1, 1.0 accepted per §5).
 - Zero-copy `RecordRef<'a>` (`parse` for one whole record, `parse_prefix` for the first record of a
   buffer): strict, capped by `Limits`, ordered headers kept verbatim, typed accessors `record_id()`
-  (without `<>`), `warc_type()`, `date()`, `target_uri()`, `body()`, `as_bytes()` (byte-exact).
+  (without `<>`), `warc_type()`, `date()`, `target_uri()`, `body()`, `as_bytes()` (byte-exact) and `head()` (M24: the
+  bytes before the body, version line through the empty line; `head() + body() + CRLF CRLF == as_bytes()`).
 - Owned `Record` (validated serialized bytes, `view()` back to a `RecordRef`) and `RecordBuilder`
   (insertion-ordered headers; `Content-Length` is always computed and written last).
 - `WarcReader<R: BufRead>`: lending sequential reader (fsck, import) with one reusable buffer, caps on
@@ -326,6 +327,30 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   `get_raw`); `get_raw` returns the stored bytes and their encoding. A locator of another generation is
   `StaleLocator`. M19 adds `CollectionHandle::put_raw_envelope`, `scan`, `search`, `find_by_url`/`get_by_url` and
   `Repository::find_by_id`/`get_by_id` (see "Queries and bulk import (M19)" below).
+- **Grep (M24)**, `grep.rs` / `grep_scan.rs` / `grep_match.rs`: `Repository::grep(&[CollectionHandle], GrepOptions) ->
+  Grep`, a stream of `GrepEvent` (`Hit { located, queries }`, `Unreadable`, `Progress`) followed by a `GrepReport`
+  (per-collection `GrepStats`, `hits`, `truncated`). Queries (1..=64, OR'ed, each hit names the matching set) are
+  literals or regexes compiled once per grep into one `regex-automata` `meta::Regex` (`MatchKind::All`, byte mode,
+  Unicode off, linear time; NFA capped at 4 MiB, lazy-DFA cache 512 KiB per (grep, collection)); scope is `Payload`,
+  `Headers` or `All` (default), on the record as stored (no transfer or content decoding). Per collection **one shared
+  scanner task** walks the CDX (never the segments, so orphans are skipped and tombstones applied) in batches of 256
+  lines, one blocking job and one read permit per batch; each record is read, digest-checked and decoded once per pass
+  and matched by every subscription that needs it. A late grep attaches at the scanner's position and the scan wraps
+  once to cover the part it missed; the scanner exits, under the slot lock, when no subscription is left. Coverage of
+  a grep is the live records of the CDX prefix `[header, T)`, `T` = fsynced CDX length at attach (appends after the
+  call are excluded; records deleted before the call are hidden because tombstones are loaded up to the largest `T`;
+  a record deleted during the grep may still be returned). A generation change (rebuild) fails that collection's
+  part with `StaleLocator`; deletion of the collection gives `UnknownCollection`, shutdown `ShuttingDown` (scanners
+  are joined by `shutdown_body`). The scanner never waits for a consumer: each grep has one bounded channel (64
+  batch messages) and a full channel detaches that grep with `GrepLagged`. Limits are constants (`MAX_GREP_QUERIES`
+  64, `MAX_GREP_PATTERN_BYTES` 4096, `MAX_GREP_COLLECTIONS` 16, `DEFAULT_GREP_MAX_HITS` 10 000, `MAX_GREP_HITS`
+  1 000 000, `MAX_CONCURRENT_GREPS` 32 per repository, `TooManyGreps` beyond). New errors: `InvalidPattern`
+  (`Invalid`), `TooManyGreps` and `GrepLagged` (`Unavailable`). Regexes reject non-ASCII characters (write `\xHH`);
+  literals accept any UTF-8. Progress is measured in CDX bytes of the grep's range `[first, T)` (exact total at
+  positioning, `cdx_done == cdx_total` iff complete; a start event with `cdx_done = 0`, then one every 16 384 in-range
+  lines); events are selectable via `GrepEvents` (generated only if wanted; counters and `max_hits` always apply).
+  External dependency: `regex-automata` 0.4 (features `std syntax meta perf hybrid
+  nfa-backtrack dfa-onepass`, no Unicode tables).
 - **Dictionary accessors (M22)**, `dicts.rs`: `Repository::dictionaries() -> Result<Vec<DictionaryInfo { dict_id, label,
   size }>>` (sorted by id, in memory) and `Repository::dictionary(dict_id) -> Vec<u8>` (file bytes read in
   `spawn_blocking` under one read permit; unknown id or 0 is `DictNotFound`). Not cached: clients that compress or
@@ -507,9 +532,10 @@ append, read, rebuild, recovery (spec 1, 2, 4.1–4.6, 5). Synchronous, no secon
   - Errors: `IndexOpen` (kind `Io`), `IndexLagging`, `IndexUnavailable` (kind `Unavailable`).
   - Lock order (M21): `Core::gate`, `index_rebuild`, `rebuild_sem` (a permit, rebuild units only),
     per-collection `admin` (ascending uuid), per-collection `admission`, `create_lock`, `registry`, then the leaves
-    `Shared::slug` (taken only under the registry write lock), `RebuildSlot::rb` (held during blocking I/O by design,
+    `Shared::grep` (M24: the grep scanner slot; it may take the `Published::snapshot` read lock inside and nothing
+    else; never held across `.await` or while finishing a subscription), `Shared::slug` (taken only under the registry write lock), `RebuildSlot::rb` (held during blocking I/O by design,
     nothing else is taken meanwhile), `Published::snapshot`, pool mutexes, `Hub::dirty`, `Core::index`,
-    `Inner::index_task`. **`create_lock` moved after `admin`** (it used to follow the gate): rename holds both, and
+    `Inner::index_task`, `GrepShared::outcomes` (M24, a leaf taken alone). **`create_lock` moved after `admin`** (it used to follow the gate): rename holds both, and
     `create_collection` takes only gate then `create_lock`, never an `admin`. `train_sem` is taken with no other lock
     held. The writer task never takes the admin mutex or the gate; the indexer takes neither. `delete_collection`
     releases `admission` before it waits for `admin`.
@@ -601,7 +627,7 @@ Edge list (authoritative):
 | collection | warc, zframe, cdx, seglog, durable |
 | index | warc, cdx, urlkey |
 | index-redb | index, cdx |
-| masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe (`codec`, `train`), cdx, durable |
+| masstuffy | collection, dictstore, index, index-redb (feature), warc, urlkey, zframe (`codec`, `train`), cdx, durable, regex-automata (M24) |
 | masstuffy-http | masstuffy, warc, cdx, zframe (`codec`) |
 
 `index` also depends on `warc` (for `WarcDate`); `index-redb` uses `WarcDate`/`UrlPattern` through `index`'s re-exports.
@@ -638,6 +664,9 @@ Each milestone is one plan → code → review cycle and leaves the workspace gr
 | M21 | `masstuffy`: `delete_collection`, `rename_collection`, record deletion (`delete`, `delete_by_id`) | crash mid-delete leaves `.trash-*` swept at open; slug uniqueness under concurrent creates and renames; deletes wait for rebuilds; I8 after deletes |
 | M22 | http: API crate + `masstuffy-server` + `docs/http-api.md`; dictstore `bytes`, engine `dictionaries`/`dictionary` | every endpoint, error mapping, limits, streaming import/export, disconnect, graceful shutdown, dictionary download with ETag |
 | M23 | http: env-var configuration of masstuffy-server (one option table; flags for every HttpOptions/ServeOptions field) | precedence, layer order, malformed values per parser, empty/non-UTF-8 env, unknown-variable warning, validation names its source, docs table in sync |
+| M24 | `masstuffy` (+ `warc::RecordRef::head`): shared circular-scan `Repository::grep` | one scanner per collection (`started == 1`) with a late joiner reading the missed prefix exactly twice and no other record twice; coverage `[header, T)` under growth and deletes; rebuild, shutdown, delete_collection end the grep; lagging consumer detached without stalling others; limits and validation |
+| M25 | http: `POST /v1/grep`, NDJSON stream, error codes, `docs/http-api.md` | planned (not part of M24) |
+| M26 | python client: `Client.grep` / `Collection.grep` | planned (not part of M24) |
 
 M3 and M4 are delivered together (one plan → code → review cycle).
 
@@ -807,3 +836,29 @@ These override the spec where they differ.
 26. **Engine config by environment** (M23): not supported; `config.json` stays the only engine
     configuration. Reason: it is persistent, validated and written at init; a runtime override layer needs an engine
     API (`open` takes no config) and a way to report effective values. Follow-up if containers need it.
+27. **Grep coverage of appends** (M24): a grep covers exactly the live records of `[header, T)`, `T` the fsynced CDX
+    length at attach; later appends are excluded even when the shared pass reads them for another grep.
+    Deterministic, and the same rule as `scan`. *Adopted.*
+28. **Grep slow consumer** (M24): the grep is detached with `GrepLagged` (bounded channel, `try_send`) rather than
+    stalling the shared scan; a bounded wait would need a tokio `time` driver, which the library does not enable.
+    Revisit (larger channel, per-grep pause) if healthy clients hit it. *Adopted.*
+29. **Rebuild during a grep** (M24): that collection fails with `StaleLocator` (the client re-runs); continuing on the
+    new generation could mix locators of two generations. *Adopted.*
+30. **Grep scopes** (M24): `payload` is the body of non-HTTP records and the bytes after the first CRLF CRLF of an
+    `application/http` block; `headers` the WARC head plus the HTTP head; `all` the whole record (default). No
+    transfer or content decoding (follow-up as an opt-in). *Adopted.*
+31. **Grep regex dialect** (M24): byte mode, Unicode off, ASCII-only case folding, non-ASCII characters rejected in
+    regexes (use `\xHH`), literals accept any UTF-8. *Adopted.*
+32. **Grep limits** (M24): engine constants, not `config.json` fields (no config schema change). *Adopted.*
+33. **Grep during HTTP drain** (M25): a long grep keeps its connection until `drain_timeout`, then is cut without an
+    `end` line; a follow-up can pass the stop signal to emit `shutting_down`. *Adopted* (recorded here, built in M25).
+34. **Grep progress measure** (M24): CDX bytes of the grep's range `[first, T)`. The total is exact and free at
+    positioning; done sums the lengths of every consumed in-range line (adds, tombstones, tombstoned and unmatched
+    records), so `done == total` exactly when coverage is complete. A record total would need a pass (tombstones,
+    commit counters are not live counts). The fraction follows index lines, not data volume. A start event
+    (`cdx_done = 0`) is queued when the grep is positioned, then one every 16 384 in-range lines; no final event.
+    *Adopted.*
+35. **Grep event filtering in the engine** (M24): `GrepOptions::events` decides what is generated, so unwanted events
+    never use channel capacity (fewer `GrepLagged`), allocations or serialisation. Counters are always maintained and
+    `max_hits` applies to matches whether or not hits are delivered (a count-only grep is truncated at `max_hits`).
+    The HTTP `end` line is produced by the HTTP layer and cannot be filtered. *Adopted.*

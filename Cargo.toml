@@ -36,6 +36,7 @@ http-body = { version = "1.1.0", default-features = false }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 form_urlencoded = { version = "1.2.2", default-features = false, features = ["std"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
+regex-automata = { version = "0.4.9", default-features = false, features = ["std", "syntax", "meta", "perf", "hybrid", "nfa-backtrack", "dfa-onepass"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
 
 # Line tables keep file:line in backtraces while cutting debug build size several times.

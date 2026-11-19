@@ -57,7 +57,7 @@ pub(crate) fn snapshot_for(shared: &Shared, generation: u32) -> Result<Arc<Snaps
 
 /// After a `SegmentMissing` on `snap`: the snapshot to retry with (same generation, other `Arc`),
 /// or the `StaleLocator` of a retired snapshot whose files were removed.
-fn retry_snapshot(
+pub(crate) fn retry_snapshot(
     snap: &Arc<Snapshot>,
     published: &Published,
 ) -> Result<Option<Arc<Snapshot>>, Error> {
