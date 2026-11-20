@@ -47,6 +47,15 @@ Loop:
 
 Never skip the reviewer for a feature, even if the change looks trivial once written.
 
+### Changelog and releases
+
+- Every user-visible change (server, HTTP API, on-disk format, env vars, Python client, Docker
+  image) gets an entry under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md), in the same
+  commit. Use the `changelog` skill ([`.claude/skills/changelog/SKILL.md`](.claude/skills/changelog/SKILL.md)) for the format.
+- A release = a `## [X.Y.Z]` section in `CHANGELOG.md` + the same version in
+  `crates/http/Cargo.toml`, merged into `release`. CI then pushes the image, tags `vX.Y.Z` and
+  creates the GitHub release from that section; it refuses to build if the section is missing.
+
 ## Rust rules (apply to everyone, agents included)
 
 ### Safety

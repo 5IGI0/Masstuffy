@@ -1,5 +1,6 @@
-# Builds the masstuffy-server image and pushes it to ghcr.io on every push to the `release` branch
-# (a merge into `release` is a push).
+# On every push to the `release` branch (a merge into `release` is a push): builds the
+# masstuffy-server image, pushes it to ghcr.io, then tags the commit `v<version>` and creates a
+# GitHub release whose notes are the `## [<version>]` section of CHANGELOG.md.
 name: Release image
 
 on:
@@ -7,7 +8,7 @@ on:
     branches: [release]
 
 permissions:
-  contents: read
+  contents: write # push the git tag and create the GitHub release
   packages: write
 
 concurrency:
@@ -30,6 +31,7 @@ jobs:
 
       # The image version is the masstuffy-http crate version (what `masstuffy-server --version`
       # prints). A published version is never overwritten: bump it before merging into release.
+      # Everything is checked before building so a bad release fails without publishing anything.
       - id: version
         run: |
           v=$(awk -F'"' '/^\[/{p=($0=="[package]")} p && /^version *=/{print $2; exit}' crates/http/Cargo.toml)
@@ -39,6 +41,12 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           if docker manifest inspect "$image:$v" >/dev/null 2>&1; then
             echo "::error::$image:$v already exists; bump the version in crates/http/Cargo.toml"; exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null; then
+            echo "::error::git tag v$v already exists; bump the version in crates/http/Cargo.toml"; exit 1
+          fi
+          if ! scripts/changelog-section.sh "$v" > "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no '## [$v]' section; add one before merging into release"; exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "minor=${v%.*}" >> "$GITHUB_OUTPUT"
@@ -62,3 +70,15 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Tag only after the image is published. `gh release create` creates the tag on the exact
+      # commit that was built. Tags pushed with GITHUB_TOKEN do not trigger other workflows.
+      - name: Tag and create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
