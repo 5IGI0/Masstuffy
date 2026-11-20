@@ -36,6 +36,7 @@
 mod checkpoint;
 mod collection;
 mod context;
+mod counts;
 mod entries;
 mod error;
 mod id;
@@ -58,6 +59,7 @@ use std::num::NonZeroU64;
 pub use checkpoint::{CHECKPOINT_MIN_GROWTH, MAX_CHECKPOINT_BYTES, MAX_CHECKPOINT_SEGMENTS};
 pub use collection::{Collection, CreateSpec};
 pub use context::{GenContext, Options};
+pub use counts::CdxCounts;
 pub use entries::{CdxLine, CdxLines, Entries};
 pub use error::{
     CommitError, Error, I2Violation, ManifestError, PrepareError, ReadError, TombstoneError,

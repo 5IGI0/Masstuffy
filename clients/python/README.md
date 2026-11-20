@@ -50,6 +50,11 @@ with m.Client("http://127.0.0.1:8470") as client:
   get_by_id`, `client.lookup_by_id(..., collection=None)`.
 - Iterate: `col.search(host, subdomains=, port=, path=, path_match=, limit=)` and `col.scan()` (flat iterators; `*_pages`
   variants give `Page` objects with their cursor), `col.export(dest)` and `col.iter_export()`.
+- Grep: `client.grep(collections, queries, scope="all", max_hits=None, events=("hit", "unreadable"), strict=True)` or
+  `col.grep(queries, ...)` search one or more collections (`POST /v1/grep`) and return a `GrepStream`: an iterator of
+  `GrepHit` / `GrepUnreadable` (plus `GrepProgress` if `"progress"` is in `events`) and a context manager. Queries are
+  strings (literals) or `GrepQuery(pattern, regex=, case_insensitive=)`; `scope` is `payload`, `headers` or `all`.
+  `stream.report` (a `GrepReport`) is set once the stream ends; `stream.progress[slug]` holds the latest progress.
 
 ```python
 col.put_warc_file("crawl.warc.gz", batch_records=500)                     # resume: start_record=report.next_record
@@ -61,6 +66,25 @@ job = col.train(max_dict_size=16384).wait(120)                            # then
 col.rebuild(m.Codec.zstd(job.result["dict_id"], 3)).wait(600)
 client.sync_index(); client.rebuild_index().wait(); client.jobs(); client.dictionaries()
 ```
+
+```python
+with client.grep(["web"], ["needle", m.GrepQuery(r"id=[0-9]+", regex=True)], scope="payload", max_hits=100,
+                 events=("hit", "progress")) as stream:
+    for item in stream:
+        if isinstance(item, m.GrepHit):
+            print(item.slug, item.queries, item.locator.url)
+        else:                                                     # GrepProgress: an indicator, nothing more
+            print("%s %.0f%%" % (item.slug, 100 * item.fraction))
+    for c in stream.report.collections:
+        print(c.slug, c.status, c.hits)                           # "complete" | "truncated" | "failed"
+```
+
+Completeness is given by each collection's `status` in `stream.report`, never by `GrepProgress.fraction`: `fraction`
+(`cdx_done / cdx_total`) is a progress indicator that follows index lines, and a truncated (`max_hits`) or failed
+collection can also end at 1.0. With `strict=True` (default) the stream raises `GrepIncompleteError` (carrying
+`.report`) after its last item when a collection failed; truncation is never an error. A response without an `end`
+line raises `ProtocolError`. The request always asks the server for progress lines (liveness); they are only yielded
+when requested. `close()` (or leaving the `with`) drops the connection, which detaches the grep on the server.
 
 ## Errors
 
@@ -75,6 +99,7 @@ client.sync_index(); client.rebuild_index().wait(); client.jobs(); client.dictio
 | `TransportError` | network failure; `outcome_unknown` is True when a mutation may have happened |
 | `ProtocolError` | the server broke the contract (bad JSON, missing header, malformed WARC, count mismatch) |
 | `PartialPutError`, `ExportInterruptedError` | failure part-way; `.report` says where to resume, `.cause` is the error |
+| `GrepIncompleteError` | a grep ended but a collection `failed` (`.report`); `strict=False` disables it |
 | `JobFailedError`, `JobTimeoutError`, `RecordTooLargeError`, `MissingDependencyError` | see docstrings |
 
 All `ApiError`s carry `status`, `kind`, `code`, `message`, `details`, `retry_after`; import errors expose
@@ -85,7 +110,7 @@ All `ApiError`s carry `status`, `kind`, `code`, `message`, `details`, `retry_aft
 - `put` returns after the server's 201: durable. A `TransportError` with `outcome_unknown=True` or a 5xx means the
   records may be committed; retrying can duplicate them (at-least-once; duplicate record ids are allowed and
   `lookup_by_id` returns the latest). The client never retries a put automatically, except 503 `overloaded` /
-  `too_many_jobs` / `index_lagging` (rejected before any work) when the body is replayable. GET requests and
+  `too_many_jobs` / `index_lagging` / `too_many_greps` (rejected before any work) when the body is replayable. GET requests and
   `sync_index` are retried on transport errors.
 - `put_warc_file` batches commit independently. Import commits batch by batch (a prefix); resume with
   `import_envelope(resume_offset=report.committed_offset)` or `put_warc_file(start_record=...)`. If a record is

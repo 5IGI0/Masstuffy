@@ -108,6 +108,8 @@ class IntegrationTest(unittest.TestCase):
         self.assertIn(col.slug, [c.slug for c in self.client.collections()])
         info = self.client.get_collection(col.slug)
         self.assertEqual(info.stats.records, 0)
+        self.assertEqual(info.size.records, 0)
+        self.assertGreater(info.size.stored_bytes, 0)
         new = col.rename(col.slug + "-r")
         with self.assertRaises(m.NotFoundError):
             self.client.get_collection(col.slug)
@@ -344,6 +346,49 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(errs, [])
         self.assertEqual(len({l.token for l in locs}), 40)
         self.assertEqual(len(list(col.scan())), 41)
+
+    def test_grep_concurrent_and_collection(self):
+        col = self.new()
+        specs = [m.RecordSpec("resource", (b"needle %d " % i if i % 3 == 0 else b"hay %d " % i) * 4)
+                 for i in range(30)]
+        col.put(specs)
+        want = {l.token for l in col.scan()}
+        expected = 10
+        results, errs = [], []
+
+        def work(use_collection):
+            try:
+                if use_collection:
+                    st = col.grep("needle")
+                else:
+                    st = self.client.grep([col.slug], [m.GrepQuery("needle")], events=("hit", "progress"))
+                with st:
+                    items = list(st)
+                results.append((items, st.report, dict(st.progress)))
+            except Exception as e:  # pragma: no cover
+                errs.append(e)
+
+        ths = [threading.Thread(target=work, args=(k % 2 == 0,)) for k in range(4)]
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+        self.assertEqual(errs, [])
+        self.assertEqual(len(results), 4)
+        for items, rep, prog in results:
+            hits = [i for i in items if isinstance(i, m.GrepHit)]
+            self.assertEqual(len(hits), expected)
+            self.assertEqual(len({h.locator.token for h in hits}), expected)
+            self.assertTrue(all(h.locator.token in want for h in hits))
+            self.assertEqual(rep.collections[0].status, "complete")
+            self.assertEqual(rep.collections[0].hits, expected)
+            self.assertEqual(rep.collections[0].cdx_done, rep.collections[0].cdx_total)
+            self.assertIn(col.slug, prog)
+        with self.client.grep(col.slug, "needle", events=("progress",)) as st:
+            first = next(iter(st))
+        self.assertEqual((first.cdx_done, first.slug), (0, col.slug))
+        self.assertGreater(first.cdx_total, 0)
+        with self.assertRaises(m.InvalidRequestError) as cm:
+            self.client.grep(col.slug, m.GrepQuery("(", regex=True))
+        self.assertEqual(cm.exception.code, "invalid_pattern")
 
 
 @unittest.skipUnless(HAVE_BIN, "MASSTUFFY_SERVER_BIN not set")

@@ -7,6 +7,7 @@
 use std::convert::Infallible;
 use std::io::{self, Read};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -14,9 +15,13 @@ use axum::body::Body;
 use axum::http::{HeaderMap, header};
 use bytes::Bytes;
 use http_body::{Body as _, Frame, SizeHint};
+use masstuffy::{CollectionGrep, CollectionId, Grep, GrepEvent, GrepReport, QuerySet};
+use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::error::ApiError;
+use crate::json::{LocatorJson, locator_json};
 
 /// Capacity of the pump channel, in chunks.
 pub(crate) const PUMP_CHANNEL: usize = 8;
@@ -307,6 +312,247 @@ pub(crate) fn check_content_length(headers: &HeaderMap, cap: u64) -> Result<(), 
         )));
     }
     Ok(())
+}
+
+/// A grep response flushes its buffer as a frame once it holds this many bytes.
+const GREP_FRAME_BYTES: usize = 64 * 1024;
+
+/// A query set as a JSON array of indices, without allocating.
+struct QueryList(QuerySet);
+
+impl Serialize for QueryList {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_seq(self.0.iter())
+    }
+}
+
+/// `{"type":"hit",...}`.
+#[derive(Serialize)]
+struct HitLine<'a> {
+    r#type: &'static str,
+    slug: &'a str,
+    queries: QueryList,
+    record: LocatorJson,
+}
+
+/// `{"type":"unreadable",...}`.
+#[derive(Serialize)]
+struct UnreadableLine<'a> {
+    r#type: &'static str,
+    slug: &'a str,
+    record: LocatorJson,
+    error: Value,
+}
+
+/// `{"type":"progress",...}`.
+#[derive(Serialize)]
+struct ProgressLine<'a> {
+    r#type: &'static str,
+    slug: &'a str,
+    records: u64,
+    bytes: u64,
+    cdx_done: u64,
+    cdx_total: u64,
+}
+
+/// One collection of the `end` line.
+#[derive(Serialize)]
+struct EndCollection<'a> {
+    slug: &'a str,
+    id: String,
+    status: &'static str,
+    records: u64,
+    bytes: u64,
+    cdx_done: u64,
+    cdx_total: u64,
+    hits: u64,
+    unreadable: u64,
+    error: Option<Value>,
+}
+
+/// `{"type":"end",...}`.
+#[derive(Serialize)]
+struct EndLine<'a> {
+    r#type: &'static str,
+    hits: u64,
+    truncated: bool,
+    collections: Vec<EndCollection<'a>>,
+}
+
+/// Streaming NDJSON body of `POST /v1/grep`. Dropping it drops the [`Grep`], which detaches it
+/// from the shared scans.
+pub(crate) struct GrepBody {
+    grep: Grep,
+    slugs: Vec<(CollectionId, Arc<str>)>,
+    buf: Vec<u8>,
+    done: bool,
+}
+
+/// The requested slug of a collection of the grep.
+fn slug_of(slugs: &[(CollectionId, Arc<str>)], id: CollectionId) -> &str {
+    slugs
+        .iter()
+        .find(|(c, _)| *c == id)
+        .map_or("", |(_, s)| &**s)
+}
+
+/// Appends `line` and `\n`. A line is plain data, so serialisation cannot fail; if it ever does
+/// the line is dropped (a dropped `end` line is the documented "cut" signal).
+fn write_line<T: Serialize>(buf: &mut Vec<u8>, line: &T) {
+    let mark = buf.len();
+    if serde_json::to_writer(&mut *buf, line).is_err() {
+        buf.truncate(mark);
+        return;
+    }
+    buf.push(b'\n');
+}
+
+impl GrepBody {
+    pub(crate) fn new(grep: Grep, slugs: Vec<(CollectionId, Arc<str>)>) -> GrepBody {
+        GrepBody {
+            grep,
+            slugs,
+            buf: Vec::with_capacity(GREP_FRAME_BYTES),
+            done: false,
+        }
+    }
+
+    fn push_event(&mut self, ev: GrepEvent) {
+        let slugs = &self.slugs;
+        let buf = &mut self.buf;
+        match ev {
+            GrepEvent::Hit { located, queries } => write_line(
+                buf,
+                &HitLine {
+                    r#type: "hit",
+                    slug: slug_of(slugs, located.collection),
+                    queries: QueryList(queries),
+                    record: locator_json(&located),
+                },
+            ),
+            GrepEvent::Unreadable { located, error } => write_line(
+                buf,
+                &UnreadableLine {
+                    r#type: "unreadable",
+                    slug: slug_of(slugs, located.collection),
+                    record: locator_json(&located),
+                    error: ApiError::from(&*error).object(),
+                },
+            ),
+            GrepEvent::Progress {
+                collection,
+                records,
+                bytes,
+                cdx_done,
+                cdx_total,
+            } => write_line(
+                buf,
+                &ProgressLine {
+                    r#type: "progress",
+                    slug: slug_of(slugs, collection),
+                    records,
+                    bytes,
+                    cdx_done,
+                    cdx_total,
+                },
+            ),
+        }
+    }
+
+    fn push_end(&mut self, report: &GrepReport) {
+        let slugs = &self.slugs;
+        let collections: Vec<EndCollection<'_>> = report
+            .collections
+            .iter()
+            .map(|c: &CollectionGrep| {
+                let status = if c.error.is_some() {
+                    "failed"
+                } else if c.stats.complete {
+                    "complete"
+                } else {
+                    "truncated"
+                };
+                EndCollection {
+                    slug: slug_of(slugs, c.collection),
+                    id: c.collection.to_string(),
+                    status,
+                    records: c.stats.records,
+                    bytes: c.stats.bytes,
+                    cdx_done: c.stats.cdx_done,
+                    cdx_total: c.stats.cdx_total,
+                    hits: c.stats.hits,
+                    unreadable: c.stats.unreadable,
+                    error: c.error.as_deref().map(|e| ApiError::from(e).object()),
+                }
+            })
+            .collect();
+        write_line(
+            &mut self.buf,
+            &EndLine {
+                r#type: "end",
+                hits: report.hits,
+                truncated: report.truncated,
+                collections,
+            },
+        );
+    }
+
+    fn take_frame(&mut self) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let data = std::mem::replace(&mut self.buf, Vec::with_capacity(GREP_FRAME_BYTES));
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(data)))))
+    }
+}
+
+impl http_body::Body for GrepBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let this = &mut *self;
+        if this.done && this.buf.is_empty() {
+            return Poll::Ready(None);
+        }
+        while !this.done {
+            match this.grep.poll_next(cx) {
+                Poll::Ready(Some(ev)) => {
+                    this.push_event(ev);
+                    if this.buf.len() >= GREP_FRAME_BYTES {
+                        return this.take_frame();
+                    }
+                }
+                Poll::Ready(None) => {
+                    // No report would mean the end line is missing: the client treats the
+                    // response as cut, which is the documented failure signal.
+                    if let Some(report) = this.grep.report() {
+                        this.push_end(&report);
+                    }
+                    this.done = true;
+                }
+                Poll::Pending => {
+                    if this.buf.is_empty() {
+                        return Poll::Pending;
+                    }
+                    return this.take_frame();
+                }
+            }
+        }
+        if this.buf.is_empty() {
+            Poll::Ready(None)
+        } else {
+            this.take_frame()
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done && self.buf.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::default()
+    }
 }
 
 #[cfg(test)]

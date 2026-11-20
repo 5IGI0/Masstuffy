@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use masstuffy_cdx::{Entry, ImportMeta};
-use masstuffy_collection::{Codec, CollectionId, RawEncoding, RecoveryReport};
+use masstuffy_collection::{CdxCounts, Codec, CollectionId, RawEncoding, RecoveryReport};
 
 /// Where a committed record lives. Self-describing: enough to read it back with
 /// `Repository::get` and `Repository::get_raw`.
@@ -88,6 +88,50 @@ pub struct CollectionInfo {
     pub codec: Codec,
     /// The active generation.
     pub generation: u32,
+    /// Size of the active generation, read together with `generation`.
+    pub size: CollectionSize,
+}
+
+/// Size of a collection's active generation (see `docs/http-api.md`, "Collection size"). Derived
+/// from exact CDX counters kept by the writer task: reading it is O(1), no I/O.
+///
+/// If the writer task loses its writer (failed reopen), the last published value stays until the
+/// writer is back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CollectionSize {
+    /// Live records: `records_total - tombstones` (saturating). Exact iff every tombstone names a
+    /// distinct record; lower after a record was deleted twice or after a delete with a crafted
+    /// locator; exact again after a rebuild.
+    pub records: u64,
+    /// `Add` lines minus the generation's own warcinfo (deleted records included until a rebuild;
+    /// warcinfo records of earlier generations copied by a rebuild included).
+    pub records_total: u64,
+    /// `T` lines (duplicates included; 0 after a rebuild).
+    pub tombstones: u64,
+    /// Sum of `raw_size` of the `Add` lines (stored, i.e. compressed, bytes; warcinfo included).
+    pub stored_bytes: u64,
+    /// Sum of `raw_size` of the `T` lines (same caveat as `records`).
+    pub tombstoned_bytes: u64,
+    /// Total length of the active generation's segment files (orphan tails included).
+    pub segment_bytes: u64,
+    /// Length of the active CDX file (fsynced, header included).
+    pub cdx_bytes: u64,
+}
+
+impl CollectionSize {
+    /// Builds the size from a writer's counters.
+    pub(crate) fn from_counts(c: CdxCounts, segment_bytes: u64, cdx_bytes: u64) -> CollectionSize {
+        let records_total = c.adds.saturating_sub(1);
+        CollectionSize {
+            records: records_total.saturating_sub(c.tombstones),
+            records_total,
+            tombstones: c.tombstones,
+            stored_bytes: c.add_bytes,
+            tombstoned_bytes: c.tombstone_bytes,
+            segment_bytes,
+            cdx_bytes,
+        }
+    }
 }
 
 /// Counters of one writer task (monotonic since open).

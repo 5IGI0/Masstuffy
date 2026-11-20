@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use crate::error::Error;
 use crate::pool::PreparerPool;
 use crate::repository::Core;
-use crate::types::{CollectionInfo, Located, RawItem, WriterStats};
+use crate::types::{CollectionInfo, CollectionSize, Located, RawItem, WriterStats};
 use crate::writer::{Committed, Msg, Published, Rejected, Reply, Request, WriteError};
 
 /// One per collection; holds the only long-lived `mpsc::Sender` of its writer task.
@@ -37,6 +37,8 @@ pub(crate) struct Shared {
     pub(crate) deleted: AtomicBool,
     /// Rebuild state shared with the writer task.
     pub(crate) rebuild: Arc<crate::rebuild::RebuildSlot>,
+    /// The shared grep scanner of this collection (a leaf lock, see `grep_scan`).
+    pub(crate) grep: crate::grep_scan::GrepSlot,
     pub(crate) task: Mutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     pub(crate) hooks: Arc<crate::writer::TestHooks>,
@@ -118,16 +120,24 @@ impl CollectionHandle {
         self.shared.slug()
     }
 
-    /// Summary of the collection (codec and generation of the current snapshot).
+    /// Summary of the collection (codec, generation and size of the current snapshot).
     #[must_use]
     pub fn info(&self) -> CollectionInfo {
-        let snap = self.shared.published.load();
+        let (snap, size) = self.shared.published.load_with_size();
         CollectionInfo {
             id: self.shared.id,
             slug: self.shared.slug(),
             codec: snap.manifest().active().codec,
             generation: snap.generation(),
+            size,
         }
+    }
+
+    /// Size of the active generation (O(1), no I/O). Reflects every put and delete acknowledged
+    /// before this call; see [`CollectionSize`] for exactness.
+    #[must_use]
+    pub fn size(&self) -> CollectionSize {
+        self.shared.published.size()
     }
 
     /// Counters of the writer task.

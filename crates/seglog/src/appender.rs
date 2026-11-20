@@ -27,6 +27,10 @@ pub struct Appender {
     current: u32,
     /// Byte length of `current`.
     size: u64,
+    /// Sum of the lengths of segments `1..current` (every segment except the current one), as
+    /// stat'ed at `open` or left behind at each rollover. `sealed + size` is the total length of
+    /// the log as written by this appender.
+    sealed: u64,
     file: File,
     /// `file` has bytes not yet covered by a successful `sync_data`.
     dirty: bool,
@@ -72,6 +76,7 @@ impl Appender {
         threshold: NonZeroU64,
         current: u32,
         size: u64,
+        sealed: u64,
         file: File,
     ) -> Appender {
         Appender {
@@ -80,6 +85,7 @@ impl Appender {
             threshold,
             current,
             size,
+            sealed,
             file,
             dirty: false,
             retired_unsynced: Vec::new(),
@@ -125,7 +131,7 @@ impl Appender {
                 }
             })?;
         masstuffy_durable::sync_dir(&dir)?;
-        Ok(Appender::new(dir, naming, threshold, 1, 0, file))
+        Ok(Appender::new(dir, naming, threshold, 1, 0, 0, file))
     }
 
     /// Opens an existing log and continues appending at the end of its last segment.
@@ -141,7 +147,8 @@ impl Appender {
     ///
     /// # Errors
     ///
-    /// `NoSegments`; `Gap`; `BadSegmentName`; `NotAFile`; `Io{ReadDir|Stat|Open|Seek}`.
+    /// `NoSegments`; `Gap`; `BadSegmentName`; `NotAFile`; `Io{ReadDir|Stat|Open|Seek}` (`Stat` also
+    /// covers the length of each earlier segment).
     pub fn open(
         dir: impl Into<PathBuf>,
         naming: Naming,
@@ -171,13 +178,19 @@ impl Appender {
         if count != u64::from(max) {
             return Err(Error::Gap { dir, count, max });
         }
+        let mut sealed: u64 = 0;
+        for n in 1..max {
+            let earlier = segment_path(&dir, &naming, n);
+            let meta = std::fs::metadata(&earlier).map_err(io(Op::Stat, &earlier))?;
+            sealed = sealed.saturating_add(meta.len());
+        }
         let path = segment_path(&dir, &naming, max);
         let mut file = OpenOptions::new()
             .write(true)
             .open(&path)
             .map_err(io(Op::Open, &path))?;
         let size = file.seek(SeekFrom::End(0)).map_err(io(Op::Seek, &path))?;
-        let mut a = Appender::new(dir, naming, threshold, max, size, file);
+        let mut a = Appender::new(dir, naming, threshold, max, size, sealed, file);
         // A previous writer may have created this segment, or written to it, without ever
         // syncing: its directory entry and data are not known to be durable. The first `sync`
         // after `open` therefore fsyncs the last segment and the directory once.
@@ -252,6 +265,8 @@ impl Appender {
             if self.dirty {
                 self.retired_unsynced.push((self.current, old));
             }
+            // The old segment's length is final: the roll happens before the write.
+            self.sealed = self.sealed.saturating_add(self.size);
             self.current = segment;
             self.size = 0;
             self.dirty = false;
@@ -363,6 +378,15 @@ impl Appender {
     #[must_use]
     pub fn current_len(&self) -> u64 {
         self.size
+    }
+
+    /// Total length of the log as known to this appender: the lengths of the earlier segments
+    /// (stat'ed at `open` or left at each rollover) plus `current_len()`. Saturating. Orphan tails
+    /// (I3) are included. After a poisoning error it may be below the real file lengths (the
+    /// partial write is not counted): reopen.
+    #[must_use]
+    pub fn total_len(&self) -> u64 {
+        self.sealed.saturating_add(self.size)
     }
 
     /// True after an I/O error: every later `append_batch` and `sync` fails with `Poisoned`.
@@ -674,6 +698,64 @@ mod tests {
         assert_eq!(a.current_len(), 8);
         assert_eq!(a.append_batch(&["x"]).unwrap(), [loc(1, 8, 1)]);
         assert_eq!(&file_bytes(&d, "seg.1.1.warc")[..8], b"helloabc");
+    }
+
+    fn disk_total(d: &TestDir) -> u64 {
+        names(d.path())
+            .iter()
+            .map(|n| fs::metadata(d.path().join(n)).unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn total_len_after_create_is_zero() {
+        let d = TestDir::new();
+        assert_eq!(create(&d, 10).total_len(), 0);
+    }
+
+    #[test]
+    fn total_len_tracks_appends_and_rollover() {
+        let d = TestDir::new();
+        let mut a = create(&d, 100);
+        for n in [60usize, 60, 30] {
+            a.append_batch(&[vec![7u8; n]]).unwrap();
+            assert_eq!(a.total_len(), disk_total(&d));
+        }
+        assert_eq!(a.current_segment(), 2);
+        assert_eq!(a.total_len(), 150);
+    }
+
+    #[test]
+    fn total_len_after_open_includes_orphans() {
+        let d = TestDir::new();
+        let mut a = create(&d, 100);
+        a.append_batch(&[[1u8; 60]]).unwrap();
+        a.append_batch(&[[2u8; 60]]).unwrap();
+        a.append_batch(&[[3u8; 10]]).unwrap();
+        a.sync().unwrap();
+        drop(a);
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(d.path().join("seg.1.2.warc"))
+            .unwrap();
+        f.write_all(b"orphan").unwrap();
+        drop(f);
+        let a = Appender::open(d.path(), naming(), nz(100)).unwrap();
+        assert_eq!(a.current_segment(), 2);
+        assert_eq!(a.total_len(), 60 + 76);
+        assert_eq!(a.total_len(), disk_total(&d));
+    }
+
+    #[test]
+    fn total_len_not_advanced_on_failed_write() {
+        let d = TestDir::new();
+        let mut a = create(&d, 100);
+        a.append_batch(&["hello"]).unwrap();
+        let before = a.total_len();
+        a.fail_after = Some(3);
+        assert!(a.append_batch(&["abcdef"]).is_err());
+        assert!(a.is_poisoned());
+        assert_eq!(a.total_len(), before);
     }
 
     struct Mock {

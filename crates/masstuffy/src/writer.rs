@@ -23,6 +23,7 @@ use tracing::{debug, error, warn};
 use crate::indexer::{IndexFeed, IndexLink};
 use crate::rebuild::RebuildSlot;
 use crate::resolver::StoreResolver;
+use crate::types::CollectionSize;
 
 /// What a committed request gets back.
 #[derive(Debug)]
@@ -139,9 +140,18 @@ pub(crate) type FinishReply = Result<FinishDone, FinishFail>;
 /// The snapshots readers can use. Invariant: `retired`, when `Some`, is the snapshot of the
 /// generation that the last committed rebuild replaced, its files are still on disk, and
 /// `retired.generation() < current.generation()`.
+///
+/// `size` describes `current`'s generation, or the previous state of that generation until the
+/// writer task publishes again.
 struct Snaps {
     current: Arc<Snapshot>,
     retired: Option<Arc<Snapshot>>,
+    size: CollectionSize,
+}
+
+/// The size of the collection a writer owns (O(1): counters kept by the writer).
+pub(crate) fn size_of(w: &Writer) -> CollectionSize {
+    CollectionSize::from_counts(w.counts(), w.segment_bytes(), w.cdx_len())
 }
 
 /// What readers and `stats()` see of a collection. It holds no `Sender`, so the writer task
@@ -154,11 +164,12 @@ pub(crate) struct Published {
 }
 
 impl Published {
-    pub(crate) fn new(snapshot: Arc<Snapshot>, cdx_len: u64) -> Published {
+    pub(crate) fn new(snapshot: Arc<Snapshot>, cdx_len: u64, size: CollectionSize) -> Published {
         Published {
             snapshot: RwLock::new(Snaps {
                 current: snapshot,
                 retired: None,
+                size,
             }),
             commits: AtomicU64::new(0),
             records: AtomicU64::new(0),
@@ -167,7 +178,8 @@ impl Published {
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Snaps> {
-        // A poisoned lock is recovered: the guarded value is two `Arc`s, always consistent.
+        // A poisoned lock is recovered: the guarded value is two `Arc`s and a `Copy` struct, always
+        // consistent.
         self.snapshot.read().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -182,6 +194,22 @@ impl Published {
         Arc::clone(&self.read().current)
     }
 
+    /// The current snapshot and its size, read under one guard.
+    pub(crate) fn load_with_size(&self) -> (Arc<Snapshot>, CollectionSize) {
+        let g = self.read();
+        (Arc::clone(&g.current), g.size)
+    }
+
+    /// The size of the current generation (a copy under the read guard).
+    pub(crate) fn size(&self) -> CollectionSize {
+        self.read().size
+    }
+
+    /// Publishes a new size for the current generation.
+    pub(crate) fn set_size(&self, size: CollectionSize) {
+        self.write().size = size;
+    }
+
     /// The current snapshot and the fsynced CDX length, read together: the length is loaded while
     /// the snapshot read lock is held, and `switch` stores a new-generation snapshot and its length
     /// under the write lock.
@@ -194,19 +222,24 @@ impl Published {
     /// Replaces the current snapshot after a reopen. A different generation means the reopen
     /// crossed a switch (`Collection::open` deleted the other generation's files): the retired
     /// snapshot is dropped.
-    pub(crate) fn store(&self, s: Arc<Snapshot>) {
+    /// `None` keeps the current size; otherwise it is replaced under the same write guard.
+    pub(crate) fn store(&self, s: Arc<Snapshot>, size: Option<CollectionSize>) {
         let mut g = self.write();
         if s.generation() != g.current.generation() {
             g.retired = None;
         }
         g.current = s;
+        if let Some(size) = size {
+            g.size = size;
+        }
     }
 
-    /// A committed rebuild: `s` becomes current with its CDX length (both under one write guard),
-    /// the previous snapshot becomes the retired one.
-    pub(crate) fn switch(&self, s: Arc<Snapshot>, cdx_len: u64) {
+    /// A committed rebuild: `s` becomes current with its CDX length and its size (all under one
+    /// write guard), the previous snapshot becomes the retired one.
+    pub(crate) fn switch(&self, s: Arc<Snapshot>, cdx_len: u64, size: CollectionSize) {
         let mut g = self.write();
         self.cdx_len.store(cdx_len, Ordering::Release);
+        g.size = size;
         let old = std::mem::replace(&mut g.current, s);
         g.retired = Some(old);
     }
@@ -469,6 +502,14 @@ struct BlockingOutcome {
 }
 
 impl WriterTask {
+    /// Publishes the size of the writer's generation. Without a writer (lost) nothing is
+    /// published: the last size stays until the writer is back.
+    fn publish_size(&self) {
+        if let Some(w) = &self.writer {
+            self.published.set_size(size_of(w));
+        }
+    }
+
     pub(crate) fn new(p: WriterParams) -> WriterTask {
         let last_checkpoint_len = p.writer.cdx_len();
         WriterTask {
@@ -622,7 +663,7 @@ impl WriterTask {
         };
         self.writer = out.writer;
         if let Some(s) = out.new_snapshot {
-            self.published.store(s);
+            self.published.store(s, self.writer.as_ref().map(size_of));
             // A reopened writer starts a fresh checkpoint interval, as in `commit_group`.
             if let Some(w) = &self.writer {
                 self.last_checkpoint_len = w.cdx_len();
@@ -634,6 +675,8 @@ impl WriterTask {
                 self.link.wake(&self.feed);
             }
         }
+        // After the fsync, before the reply: read-your-writes.
+        self.publish_size();
         // A dropped receiver means the caller cancelled; the write stands.
         let _ = reply.send(out.result);
         self.maybe_checkpoint().await;
@@ -668,7 +711,7 @@ impl WriterTask {
         };
         self.writer = out.writer;
         if let Some(s) = out.publish {
-            self.published.store(s);
+            self.published.store(s, self.writer.as_ref().map(size_of));
         }
         if out.reopened
             && let Some(w) = &self.writer
@@ -679,6 +722,7 @@ impl WriterTask {
                 self.link.wake(&self.feed);
             }
         }
+        self.publish_size();
         let _ = reply.send(out.result);
     }
 
@@ -769,7 +813,7 @@ impl WriterTask {
 
         self.writer = outcome.writer;
         if let Some(s) = outcome.new_snapshot {
-            self.published.store(s);
+            self.published.store(s, self.writer.as_ref().map(size_of));
         }
         let mut replies: Vec<Option<Result<Committed, WriteError>>> =
             (0..n).map(|_| None).collect();
@@ -814,6 +858,8 @@ impl WriterTask {
                 self.link.wake(&self.feed);
             }
         }
+        // After the fsync, before the replies: read-your-writes.
+        self.publish_size();
         for ((reply, permit), r) in slots.into_iter().zip(replies) {
             let r = r
                 .unwrap_or(Err(WriteError::Internal("no result for request")))
@@ -862,14 +908,15 @@ impl WriterTask {
             Some(Publish::Switch(snapshot)) => {
                 if let Some(w) = &self.writer {
                     let len = w.cdx_len();
-                    self.published.switch(snapshot, len);
+                    self.published.switch(snapshot, len, size_of(w));
                     self.last_checkpoint_len = len;
                     // The indexer resolves the switch (resume at the staged checkpoint).
                     self.link.wake(&self.feed);
                 }
             }
             Some(Publish::Reopened(snapshot)) => {
-                self.published.store(snapshot);
+                self.published
+                    .store(snapshot, self.writer.as_ref().map(size_of));
                 if let Some(w) = &self.writer {
                     let len = w.cdx_len();
                     self.last_checkpoint_len = len;
@@ -1378,7 +1425,7 @@ mod tests {
         )
         .unwrap();
         let old = Arc::clone(c.snapshot());
-        let p = Published::new(Arc::clone(&old), c.writer().cdx_len());
+        let p = Published::new(Arc::clone(&old), c.writer().cdx_len(), size_of(c.writer()));
         let (_, gone) = c
             .rebuild(Codec::None, &opts, RebuildOptions::default(), &NoDicts)
             .unwrap();
@@ -1387,7 +1434,7 @@ mod tests {
         assert_eq!((old.generation(), new.generation()), (1, 2));
         assert_ne!(p.tail().1, new_len);
 
-        p.switch(Arc::clone(&new), new_len);
+        p.switch(Arc::clone(&new), new_len, size_of(c.writer()));
         let (cur, len) = p.tail();
         assert!(Arc::ptr_eq(&cur, &new));
         assert_eq!(len, new_len);
@@ -1400,13 +1447,13 @@ mod tests {
         assert!(Arc::ptr_eq(&p.load(), &new));
 
         // `store` of the same generation keeps the retired snapshot; another one drops it.
-        let p1 = Published::new(Arc::clone(&old), 0);
-        p1.switch(Arc::clone(&new), new_len);
-        p1.store(Arc::clone(&new));
+        let p1 = Published::new(Arc::clone(&old), 0, CollectionSize::default());
+        p1.switch(Arc::clone(&new), new_len, CollectionSize::default());
+        p1.store(Arc::clone(&new), None);
         assert!(p1.load_for(1).is_ok());
-        let p2 = Published::new(Arc::clone(&old), 0);
-        p2.switch(Arc::clone(&new), new_len);
-        p2.store(Arc::clone(&old));
+        let p2 = Published::new(Arc::clone(&old), 0, CollectionSize::default());
+        p2.switch(Arc::clone(&new), new_len, CollectionSize::default());
+        p2.store(Arc::clone(&old), None);
         assert_eq!(p2.load_for(2).err(), Some(1));
         drop(gone);
     }

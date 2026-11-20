@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+regex-automata.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 masstuffy-collection.workspace = true
 masstuffy-dictstore.workspace = true

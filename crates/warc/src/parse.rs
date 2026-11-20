@@ -190,6 +190,7 @@ pub struct RecordRef<'a> {
     raw: &'a [u8],
     header_block: &'a str,
     body: &'a [u8],
+    head_len: usize,
     warc_type: &'a str,
     record_id: Option<&'a str>,
     date: Option<WarcDate>,
@@ -253,6 +254,7 @@ impl<'a> RecordRef<'a> {
                 raw,
                 header_block: head.header_block,
                 body,
+                head_len: head.head_len,
                 warc_type: head.warc_type,
                 record_id: head.record_id,
                 date: head.date,
@@ -300,6 +302,14 @@ impl<'a> RecordRef<'a> {
         self.body
     }
 
+    /// The bytes before the body: the version line, every header line and the empty line
+    /// (byte-exact). `head().len() + body().len() + 4 == as_bytes().len()`.
+    pub fn head(&self) -> &'a [u8] {
+        // `head_len <= raw.len()` holds by construction in `parse_prefix` (the body starts at
+        // `head_len` inside `raw`); `get` keeps this panic-free anyway.
+        self.raw.get(..self.head_len).unwrap_or_default()
+    }
+
     /// The exact input bytes of the record (byte-faithful).
     pub fn as_bytes(&self) -> &'a [u8] {
         self.raw
@@ -332,6 +342,24 @@ mod tests {
 
     fn min() -> Vec<u8> {
         rec(MIN, MIN_BODY)
+    }
+
+    #[test]
+    fn head_body_reconstruct() {
+        let v10 = rec_v("WARC/1.0\r\n", MIN, MIN_BODY);
+        let empty = rec(
+            "WARC-Type: resource\r\nWARC-Record-ID: <urn:uuid:00000000-0000-4000-8000-000000000000>\r\nWARC-Date: 2026-11-12T10:00:00Z\r\nContent-Length: 0\r\n",
+            b"",
+        );
+        for raw in [min(), v10, empty] {
+            let r = parse(&raw).unwrap();
+            let mut joined = r.head().to_vec();
+            joined.extend_from_slice(r.body());
+            joined.extend_from_slice(b"\r\n\r\n");
+            assert_eq!(joined, raw);
+            assert!(r.head().starts_with(b"WARC/1."));
+            assert!(r.head().ends_with(b"\r\n\r\n"));
+        }
     }
 
     fn parse(b: &[u8]) -> Result<RecordRef<'_>, ParseError> {

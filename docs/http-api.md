@@ -11,6 +11,7 @@ written against this file.
   `collection`, jobs, index, dictionaries) are admin scope for a future auth layer.
 - All JSON is UTF-8 with `Content-Type: application/json`. Unknown JSON fields in requests are rejected. Unknown or
   duplicate query parameters are rejected (`invalid_param`).
+- `POST /v1/grep` streams `application/x-ndjson` (one JSON object per line) instead of one JSON document.
 - u64 values are JSON numbers (exact in Python; JavaScript clients beware of values above 2^53). Digests are 16
   lowercase hex characters (xxh3-64).
 - `HEAD` is accepted on every `GET` route (same work, no body).
@@ -76,6 +77,9 @@ Engine codes (code: details):
 | `shutting_down`, `index_unavailable`, `shutdown_failed` | 503 | |
 | `collection_unavailable` | 503 | `{"collection","outcome":"unknown"}` (the write may or may not be durable) |
 | `index_lagging` | 503 | `{"collections":[uuid…]}` |
+| `invalid_pattern` | 400 | `{"index"}` of the query (null when unknown) |
+| `too_many_greps` | 503 | `Retry-After: 1` |
+| `grep_lagged` | 503 | only inside the `end` line of a grep (the consumer did not keep up) |
 | `import_failed` | cause's | `{"report": ImportReport, "cause": {"kind","code","message"}}` |
 | `internal` | 500 | |
 
@@ -127,6 +131,7 @@ For a body cap or failure during an import, the import report is attached as `de
 | header read timeout | 30 s |
 | connections | 256 |
 | concurrent requests | 256, at most 384 (held while the response streams; `/healthz` is exempt). Each in-flight upload parks one thread of the runtime's blocking pool (512 threads) for its WARC parse or import producer, so the cap keeps room for the engine's own blocking work |
+| grep | 64 queries, 4096 bytes per pattern, 16 collections, `max_hits` default 10 000 / max 1 000 000, 32 concurrent greps; streamed without a request timeout |
 | jobs | 8 running, 256 retained, `wait` up to 60 s |
 
 ## 5. Endpoints
@@ -137,10 +142,10 @@ Success statuses are in the headings. Every error follows section 3.
 `{"status":"ok"}`; 503 `shutting_down` once the repository shuts down. It is exempt from the concurrent-request limit and the request timeout, so it answers under load.
 
 ### `GET /v1/status` 200
-`{"version","api":1,"repository","raw_check":"full"|"header","max_record_bytes","collections","dictionaries","jobs_running","limits":{max_put_body_bytes,max_put_records,max_import_body_bytes (null if unbounded),max_json_body_bytes,max_export_page_bytes,request_timeout_ms,body_idle_timeout_ms,max_concurrent_requests},"open_report":null|{loaded,skipped,trashed,unknown_count,tmp_removed,trash_removed,index_recreated}}`.
+`{"version","api":1,"repository","raw_check":"full"|"header","max_record_bytes","collections","dictionaries","jobs_running","limits":{max_put_body_bytes,max_put_records,max_import_body_bytes (null if unbounded),max_json_body_bytes,max_export_page_bytes,request_timeout_ms,body_idle_timeout_ms,max_concurrent_requests,"grep":{max_queries,max_pattern_bytes,max_collections,max_hits,default_max_hits,max_concurrent}},"open_report":null|{loaded,skipped,trashed,unknown_count,tmp_removed,trash_removed,index_recreated}}`.
 
 ### Collections
-Collection object: `{"id","slug","generation","codec","raw_rules"}` (+ `"stats":{"commits","records","cdx_len"}` on single GET, create and rename).
+Collection object: `{"id","slug","generation","codec","raw_rules","size"}` (+ `"stats":{"commits","records","cdx_len"}` on single GET, create and rename). `size` is on every collection object, the list included; see "Collection size" below.
 
 - `GET /v1/collections` 200: `{"collections":[…]}` sorted by slug.
 - `POST /v1/collections` 201, `Location: /v1/collections/{slug}`. Body `{"slug", "codec"?}` (default `{"algo":"none"}`). Errors: `slug_taken` 409, `invalid_slug`, `invalid_codec`, `dict_not_found` 404.
@@ -151,6 +156,25 @@ Collection object: `{"id","slug","generation","codec","raw_rules"}` (+ `"stats":
 ```
 curl -X POST localhost:8470/v1/collections -d '{"slug":"web","codec":{"algo":"zstd","dict_id":32770,"level":3}}'
 ```
+
+#### Collection size
+`size` is `{"records","records_total","tombstones","stored_bytes","tombstoned_bytes","segment_bytes","cdx_bytes"}`, all unsigned integers. Every value is O(1) to read (counters kept in memory by the collection's writer, no scan and no I/O), so it is cheap in the list too. All measures describe the **active generation** as of the last commit or delete acknowledged: the fsynced CDX prefix plus the segment files of that generation. A put or delete that has returned is already included.
+
+| field | definition | exactness |
+|---|---|---|
+| `records_total` | Number of `Add` lines in the CDX, minus 1: the generation's own warcinfo (segment 1, offset 0) is excluded. Deleted records still count until the next rebuild. Warcinfo records of earlier generations that a rebuild copied are ordinary records and are counted. | exact |
+| `tombstones` | Number of `T` lines in the CDX (duplicates included). 0 right after a rebuild. | exact |
+| `records` | `records_total - tombstones` (saturating): live records. Equals the number of entries a full `scan` returns, minus 1. | exact only if every `T` line names a distinct record. It is lower than the truth when the same record was deleted more than once (a re-delete is accepted and writes another `T` line) or when a delete used a crafted locator that names no record start. A rebuild makes it exact again. |
+| `stored_bytes` | Sum of `raw_size` over the `Add` lines: stored bytes (compressed in a zstd collection), warcinfo and deleted records included. | exact |
+| `tombstoned_bytes` | Sum of `raw_size` over the `T` lines: about what a rebuild would reclaim. | same caveat as `records` (overcounts on duplicates) |
+| `segment_bytes` | Sum of the lengths of the active generation's segment files. At least `stored_bytes`; the difference is orphan bytes of unacknowledged writes. | exact for the files as written by this process (stat at open, then tracked) |
+| `cdx_bytes` | Length of the active CDX file: the fsynced length, header included. | exact; same value as `stats.cdx_len`, but the two are published separately and may differ for an instant |
+
+Notes:
+- `stats.records` counts the records acknowledged since the server started. It is not the collection size: use `size.records`.
+- Not counted: dictionaries (they live in a shared store), the uncompressed size (it is not known without reading the records), the manifest and checkpoint files, and the files of a rebuild in progress or of a retired generation not yet removed.
+- During a rebuild `size` keeps describing the old generation, including the puts still being accepted (deletes wait for the rebuild to end). It switches to the new generation at the same instant as `generation`.
+- If the collection's writer is lost after a failed reopen, `size` stays at its last value until the writer is back.
 
 ### Records
 - `POST /v1/collections/{slug}/records` 201. `Content-Type: application/warc`, body = concatenated uncompressed WARC records.
@@ -187,6 +211,77 @@ Parameters: `host` (required); `subdomains` (default false: exact host vs host a
 
 ### `GET /v1/collections/{slug}/export?cursor=&max_records=&max_bytes=&on_unreadable=fail|skip`
 One page per request: `200 application/warc`, the decoded records in index order with nothing between them (the concatenation of pages is a valid WARC stream). Headers: `Masstuffy-Record-Count`, `Masstuffy-Unreadable-Count` (skip mode), `Masstuffy-Next-Cursor` (when the page was non-empty, even if every item was skipped). A page ends once `max_bytes` (1..64 MiB, default 8 MiB) is reached and holds at least one record. The end is an empty body without `Masstuffy-Next-Cursor` and without `Masstuffy-Record-Count`. `on_unreadable=fail` (default): the first unreadable record gives 500 `unreadable_record`; `skip` drops and counts it.
+
+### `POST /v1/grep`
+Searches one or more collections for one or more queries and streams the matching records as NDJSON.
+
+Request (`Content-Type: application/json`):
+```json
+{"collections":["slug",…], "queries":[{"pattern":"…","regex":false,"case_insensitive":false},…],
+ "scope":"all", "max_hits":10000, "events":["hit","unreadable","progress"]}
+```
+- `collections`: 1..16 distinct slugs. `queries`: 1..64; `pattern` is 1..4096 bytes. `regex` (default false) makes the
+  pattern a regex, otherwise a literal (its UTF-8 bytes). `case_insensitive` (default false) folds ASCII letters only.
+- `scope`: `payload`, `headers` or `all` (default). `all` searches the whole record bytes. `headers` searches the WARC
+  head and, for HTTP records, the HTTP head. `payload` searches the body, or for HTTP records the bytes after the first
+  CRLFCRLF of the HTTP message. A record is an HTTP record when its WARC `Content-Type` (before `;`, trimmed, ASCII
+  case-insensitive) is `application/http`; a message without CRLFCRLF is all head. A match never spans two parts.
+  Bytes are matched as stored: no chunked or `Content-Encoding` decoding.
+- `max_hits` (default 10 000, max 1 000 000): the grep stops after that many hits (`truncated`). It applies whatever
+  `events` selects, so a count-only grep is truncated too: set it to the maximum to count everything.
+- `events`: which line types are sent, from `hit`, `unreadable`, `progress`, `end`. Default `["hit","unreadable","progress"]`.
+  `end` is accepted and has no effect: the `end` line is always sent. `[]` is count mode (only the `end` line).
+  Duplicates are allowed. An unknown value gives 400 `invalid_json`. The counters of the `end` line and `max_hits`
+  apply whatever the filter.
+
+Semantics:
+- Queries are OR'ed; each hit lists the indices of every query that matched.
+- Regexes run in byte mode with guaranteed linear time: Unicode is off, `.` matches any byte except `\n`, classes are
+  ASCII, and non-ASCII characters in a regex are rejected with `invalid_pattern` (write `\xHH`). Literals accept any UTF-8.
+- Coverage: a grep covers exactly the live records of the CDX prefix `[header, T)`, `T` being the fsynced CDX length when
+  the grep starts, that is every record acknowledged before the call. Later appends are not returned. Records deleted
+  before the call are not returned; records deleted during the grep may be.
+- The scan of a collection is shared by all greps on it and is circular: a grep that starts while a scan runs begins at
+  the scan's position and wraps. Within a collection the order of hits is therefore **not** CDX order for a late joiner.
+  Collections interleave.
+- A rebuild during the grep fails that collection's part with `stale_locator` (in its `end` entry); other collections
+  continue. Restart the grep.
+- A slow reader never stalls the shared scan: if the grep's buffer fills it is detached and that collection ends with
+  `grep_lagged`. Read the response promptly.
+
+Errors before the stream starts use the normal JSON error body: 404 `unknown_collection`, 400 `invalid_json`,
+`invalid_query` (0 or more than 64 queries, empty or too long pattern, no or more than 16 or duplicate collections,
+`max_hits` out of range), `invalid_pattern` (`details.index`), 415 `unsupported_media_type`, 503 `too_many_greps`
+(`Retry-After: 1`), 503 `shutting_down`.
+
+Response: `200 application/x-ndjson`, `Cache-Control: no-store`, one object per line, each ending in `\n`. `slug` is the
+slug as written in the request.
+- `{"type":"hit","slug":S,"queries":[i…],"record":Locator}`: `Locator` is the object of scan; fetch the record with its
+  `locator`.
+- `{"type":"unreadable","slug":S,"record":Locator,"error":{kind,code,message,details?}}`: a record the grep needed could
+  not be read or decoded. The grep continues.
+- `{"type":"progress","slug":S,"records":n,"bytes":n,"cdx_done":n,"cdx_total":n}`: `cdx_done / cdx_total` is the
+  completion fraction over the grep's CDX range `[first, T)`. The first progress line of each collection is
+  `cdx_done: 0` (it arrives with the first batch); then one line every 16 384 index lines. The fraction is proportional
+  to index lines (tombstones and records that did not match included), not to bytes of data. There is no final progress
+  line: the `end` line carries the final values.
+- Always last on a normal end:
+  `{"type":"end","hits":n,"truncated":bool,"collections":[{"slug":S,"id":uuid,"status":"complete"|"truncated"|"failed","records","bytes","cdx_done","cdx_total","hits","unreadable","error":{kind,code,message,details?}|null}]}`
+  in the order of the request. `status` is `failed` iff `error` is set, else `truncated` iff the collection was not
+  fully examined (`max_hits` reached), else `complete`. `status == "complete"` implies `cdx_done == cdx_total`, but not the
+  reverse (a line is counted before its record is matched, so a `truncated` or `failed` collection can also end at
+  done == total): judge completeness by `status`, never by the fraction. Both are 0 for a collection that failed
+  before it started. `hits` counts matches, including any that were not delivered because
+  the grep lagged.
+
+A response that ends without an `end` line was cut (server stop, drain timeout, connection reset): treat the grep as
+failed.
+
+```sh
+curl -sN -X POST http://127.0.0.1:8470/v1/grep -H 'Content-Type: application/json' -d \
+  '{"collections":["web"],"queries":[{"pattern":"needle"},{"pattern":"id=[0-9]+","regex":true}],
+    "scope":"payload","max_hits":100,"events":["hit","progress"]}'
+```
 
 ### Admin and jobs
 - `POST …/rebuild` 202 + `Location: /v1/jobs/{id}`: body `{"codec", "recompress"?, "on_unreadable"?: "fail"|"skip", "workers"?, "max_inflight_bytes"?}`. Result: `{rounds,index_switched,old_files_removed,from_generation,generation,codec,copied,raw_copied,dropped_tombstoned,tombstone_lines,skipped,skipped_first,bytes_read,bytes_written}`.
@@ -226,6 +321,9 @@ One page per request: `200 application/warc`, the decoded records in index order
   most recently committed copy).
 - A disconnect during the upload writes nothing for `…/records` (the parse fails before the put). For import, every batch
   acknowledged before the disconnect stays committed (a prefix); find the resume point with a by-id lookup.
+- Grep streams without a request timeout (the timeout bounds only the response head). Liveness is signalled by
+  `progress` lines (every 16 384 index lines). Dropping the connection detaches the grep and frees its slot; a graceful
+  drain cuts a running grep at `drain_timeout` without an `end` line.
 - `timeout` on a mutation: the outcome is unknown, check state.
 - Export and scan: resume with the cursor; `stale_locator` means restart.
 - Jobs survive the client and end at server shutdown (cancelled rebuilds report `rebuild_aborted` or `shutting_down`).

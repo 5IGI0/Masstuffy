@@ -246,6 +246,20 @@ pub enum Error {
     /// The secondary index failed to answer.
     #[error("secondary index query failed: {0}")]
     IndexQuery(#[source] masstuffy_index::Error),
+    /// A grep pattern does not compile (index of the query when known).
+    #[error("invalid grep pattern{}: {message}", index.map(|i| format!(" {i}")).unwrap_or_default())]
+    InvalidPattern {
+        /// Index of the offending query, when known.
+        index: Option<usize>,
+        /// Why the pattern was rejected.
+        message: String,
+    },
+    /// `MAX_CONCURRENT_GREPS` greps are running.
+    #[error("too many greps running")]
+    TooManyGreps,
+    /// The grep did not read its results fast enough and was detached.
+    #[error("grep detached: the consumer did not keep up")]
+    GrepLagged,
     /// The raw-import envelope is malformed or unreadable.
     #[error("raw import envelope: {0}")]
     Envelope(#[source] masstuffy_cdx::EnvelopeError),
@@ -343,6 +357,7 @@ impl Error {
             | Error::InvalidSlug { .. }
             | Error::Train(_)
             | Error::InvalidOptions(_)
+            | Error::InvalidPattern { .. }
             | Error::Build { .. }
             | Error::Tombstone { .. }
             | Error::Prepare { .. } => ErrorKind::Invalid,
@@ -361,6 +376,8 @@ impl Error {
             | Error::ShutdownFailed(_)
             | Error::IndexLagging { .. }
             | Error::IndexUnavailable
+            | Error::TooManyGreps
+            | Error::GrepLagged
             | Error::Internal(_) => ErrorKind::Unavailable,
         }
     }

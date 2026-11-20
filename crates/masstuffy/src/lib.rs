@@ -26,7 +26,7 @@
 //! `gate`, then `index_rebuild`, then a `rebuild_sem` permit (rebuild units only), then
 //! per-collection `admin` mutexes (ascending uuid), then the per-collection `admission` lock,
 //! then `create_lock` (it moved after `admin` in M21: rename holds both), then the registry, then
-//! the leaves: the slug lock (only under the registry write lock), the per-collection rebuild
+//! the leaves: `Shared::grep` (the grep scanner slot; it may take the `Published::snapshot` read lock inside and nothing else), `GrepShared::outcomes`, the slug lock (only under the registry write lock), the per-collection rebuild
 //! slot mutex (held during blocking I/O by design, nothing else is taken meanwhile), snapshot
 //! and pool mutexes, the indexer hub, the index handle and the indexer task handle. `train_sem`
 //! is taken with no other lock held. No std lock is held across an `.await`; the writer task
@@ -61,6 +61,20 @@
 //! is consistent with every put acknowledged before the scan (re)opens.
 //! [`CollectionHandle::put_raw_envelope`] bulk-imports an envelope stream.
 //!
+//! # Grep
+//!
+//! [`Repository::grep`] searches one or more collections for literal or regex queries (OR'ed,
+//! each hit names the queries that matched) over a scope (payload, headers or all). Per collection
+//! one sequential pass over the CDX runs at a time and is shared by every grep attached to it: a
+//! late joiner attaches at the scan's current position and the scan wraps around until it has
+//! seen everything. A grep covers exactly the live records acknowledged before the call (the CDX
+//! prefix `[header, T)`); later appends are never returned. A rebuild during a grep fails that
+//! collection's part with `StaleLocator`. Progress is measured in CDX bytes of the grep's range
+//! `[first, T)` (exact total at positioning, `done == total` iff complete); the events are
+//! selectable with `GrepEvents` (generated only if wanted; counters and `max_hits` always apply).
+//! A consumer that stops reading is detached with
+//! `GrepLagged` rather than stalling the shared scan. Limits are the `MAX_GREP_*` constants.
+//!
 //! # Dictionary training and rebuild
 //!
 //! [`CollectionHandle::train_dictionary`] trains a zstd dictionary from a deterministic sample of
@@ -82,6 +96,11 @@ mod collection;
 mod config;
 mod dicts;
 mod error;
+mod grep;
+mod grep_match;
+mod grep_scan;
+#[cfg(test)]
+mod grep_tests;
 mod import;
 mod index;
 #[cfg(test)]
@@ -100,6 +119,8 @@ mod repository;
 mod resolver;
 mod scan;
 #[cfg(test)]
+mod size_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod testutil;
@@ -111,6 +132,11 @@ pub use collection::CollectionHandle;
 pub use config::{Config, ConfigError, MAX_CONFIG_BYTES, RAW_IMPORT_CHECK_ENV};
 pub use dicts::DictionaryInfo;
 pub use error::{Error, ErrorKind};
+pub use grep::{
+    CollectionGrep, DEFAULT_GREP_MAX_HITS, Grep, GrepEvent, GrepEvents, GrepOptions, GrepQuery,
+    GrepReport, GrepScope, GrepStats, MAX_CONCURRENT_GREPS, MAX_GREP_COLLECTIONS, MAX_GREP_HITS,
+    MAX_GREP_PATTERN_BYTES, MAX_GREP_QUERIES, QuerySet,
+};
 pub use import::{
     ImportOptions, ImportReport, MAX_IMPORT_BATCH_RECORDS, MAX_REPORTED_REJECTIONS, OnInvalid,
     Rejection,
@@ -132,7 +158,7 @@ pub use repository::Repository;
 pub use scan::{MAX_SCAN_PAGE, Scan, ScanCursor, ScanItem, ScanOptions, ScanPage};
 pub use train::{TrainOptions, TrainReport};
 pub use types::{
-    CollectionInfo, CollectionRef, DeletedCollection, LoadedCollection, Located,
+    CollectionInfo, CollectionRef, CollectionSize, DeletedCollection, LoadedCollection, Located,
     MAX_DELETE_TARGETS, MAX_REPORTED_UNKNOWN, OpenReport, RawItem, RawRecord, SkipReason,
     SkippedCollection, WriterStats,
 };

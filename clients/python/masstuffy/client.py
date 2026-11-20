@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import gzip
 import io
+import json
 import math
 import os
 import ssl
@@ -22,20 +23,23 @@ from ._framing import RawRecord, iter_raw_records, open_warc_source
 from ._transport import Response, StreamingResponse, Transport, seg
 from .compression import (DictionaryCache, RecordCompressor, _xxhash, _zstd, have_xxhash, open_decompressed)
 from .envelope import ENVELOPE_HEADER, MAX_LINE, meta_from_head, v1_line
-from .errors import (ApiError, ExportInterruptedError, JobFailedError, JobTimeoutError, MasstuffyError,
+from .errors import (ApiError, ExportInterruptedError, GrepIncompleteError, JobFailedError, JobTimeoutError, MasstuffyError,
                      MissingDependencyError, NotFoundError, PartialPutError, ProtocolError, RecordTooLargeError,
                      ServerError, TransportError, UnavailableError, error_from_object)
-from .models import (Codec, CollectionInfo, DeletedCollection, DictionaryInfo, ExportReport, ImportReport,
-                     Locator, LocatorLike, Page, PutFileReport, ServerStatus, locator_token)
+from .models import (Codec, CollectionInfo, DeletedCollection, DictionaryInfo, ExportReport, GrepHit,
+                     GrepProgress, GrepQuery, GrepReport, GrepUnreadable, ImportReport, Locator, LocatorLike, Page, PutFileReport, ServerStatus, locator_token)
 from .records import RawBody, Record, RecordSpec, _put_body, _Prepared, _prepare_spec
 
-__all__ = ["Client", "Collection", "Job"]
+__all__ = ["Client", "Collection", "Job", "GrepStream"]
 
 CHUNK = 65536
 SPOOL_THRESHOLD = 4 << 20
 MAX_DELETE = 65536
 DEFAULT_MAX_RECORD = 1 << 30
 _UNKNOWN_OUTCOME_CODES = frozenset({"timeout", "collection_unavailable"})
+GREP_LINE_MAX = 2 << 20
+GREP_SCOPES = frozenset({"payload", "headers", "all"})
+GREP_EVENTS = frozenset({"hit", "unreadable", "progress", "end"})
 
 
 def _media(resp: Any) -> str:
@@ -77,6 +81,57 @@ class Client:
         r = self._t.request(method, path, **kw)
         assert isinstance(r, Response)
         return r.json()
+
+    # -- grep
+
+    def grep(self, collections: Union[str, Sequence[str]],
+             queries: Union[str, GrepQuery, Sequence[Union[str, GrepQuery]]], *, scope: str = "all",
+             max_hits: Optional[int] = None, events: Sequence[str] = ("hit", "unreadable"), strict: bool = True,
+             read_timeout: Optional[float] = 300.0) -> "GrepStream":
+        """Search collections for queries (``POST /v1/grep``) and stream the matching records.
+
+        ``collections`` is a slug or a sequence of slugs. ``queries`` is a string (a literal), a ``GrepQuery`` or a
+        sequence of those; they are OR'ed and each hit lists the indices of the queries that matched. ``scope`` is
+        ``"payload"``, ``"headers"`` or ``"all"``. ``events`` selects what the iterator yields, from ``"hit"``,
+        ``"unreadable"`` and ``"progress"`` (``"end"`` is accepted and ignored: ``.report`` is always set). The
+        request always asks for progress lines, which keep the connection alive and feed ``GrepStream.progress``.
+        ``read_timeout`` is the socket timeout between two lines (None: the client's default).
+
+        Returns a ``GrepStream`` (an iterator and a context manager; use ``with``). ValueError for a bad ``scope``
+        or ``events`` value, before any request. With ``strict`` (default) the stream raises ``GrepIncompleteError``
+        after its last item when a collection failed; truncation (``max_hits``) is never an error.
+        """
+        if scope not in GREP_SCOPES:
+            raise ValueError("scope must be 'payload', 'headers' or 'all'")
+        evs = frozenset((events,) if isinstance(events, str) else events)
+        bad = evs - GREP_EVENTS
+        if bad:
+            raise ValueError("events must be among 'hit', 'unreadable', 'progress', 'end', not %r" % sorted(bad))
+        cols = [collections] if isinstance(collections, str) else list(collections)
+        if isinstance(queries, (str, GrepQuery)):
+            queries = [queries]
+        qs = []
+        for q in queries:
+            if isinstance(q, str):
+                q = GrepQuery(q)
+            elif not isinstance(q, GrepQuery):
+                raise TypeError("a query must be a str or a GrepQuery, not %s" % type(q).__name__)
+            qs.append(q.to_json())
+        body: Dict[str, Any] = {"collections": cols, "queries": qs, "scope": scope,
+                                "events": sorted((evs - {"end"}) | {"progress"})}
+        if max_hits is not None:
+            body["max_hits"] = max_hits
+        resp = self._t.request("POST", "/v1/grep", json_body=body, stream=True, idempotent=True,
+                               timeout=read_timeout)
+        assert isinstance(resp, StreamingResponse)
+        try:
+            ctype = _media(resp)
+            if ctype != "application/x-ndjson":
+                raise ProtocolError("expected an NDJSON response, got Content-Type %r" % ctype)
+        except BaseException:
+            resp.close()
+            raise
+        return GrepStream(resp, evs, strict)
 
     # -- health / status
 
@@ -308,6 +363,12 @@ class Collection:
 
     def _json(self, method: str, suffix: str, **kw: Any) -> Any:
         return self.client._json(method, self._base + suffix, **kw)
+
+    # -- grep
+
+    def grep(self, queries: Union[str, GrepQuery, Sequence[Union[str, GrepQuery]]], **kw: Any) -> "GrepStream":
+        """``Client.grep`` on this collection only (same keyword arguments)."""
+        return self.client.grep([self.slug], queries, **kw)
 
     # -- info / admin
 
@@ -1084,6 +1145,99 @@ def _envelope_stream(recs: Iterable[Any], comp: RecordCompressor, state: _State,
             state.size += content
         state.count += 1
         ordinal += 1
+
+
+class GrepStream:
+    """The result of a grep: an iterator of ``GrepHit`` / ``GrepUnreadable`` (and ``GrepProgress`` when asked),
+    and a context manager that owns the connection.
+
+    ``.report`` is the ``GrepReport`` once the ``end`` line arrived (None before). ``.progress`` maps a slug to its
+    latest ``GrepProgress`` seen so far (tracked even when progress is not yielded).
+
+    Judge completeness from ``report.collections[i].status`` only; ``GrepProgress.fraction`` is a progress
+    indicator, never a completeness test. A response that ends without an ``end`` line raises ``ProtocolError``.
+    One thread per stream. ``close()`` drops the connection, which detaches the grep on the server.
+    """
+
+    def __init__(self, resp: StreamingResponse, events: Any, strict: bool) -> None:
+        self._resp: Optional[StreamingResponse] = resp
+        self._events = frozenset(events)
+        self._strict = strict
+        self._done = False
+        self.report: Optional[GrepReport] = None
+        self.progress: Dict[str, GrepProgress] = {}
+
+    def __iter__(self) -> "GrepStream":
+        return self
+
+    def __enter__(self) -> "GrepStream":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the connection (it is not reused). Safe to call more than once."""
+        resp, self._resp = self._resp, None
+        if resp is not None:
+            resp.close()
+
+    def _line(self) -> Dict[str, Any]:
+        resp = self._resp
+        if resp is None:
+            raise StopIteration
+        raw = resp.readline(GREP_LINE_MAX)
+        if not raw:
+            raise ProtocolError("grep stream ended without an end line")
+        if not raw.endswith(b"\n"):
+            raise ProtocolError("grep stream line too long or cut (no newline)")
+        try:
+            obj = json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as e:
+            raise ProtocolError("invalid JSON line in grep stream: %s" % e) from e
+        if not isinstance(obj, dict) or not isinstance(obj.get("type"), str):
+            raise ProtocolError("grep stream line without a type")
+        return obj
+
+    def __next__(self) -> Union[GrepHit, GrepUnreadable, GrepProgress]:
+        if self._done:
+            raise StopIteration
+        try:
+            while True:
+                try:
+                    obj = self._line()
+                except StopIteration:
+                    self._done = True
+                    raise
+                kind = obj["type"]
+                if kind == "hit":
+                    hit = GrepHit.from_json(obj)
+                    if "hit" in self._events:
+                        return hit
+                elif kind == "unreadable":
+                    unreadable = GrepUnreadable.from_json(obj)
+                    if "unreadable" in self._events:
+                        return unreadable
+                elif kind == "progress":
+                    prog = GrepProgress.from_json(obj)
+                    self.progress[prog.slug] = prog
+                    if "progress" in self._events:
+                        return prog
+                elif kind == "end":
+                    self.report = GrepReport.from_json(obj)
+                    self._done = True
+                    self.close()
+                    if self._strict and any(c.status == "failed" for c in self.report.collections):
+                        raise GrepIncompleteError(self.report)
+                    raise StopIteration
+                else:
+                    raise ProtocolError("unknown grep line type %r" % kind)
+        except StopIteration:
+            raise
+        except BaseException:
+            self._done = True
+            self.close()
+            raise
 
 
 class Job:

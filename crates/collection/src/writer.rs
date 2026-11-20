@@ -10,6 +10,7 @@ use masstuffy_seglog::{Appender, Locator};
 
 use crate::checkpoint::{self, MAX_CHECKPOINT_SEGMENTS};
 use crate::context::GenContext;
+use crate::counts::CdxCounts;
 use crate::error::{CommitError, Error};
 use crate::prepare::Prepared;
 use crate::tombstone::PreparedTombstone;
@@ -31,6 +32,9 @@ pub(crate) struct ScanState {
     pub(crate) entries: u64,
     /// Per segment `i + 1`: maximum end of the lines pointing to it.
     pub(crate) seg_ends: Vec<u64>,
+    /// Counts of the same lines as `entries`. Updated independently of `valid`: it never stops
+    /// counting, even when the state can no longer be checkpointed.
+    pub(crate) counts: CdxCounts,
     /// False once the state cannot describe the file (overflow, repair cut, too many segments).
     pub(crate) valid: bool,
 }
@@ -195,6 +199,19 @@ impl Writer {
         self.synced_len
     }
 
+    /// Exact counts of the CDX lines made durable by successful commits and tombstones (and the
+    /// recovered prefix): the lines of `[header, cdx_len())`.
+    #[must_use]
+    pub fn counts(&self) -> CdxCounts {
+        self.scan.counts
+    }
+
+    /// Total length of this generation's segment files (`Appender::total_len`).
+    #[must_use]
+    pub fn segment_bytes(&self) -> u64 {
+        self.appender.total_len()
+    }
+
     /// After a generation switch the old writer must never commit again.
     pub(crate) fn retire(&mut self) {
         self.poisoned = true;
@@ -239,6 +256,7 @@ impl Writer {
         if !self.scan.valid
             || self.scan.seg_ends.len() > MAX_CHECKPOINT_SEGMENTS
             || self.scan.cdx_len == self.last_checkpoint
+            || self.scan.counts.lines() != Some(self.scan.entries)
         {
             return Ok(false);
         }
@@ -251,6 +269,7 @@ impl Writer {
             self.ctx.generation(),
             self.scan.cdx_len,
             self.scan.entries,
+            &self.scan.counts,
             &self.scan.seg_ends,
         )? {
             return Ok(false);
@@ -366,6 +385,7 @@ impl Writer {
             });
         }
         self.advance_synced(written)?;
+        self.scan.counts.add_batch(&locs);
         if let (Some(first), Some(last)) = (locs.first(), locs.last()) {
             // All items share one segment (I9).
             self.scan
@@ -497,6 +517,9 @@ impl Writer {
             });
         }
         self.advance_synced(written)?;
+        for t in items {
+            self.scan.counts.count(Kind::Tombstone, t.entry.raw_size);
+        }
         if self.scan.add_lines(written, items.len()) {
             for t in items {
                 // `prepare_tombstone` checked `end <= segment length` and segments never shrink.

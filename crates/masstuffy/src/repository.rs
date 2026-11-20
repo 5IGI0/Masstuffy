@@ -28,7 +28,7 @@ use crate::types::{
     CollectionInfo, LoadedCollection, Located, MAX_REPORTED_UNKNOWN, OpenReport, RawRecord,
     SkipReason, SkippedCollection,
 };
-use crate::writer::{Msg, Published, WriterParams, WriterTask};
+use crate::writer::{Msg, Published, WriterParams, WriterTask, size_of};
 
 /// State shared by the repository and every collection handle. It never points to a [`Shared`].
 pub(crate) struct Core {
@@ -45,6 +45,8 @@ pub(crate) struct Core {
     pub(crate) closed: AtomicBool,
     pub(crate) prepare_sem: Arc<Semaphore>,
     pub(crate) read_sem: Arc<Semaphore>,
+    /// One permit per running grep (`MAX_CONCURRENT_GREPS`); never closed.
+    pub(crate) grep_sem: Arc<Semaphore>,
     /// One permit is one KiB of input admitted but not yet committed.
     pub(crate) inflight_sem: Arc<Semaphore>,
     pub(crate) read_ctxs: CtxPool,
@@ -315,6 +317,7 @@ impl Repository {
             closed: AtomicBool::new(false),
             prepare_sem: Arc::new(Semaphore::new(prepare_permits)),
             read_sem: Arc::new(Semaphore::new(read_permits)),
+            grep_sem: Arc::new(Semaphore::new(crate::grep::MAX_CONCURRENT_GREPS)),
             inflight_sem: Arc::new(Semaphore::new(inflight)),
             read_ctxs: CtxPool::new(read_permits),
             closing: tokio::sync::watch::channel(false).0,
@@ -408,10 +411,13 @@ impl Repository {
             let shared = spawn_writer(&core, id, *coll, lock);
             registry.by_slug.insert(shared.slug(), id);
             feeds.push(Arc::clone(&shared.feed));
+            let size = shared.published.size();
             info!(
                 collection = %id,
                 slug = %shared.slug(),
                 entries = rec.entries,
+                records = size.records,
+                stored_bytes = size.stored_bytes,
                 scan = ?rec.scan,
                 "collection loaded"
             );
@@ -778,6 +784,15 @@ async fn shutdown_body(inner: Arc<Inner>) -> Result<(), Error> {
             failure = Some(Error::Join(e));
         }
     }
+    // Grep scanners see `closing` at their next iteration and fail their subscriptions with
+    // `ShuttingDown`: the wait is bounded by one batch. They take neither `gate` nor `admin`.
+    for s in &shareds {
+        for h in s.grep.close() {
+            if let Err(e) = h.await {
+                failure.get_or_insert(Error::Join(e));
+            }
+        }
+    }
     // Units still waiting for a permit get `ShuttingDown`.
     core.rebuild_sem.close();
     core.train_sem.close();
@@ -949,7 +964,7 @@ fn spawn_writer(
     let slug: Arc<str> = Arc::from(coll.manifest().slug());
     let split = coll.manifest().split_threshold().get();
     let (writer, snapshot) = coll.into_parts();
-    let published = Arc::new(Published::new(snapshot, writer.cdx_len()));
+    let published = Arc::new(Published::new(snapshot, writer.cdx_len(), size_of(&writer)));
     let feed = Arc::new(IndexFeed::new(id, Arc::clone(&published), writer.cdx_len()));
     let queue = usize::try_from(core.config.writer_queue)
         .unwrap_or(1)
@@ -995,6 +1010,7 @@ fn spawn_writer(
         admission: tokio::sync::RwLock::new(()),
         deleted: AtomicBool::new(false),
         rebuild,
+        grep: crate::grep_scan::GrepSlot::new(),
         task: Mutex::new(Some(handle)),
         #[cfg(test)]
         hooks,

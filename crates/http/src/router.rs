@@ -73,6 +73,7 @@ pub fn router(
             "/v1/collections/{slug}/records/delete-by-id",
             post(records::delete_by_id),
         )
+        .route("/v1/grep", post(query::grep))
         .route("/v1/lookup/by-id", get(query::by_id))
         .route("/v1/collections/{slug}/lookup/by-url", get(query::by_url))
         .route("/v1/collections/{slug}/search", get(query::search))

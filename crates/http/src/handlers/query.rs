@@ -2,14 +2,16 @@
 
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use bytes::Bytes;
 use masstuffy::{
-    DEFAULT_SEARCH_LIMIT, Fetch, Fetched, HostMatch, Located, MAX_SCAN_PAGE, MAX_SEARCH_LIMIT,
-    PathFilter, PortFilter, ScanCursor, ScanOptions, SearchCursor, SearchQuery, UrlPattern,
+    DEFAULT_SEARCH_LIMIT, Error, Fetch, Fetched, GrepOptions, GrepQuery, HostMatch, Located,
+    MAX_GREP_COLLECTIONS, MAX_SCAN_PAGE, MAX_SEARCH_LIMIT, PathFilter, PortFilter, ScanCursor,
+    ScanOptions, SearchCursor, SearchQuery, UrlPattern,
 };
 use serde_json::json;
 
@@ -18,9 +20,9 @@ use super::{
     MAX_HEADER_VALUE, WARC, bytes_response, collection, json_response, path_err, set_header,
     set_header_num,
 };
-use crate::body::ChunksBody;
+use crate::body::{ChunksBody, GrepBody, collect_limited, require_content_type};
 use crate::error::ApiError;
-use crate::json::locator_json;
+use crate::json::{GrepRequestJson, grep_events, locator_json, parse_json};
 use crate::locator::encode_locator;
 use crate::params::{Params, parse_date};
 use crate::router::AppState;
@@ -323,5 +325,49 @@ pub(crate) async fn export(
         set_header_num(&mut resp, H_UNREADABLE_COUNT, unreadable);
     }
     set_header(&mut resp, H_NEXT_CURSOR, &page.next.to_token());
+    Ok(resp)
+}
+
+/// `POST /v1/grep`: streams NDJSON (see `docs/http-api.md`).
+pub(crate) async fn grep(State(st): St, req: Request) -> Result<Response, ApiError> {
+    super::no_params(req.uri().query())?;
+    let (parts, body) = req.into_parts();
+    require_content_type(&parts.headers, "application/json")?;
+    let body =
+        collect_limited(body, st.opts.max_json_body_bytes, st.opts.body_idle_timeout).await?;
+    let r: GrepRequestJson = parse_json(&body)?;
+    if r.collections.len() > MAX_GREP_COLLECTIONS {
+        return Err(Error::InvalidQuery("grep collections").into());
+    }
+    let mut handles = Vec::with_capacity(r.collections.len());
+    let mut slugs = Vec::with_capacity(r.collections.len());
+    for slug in &r.collections {
+        let h = collection(&st.repo, slug)?;
+        slugs.push((h.id(), Arc::from(slug.as_str())));
+        handles.push(h);
+    }
+    let mut opts = GrepOptions::new(
+        r.queries
+            .into_iter()
+            .map(|q| GrepQuery {
+                pattern: q.pattern,
+                regex: q.regex,
+                case_insensitive: q.case_insensitive,
+            })
+            .collect(),
+    );
+    opts.scope = r.scope.to_scope();
+    if let Some(m) = r.max_hits {
+        opts.max_hits = m;
+    }
+    opts.events = grep_events(r.events.as_deref());
+    let grep = st.repo.grep(&handles, opts).await?;
+    let mut resp = Response::new(Body::new(GrepBody::new(grep, slugs)));
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(resp)
 }
